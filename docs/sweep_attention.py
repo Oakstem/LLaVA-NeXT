@@ -5,37 +5,105 @@ from pathlib import Path
 import sys
 import re # Import re for sanitization
 from datetime import datetime # Import datetime
+import time # Import time for ETA calculation
 
 # Add project root to sys.path to allow imports like 'from docs. ...'
 project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from docs.clip_eval import fix_wsl_paths, get_hostname
+# Import functions directly from extract_attention.py
+from docs.extract_attention import load_model, process_image_and_prompt, fix_wsl_paths
+
+def find_image_files(path, extensions, recursive=False):
+    """
+    Find all image files in the given path with specified extensions.
+
+    Args:
+        path (str or Path): Directory or file path
+        extensions (list): List of valid file extensions (e.g., ['.jpg', '.png'])
+        recursive (bool): Whether to search subdirectories recursively
+
+    Returns:
+        list: List of Path objects for all valid image files
+    """
+    path = Path(path)
+    image_files = []
+
+    # If path is a file, check if it's a valid image file
+    if path.is_file():
+        if path.suffix.lower() in extensions:
+            image_files.append(path)
+        return image_files
+
+    # If path is a directory, find all image files
+    if recursive:
+        for ext in extensions:
+            image_files.extend(path.glob(f'**/*{ext}'))
+    else:
+        for ext in extensions:
+            image_files.extend(path.glob(f'*{ext}'))
+
+    return sorted(image_files)
 
 def main():
     parser = argparse.ArgumentParser(description="Sweep attention extraction across specified layers using srun.")
-    parser.add_argument("--image-path", required=True, help="Path to the input image file or URL.")
-    parser.add_argument("--prompt", required=True, help="Text prompt for the model.")
+
+    # Input path options
+    parser.add_argument("--image-path", required=True, help="Path to the input image file or directory containing images.")
+    parser.add_argument("--recursive", action="store_true", help="Recursively process images in subdirectories.")
+    parser.add_argument("--image-extensions", default=".jpg,.jpeg,.png,.webp", help="Comma-separated list of image extensions to process (e.g., '.jpg,.png').")
+
+    # Prompt options
+    parser.add_argument("--prompt", default=None, help="Text prompt for the model.")
+
+    # Output options
     parser.add_argument("--base-output-dir", default="llava_attention_sweep", help="Base directory to save layer-specific attention maps.")
+
+    # Model options
     parser.add_argument("--attn-implementation", default="sdpa", choices=["sdpa", "eager", "flash_attention_2"], help="Attention implementation for extract_attention.py.")
     quant_group = parser.add_mutually_exclusive_group()
     quant_group.add_argument("--load-4bit", action="store_true", help="Load model in 4-bit quantization.")
     quant_group.add_argument("--load-8bit", action="store_true", help="Load model in 8-bit quantization.")
-    parser.add_argument("--start-layer", type=int, default=0, help="Starting layer index for the sweep.")
+
+    # Layer selection options
+    layer_group = parser.add_mutually_exclusive_group()
+    layer_group.add_argument("--layer", type=int, help="Extract attention for a specific layer only.")
+    layer_group.add_argument("--start-layer", type=int, default=0, help="Starting layer index for the sweep.")
     parser.add_argument("--end-layer", type=int, default=27, help="Ending layer index for the sweep (inclusive).")
+
     parser.add_argument("--python-executable", default=sys.executable, help="Path to the python executable to use.")
 
     # Add arguments for attention processing to pass through
-    parser.add_argument("--attn-threshold", type=float, default=0.3, help="Threshold for binary attention map (0-1).")
-    parser.add_argument("--opening-kernel", type=int, default=7, help="Kernel size for morphological opening.")
-    parser.add_argument("--min-blob-area", type=int, default=40, help="Minimum pixel area for attention blobs.")
+    parser.add_argument("--attn-threshold", type=float, default=0.001, help="Threshold for binary attention map (0-1).")
+    parser.add_argument("--opening-kernel", type=int, default=50, help="Kernel size for morphological opening.")
+    parser.add_argument("--min-blob-area", type=int, default=20, help="Minimum pixel area for attention blobs.")
     parser.add_argument("--min-avg-attn", type=float, default=0.15, help="Minimum average attention within a blob (0-1).")
     parser.add_argument("--show-highest-attn-blob", action="store_true", help="Only visualize the blob with the highest average attention.")
     parser.add_argument("--dilate-highest-blob", type=int, default=0, help="Kernel size to dilate the highest attention blob (if shown). 0 or 1 means no dilation.")
 
 
     args = parser.parse_args()
+
+    # set default prompt if not provided
+    if args.prompt is None:
+        args.prompt = ("You are an expert vision assistant. Step 1 – Caption Provide **one concise sentence** that broadly describes the entire scene. Begin the line with: Caption:"
+                       " Step 2 - Foreground people & gaze:"
+                       " 1. Detect every person in the foreground of the image."
+                       " 2. List them **left‑to‑right**. Number sequentially starting at 1. For each person output exactly **one line** in this format: Person {N}: {short description}, looking at {target description | “outside the frame” | “uncertain”}. "
+                       "Output format (no extra lines, no prose other than what is specified): "
+                       "Caption: {your one‑sentence scene description} Person 1: {short description}, looking at {short description} .\n"
+                       " Person 2: {short description}, looking at {short description} .\n"
+                       " Additional rules • Keep the phrase **“looking at”** unchanged. • {short description} = ≤ 6 words (e.g., “man in red jacket”). • If no foreground person is detected, write exactly: `No foreground people detected.` • If gaze cannot be determined, use “uncertain”."
+                       " Do **not** output your reasoning or any extra text.")
+    # Handle layer selection logic
+    if args.layer is not None:
+        # If specific layer is provided, use it for both start and end
+        start_layer = end_layer = args.layer
+    else:
+        # Otherwise use the range specified
+        start_layer = args.start_layer
+        end_layer = args.end_layer
 
     # --- Fix WSL Paths if needed ---
     # Let fix_wsl_paths handle the logic of whether conversion is necessary
@@ -51,6 +119,19 @@ def main():
              print(f"Fixed image_path: {args.image_path}")
     # ---
 
+    # Parse image extensions
+    image_extensions = [ext.strip() if ext.startswith('.') else f'.{ext.strip()}'
+                        for ext in args.image_extensions.split(',')]
+
+    # Find all image files to process
+    image_paths = find_image_files(args.image_path, image_extensions, args.recursive)
+
+    if not image_paths:
+        print(f"Error: No image files found with extensions {image_extensions} in {args.image_path}")
+        return
+
+    print(f"Found {len(image_paths)} image(s) to process")
+
     # --- Create Timestamped Output Directory ---
     # Sanitize the prompt for use in the directory name
     sanitized_prompt = re.sub(r'[^\w\-]+', '_', args.prompt) # Replace non-word chars (allow hyphen) with _
@@ -62,98 +143,99 @@ def main():
 
     # Create the main output dir (e.g., llava_attention_sweep)
     main_output_dir = Path(args.base_output_dir)
-    # Create the image-specific dir (e.g., llava_attention_sweep/visualization_frame_87965_attn_sweep)
-    image_specific_dir = main_output_dir / f"{Path(args.image_path).stem}_attn_sweep"
-    # Create the final timestamped run directory within the image-specific dir using the new name
-    run_output_path = image_specific_dir / run_dir_name
+    main_output_dir.mkdir(exist_ok=True, parents=True)
+
+    # Create the timestamped run directory
+    run_output_path = main_output_dir / run_dir_name
     run_output_path.mkdir(exist_ok=True, parents=True)
 
-    # script_to_run should be relative to the location of sweep_attention.py
-    # or construct the full path relative to the project root
-    script_to_run = project_root / "docs" / "extract_attention.py"
+    print(f"Base output directory for this run: {run_output_path}")
 
+    # Load the model once to reuse across layers and images
+    print(f"Loading model with attn_implementation='{args.attn_implementation}'")
+    tokenizer, model, image_processor, max_length = load_model(
+        attn_implementation=args.attn_implementation,
+        load_4bit=args.load_4bit,
+        load_8bit=args.load_8bit,
+        attn_layer_ind=start_layer  # Initial layer, will be updated in the loop
+    )
 
-    # Use the timestamped run_output_path as the base for layer directories
-    print(f"Starting attention sweep from layer {args.start_layer} to {args.end_layer}")
-    print(f"Base output directory for this run: {run_output_path}") # Print the timestamped path
-    print(f"Using python: {args.python_executable}")
-    print(f"Script to run: {script_to_run}")
+    if model is None:
+        print("Error: Failed to load model")
+        return
 
+    model.eval()
+    print("Model loaded successfully")
 
-    for layer_idx in range(args.start_layer, args.end_layer + 1):
-        # Create layer directory inside the timestamped run directory
-        layer_output_dir = run_output_path / f"layer_{layer_idx:02d}"
-        layer_output_dir.mkdir(exist_ok=True, parents=True)
-        log_file_path = layer_output_dir / f"extract_layer_{layer_idx:02d}.log"
+    # Process all images
+    start_time = time.time()
+    for img_idx, image_path in enumerate(image_paths):
+        # Progress reporting
+        percent_complete = (img_idx / len(image_paths)) * 100
+        time_elapsed = time.time() - start_time
 
-        print(f"\n--- Processing Layer {layer_idx} ---")
-        print(f"Output directory: {layer_output_dir}")
-        print(f"Log file: {log_file_path}")
+        # Calculate ETA if more than one image has been processed
+        if img_idx > 0:
+            time_per_image = time_elapsed / img_idx
+            eta_seconds = time_per_image * (len(image_paths) - img_idx)
+            eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
+            progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} ({percent_complete:.1f}%) - ETA: {eta_str}"
+        else:
+            progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} ({percent_complete:.1f}%)"
 
-        # Construct the command for extract_attention.py
-        cmd_extract = [
-            args.python_executable,
-            str(script_to_run),
-            "--image-path", args.image_path,
-            "--prompt", args.prompt,
-            "--output-dir", str(layer_output_dir),
-            "--attn-implementation", args.attn_implementation,
-            "--attn-layer-ind", str(layer_idx),
-            # Add new processing args
-            "--attn-threshold", str(args.attn_threshold),
-            "--opening-kernel", str(args.opening_kernel),
-            "--min-blob-area", str(args.min_blob_area),
-            "--min-avg-attn", str(args.min_avg_attn),
-            "--dilate-highest-blob", str(args.dilate_highest_blob)
-        ]
-        # Add boolean flags if set
-        if args.load_4bit:
-            cmd_extract.append("--load-4bit")
-        if args.load_8bit:
-            cmd_extract.append("--load-8bit")
-        if args.show_highest_attn_blob:
-            cmd_extract.append("--show-highest-attn-blob")
+        print(f"\n{'-'*80}")
+        print(progress_msg)
+        print(f"Image: {image_path}")
 
-        # Construct the python command directly (removed srun)
-        cmd_to_run = cmd_extract
+        # Create a specific output directory for this image
+        rel_path = Path(image_path).relative_to(Path(args.image_path).parent) if Path(args.image_path).is_dir() else Path(image_path)
+        image_output_dir = run_output_path / f"{rel_path.stem}_attn"
 
-        print(f"Executing command: {' '.join(cmd_to_run)}")
+        # Process each layer for this image
+        for layer_idx in range(start_layer, end_layer + 1):
+            # Create layer directory inside the image directory
+            layer_output_dir = image_output_dir / f"layer_{layer_idx:02d}"
+            layer_output_dir.mkdir(exist_ok=True, parents=True)
+            log_file_path = layer_output_dir / f"extract_layer_{layer_idx:02d}.log"
 
-        try:
-            # Execute the command, capture stdout/stderr, redirect stderr to stdout
-            process = subprocess.run(
-                cmd_to_run, # Use the direct python command
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, # Redirect stderr to stdout
-                text=True,
-                check=False # Don't raise exception on non-zero exit code immediately
-            )
+            print(f"  Processing Layer {layer_idx}")
 
-            # Write combined output to log file
+            # Set the current layer index in the model config
+            model.config.attn_layer_ind = layer_idx
+
+            # Redirect stdout/stderr to capture logs
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+
             with open(log_file_path, 'w') as log_file:
-                log_file.write(process.stdout)
+                sys.stdout = log_file
+                sys.stderr = log_file
 
-            # Check return code and print status
-            if process.returncode == 0:
+                # Process the current layer
+                process_image_and_prompt(
+                    str(image_path),
+                    args.prompt,
+                    model,
+                    tokenizer,
+                    image_processor,
+                    layer_output_dir,
+                    attn_threshold=args.attn_threshold,
+                    opening_kernel_size=args.opening_kernel,
+                    min_blob_area=args.min_blob_area,
+                    min_avg_attention=args.min_avg_attn,
+                    show_highest_attn_blob=args.show_highest_attn_blob,
+                    dilate_kernel_size=args.dilate_highest_blob
+                )
+
                 print(f"Layer {layer_idx} processing completed successfully.")
-                print(f"Output saved to: {layer_output_dir}")
-                print(f"Log saved to: {log_file_path}")
-            else:
-                print(f"Error processing layer {layer_idx}. Return code: {process.returncode}")
-                print(f"Check log file for details: {log_file_path}")
-                # Optionally break or continue on error
-                # break
 
-        # Removed FileNotFoundError for srun
-        except Exception as e:
-            print(f"An unexpected error occurred during script execution for layer {layer_idx}: {e}")
-            # Log the exception as well
-            with open(log_file_path, 'a') as log_file:
-                 log_file.write(f"\n\n--- SCRIPT EXECUTION ERROR ---\n{e}")
-            # Optionally break or continue
-            # break
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
-    print("\n--- Attention sweep finished ---")
+    total_time = time.time() - start_time
+    print(f"\n{'-'*80}")
+    print(f"All {len(image_paths)} images processed in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
+    print("--- Attention sweep finished ---")
 
 if __name__ == "__main__":
     main()

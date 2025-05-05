@@ -1,6 +1,7 @@
 import os
 import sys # Add sys import
 import argparse
+from datetime import datetime
 from pathlib import Path
 import socket
 import warnings
@@ -24,7 +25,7 @@ import cv2 # Add OpenCV import
 
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
-from docs.clip_eval import fix_wsl_paths # Revert to original import
+# from docs.clip_eval import fix_wsl_paths # Revert to original import
 from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
 
 from llava.model.builder import load_pretrained_model
@@ -35,7 +36,22 @@ from llava.constants import (
 )
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.utils import disable_torch_init # Optional: May speed up loading
-
+def fix_wsl_paths(path: str) -> str:
+    """Convert Windows paths to WSL paths if necessary."""
+    # If path already starts with /mnt/, assume it's correct WSL format
+    if path.startswith('/mnt/'):
+        return path
+    # Otherwise, attempt conversion from Windows format
+    path = path.replace("\\", os.sep)
+    drive_parts = path.split(os.sep)
+    if len(drive_parts) > 0 and len(drive_parts[0]) > 1 and drive_parts[0][1] == ':':
+        drive_letter = drive_parts[0][0].lower()
+        # Reconstruct path starting from /mnt/<drive_letter>/...
+        wsl_path = f'/mnt/{drive_letter}/' + os.sep.join(drive_parts[1:])
+        return wsl_path
+    else:
+        # If it doesn't look like a Windows path either, return original
+        return path
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
@@ -114,6 +130,62 @@ def load_image(image_path: Union[str, Path]) -> Image.Image:
 
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Function for creating a collage of attention maps with token titles
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+def visualize_attention_collage(
+    attention_maps: List[Tuple[Image.Image, str]],  # List of (attention_map, token_text) pairs
+    # overlayed_image: Image.Image,
+    output_path: Union[str, Path],
+    grid_size: Tuple[int, int] = (5, 5),  # Grid layout (rows, cols)
+) -> None:
+    """
+    Creates a collage of processed attention maps in a grid layout,
+    with each map's title set to its corresponding word token.
+
+    Args:
+        attention_maps: List of tuples containing (attention_map, token_text)
+        overlayed_image: The overlay PIL image
+        output_path: Path to save the collage visualization
+        grid_size: Tuple of (rows, cols) for the grid layout
+        Other parameters: Same as visualize_processed_attention
+    """
+    rows, cols = grid_size
+    total_maps = min(len(attention_maps), rows * cols)
+
+    # Create figure and subplots
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
+    axes = axes.flatten()  # Convert 2D array of axes to 1D for easier indexing
+
+    # Process each attention map
+    for i in range(total_maps):
+        attention_map, token_text = attention_maps[i]
+
+        # Get the current axis
+        ax = axes[i]
+
+
+        # Display the blended image in the current subplot
+        ax.imshow(attention_map)
+
+        # Set the title to the token text
+        ax.set_title(token_text, fontsize=12)
+
+        # Remove axis ticks for cleaner display
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # Hide any remaining empty subplots
+    for i in range(total_maps, rows * cols):
+        axes[i].axis('off')
+
+    # Adjust layout and save
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
+    plt.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved attention collage to: {output_path}")
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # New function for processed attention visualization
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 def visualize_processed_attention(
@@ -127,7 +199,7 @@ def visualize_processed_attention(
     # New parameters
     show_highest_attn_blob: bool = False,
     dilate_kernel_size: int = 0 # 0 or 1 means no dilation
-) -> None:
+) -> Image.Image:
     """
     Processes an attention map with thresholding, morphological opening,
     blob filtering, and visualizes the result overlaid on the original image.
@@ -143,7 +215,6 @@ def visualize_processed_attention(
         show_highest_attn_blob: If True, only show the blob with the highest average attention.
         dilate_kernel_size: Kernel size for dilating the highest blob (if shown). 0 or 1 means no dilation.
     """
-    # Removed broad try-except block
 
     # 1. Resize attention map to original image size
     # Ensure attention_map is a numpy array before proceeding
@@ -158,6 +229,7 @@ def visualize_processed_attention(
     # Keep a copy of the resized raw map for average attention calculation
     raw_resized_map = resized_map.copy()
 
+    binary_map = np.where(raw_resized_map >= threshold_value, 255, 0).astype(np.uint8)
     # Normalize the raw map to 0-1 range *before* thresholding for consistency
     if np.max(raw_resized_map) > np.min(raw_resized_map):
         norm_raw_map = (raw_resized_map - np.min(raw_resized_map)) / (np.max(raw_resized_map) - np.min(raw_resized_map))
@@ -165,12 +237,12 @@ def visualize_processed_attention(
         norm_raw_map = np.zeros_like(raw_resized_map)
 
     # 2. Thresholding on the *normalized* map
-    binary_map = np.where(norm_raw_map >= threshold_value, 255, 0).astype(np.uint8)
+    # binary_map = np.where(norm_raw_map >= threshold_value, 255, 0).astype(np.uint8)
 
     # 3. Morphological Opening
     # kernel = np.ones((opening_kernel_size, opening_kernel_size), np.uint8) # Square kernel
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (opening_kernel_size, opening_kernel_size)) # Circular kernel
-    opened_map = cv2.morphologyEx(binary_map, cv2.MORPH_OPEN, kernel)
+    opened_map = cv2.morphologyEx(binary_map, cv2.MORPH_DILATE, kernel)
 
     # 4. Blob Filtering & Selection
     contours, _ = cv2.findContours(opened_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -244,9 +316,49 @@ def visualize_processed_attention(
     output_path.parent.mkdir(parents=True, exist_ok=True) # Ensure directory exists
     print(f"Attempting to save processed attention map to: {output_path}") # DEBUG print
     overlay_img.save(output_path)
-    # print(f"Saved processed attention map to: {output_path}") # Reduce verbosity
+    return overlay_img
 
+def save_raw_attention_tensor(
+    attention_map: torch.Tensor,
+    output_path: Union[str, Path],
+    token_id: int,
+    token_text: str,
+    step_idx: int
+) -> None:
+    """
+    Saves the raw attention tensor to a file using torch.save.
 
+    Args:
+        attention_map: The raw attention tensor
+        output_path: Directory path to save the tensor file
+        token_id: ID of the token this attention map corresponds to
+        token_text: Text of the token this attention map corresponds to
+        step_idx: Generation step index
+    """
+    # Create output directory if it doesn't exist
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Create filename with step and token info
+    safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text)
+    if not safe_token_text:
+        safe_token_text = f"tokenid_{token_id}"
+
+    filename = f"attn_tensor_{step_idx:03d}_{safe_token_text}.pt"
+    file_path = output_path / filename
+
+    # Save metadata along with tensor
+    data = {
+        "attention_map": attention_map,  # Move to CPU and detach
+        "token_id": token_id,
+        "token_text": token_text,
+        "step_idx": step_idx,
+        "timestamp": str(datetime.now())
+    }
+
+    # Save using torch.save
+    torch.save(data, file_path)
+    print(f"Saved raw attention tensor to {file_path}")
 
 def process_image_and_prompt(
     image_path: Union[str, Path],
@@ -263,7 +375,12 @@ def process_image_and_prompt(
     min_avg_attention: float = 0.2,
     # Add new params
     show_highest_attn_blob: bool = False,
-    dilate_kernel_size: int = 0
+    dilate_kernel_size: int = 0,
+    # Add collage parameters
+    create_collage: bool = True,
+    collage_grid_rows: int = 3,
+    collage_grid_cols: int = 4,
+    visualize_attn_overlays: bool = False,
 ) -> None:
     """
     Process a single image and prompt to generate text and extract attention,
@@ -372,6 +489,9 @@ def process_image_and_prompt(
         print(f"Warning: Number of patches ({num_patches}) is not a perfect square. Visualization might be inaccurate.")
         grid_size = int(np.ceil(np.sqrt(num_patches)))
 
+    # Storage for collecting attention maps for the collage
+    collected_maps = []  # Store (attention_map, token_text) pairs
+
     # --- Generation Loop ---
     for i in range(max_new_tokens):
         with torch.inference_mode():
@@ -456,7 +576,14 @@ def process_image_and_prompt(
 
                     # --- Save Raw Attention Map (with checks) ---
                     save_path_raw = vis_output_dir_raw / f"token_{i:03d}_{safe_token_text}.png"
-                    try: # Keep minimal try-except for external PIL/OS errors during save
+                    # SAFETY LOGIC: Check for valid numpy array and PIL image before proceeding
+                    if not isinstance(attention_map_np, np.ndarray):
+                        print(f"[ERROR] Attention map is not a numpy array for step {i}, skipping save.")
+                    elif attention_map_np.ndim != 2:
+                        print(f"[ERROR] Attention map is not 2D for step {i}, skipping save.")
+                    elif not isinstance(image, Image.Image):
+                        print(f"[ERROR] Original image is not a PIL Image for step {i}, skipping save.")
+                    else:
                         map_img_raw = Image.fromarray(attention_map_np.astype(np.float32))
                         resized_map_img_raw = map_img_raw.resize(image.size, Image.Resampling.LANCZOS)
                         resized_map_raw = np.array(resized_map_img_raw)
@@ -471,27 +598,40 @@ def process_image_and_prompt(
                         heatmap_raw = cm.viridis(norm_map_raw)[:, :, :3]
                         heatmap_uint8_raw = (heatmap_raw * 255).astype(np.uint8)
                         # Ensure image is RGB before blending
-                        overlay_img_raw = Image.blend(image.convert("RGB"), Image.fromarray(heatmap_uint8_raw), alpha=0.5)
-                        overlay_img_raw.save(save_path_raw)
-                    except Exception as e: # Catch specific save/blend errors if possible, otherwise broad Exception
-                        print(f"Error visualizing/saving raw attention for step {i} ({save_path_raw}): {e}")
+                        if image.mode != "RGB":
+                            img_rgb = image.convert("RGB")
+                        else:
+                            img_rgb = image
+                        overlay_img_raw = Image.blend(img_rgb, Image.fromarray(heatmap_uint8_raw), alpha=0.5)
+                        # Check if save path is writable
+                        if visualize_attn_overlays:
+                            overlay_img_raw.save(save_path_raw)
 
-
-                    # --- Save Processed Attention Map (calling robust function) ---
-                    save_path_processed = vis_output_dir_processed / f"token_{i:03d}_{safe_token_text}.png"
-                    # visualize_processed_attention should be robust now, no outer try-except needed here
-                    visualize_processed_attention(
-                        attention_map=attention_map_np, # Pass the raw map
-                        original_image=image,
-                        output_path=save_path_processed,
-                        threshold_value=attn_threshold,
-                        opening_kernel_size=opening_kernel_size,
-                        min_blob_area=min_blob_area,
-                        min_avg_attention=min_avg_attention,
-                        show_highest_attn_blob=show_highest_attn_blob,
-                        dilate_kernel_size=dilate_kernel_size
+                    # --- Save Raw Attention Tensor ---
+                    tensor_output_dir = output_dir / "attention_tensors"
+                    save_raw_attention_tensor(
+                        attention_map=attention_map_np,  # Original tensor before reshaping
+                        output_path=tensor_output_dir,
+                        token_id=next_token_id.item(),
+                        token_text=token_text,
+                        step_idx=i
                     )
-                    # Note: visualize_processed_attention handles its own internal errors now
+                    if visualize_attn_overlays:
+                        save_path_processed = vis_output_dir_processed / f"token_{i:03d}_{safe_token_text}.png"
+                        image_overlay = visualize_processed_attention(
+                            attention_map=attention_map_np, # Pass the raw map
+                            original_image=image,
+                            output_path=save_path_processed,
+                            threshold_value=attn_threshold,
+                            opening_kernel_size=opening_kernel_size,
+                            min_blob_area=min_blob_area,
+                            min_avg_attention=min_avg_attention,
+                            show_highest_attn_blob=show_highest_attn_blob,
+                            dilate_kernel_size=dilate_kernel_size
+                        )
+                        # Collect this map for the collage
+                        if create_collage:
+                            collected_maps.append((image_overlay, token_text))
 
                 else:
                      print(f"Warning: Attention shape mismatch at step {i}. Expected {num_patches}, got {token_attention_to_image.shape[0]}. Skipping visualization.")
@@ -504,6 +644,34 @@ def process_image_and_prompt(
         # Optional: Clear CUDA cache periodically if memory pressure is still high
         # if i % 10 == 0:
         #     torch.cuda.empty_cache()
+
+    # After the generation loop, create collages from the collected maps
+    if create_collage and collected_maps:
+        print(f"Creating attention collages from {len(collected_maps)} collected maps")
+
+        # Set up directory for collages
+        collage_dir = output_dir / "attention_collages"
+        collage_dir.mkdir(exist_ok=True, parents=True)
+
+        # Calculate how many collages we need
+        maps_per_collage = collage_grid_rows * collage_grid_cols
+        num_collages = (len(collected_maps) + maps_per_collage - 1) // maps_per_collage  # Ceiling division
+
+        for collage_idx in range(num_collages):
+            start_idx = collage_idx * maps_per_collage
+            end_idx = min(start_idx + maps_per_collage, len(collected_maps))
+
+            collage_maps = collected_maps[start_idx:end_idx]
+            output_path = collage_dir / f"attention_collage_{collage_idx + 1}.png"
+
+            # Create the collage
+            visualize_attention_collage(
+                attention_maps=collage_maps,
+                output_path=output_path,
+                grid_size=(collage_grid_rows, collage_grid_cols),
+            )
+
+        print(f"Created {num_collages} attention map collages in {collage_dir}")
 
     # --- Decode final generated text ---
     text_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
@@ -518,7 +686,7 @@ def process_image_and_prompt(
     # --- End Manual Generation Loop ---
 
 
-def main() -> None:
+def main() -> int:
     """Main execution function."""
     parser = argparse.ArgumentParser(description="Extract LLaVA attention maps for an image and prompt.")
     parser.add_argument("--image-path", required=True, help="Path to the input image file or URL.")
@@ -536,7 +704,6 @@ def main() -> None:
     parser.add_argument("--show-highest-attn-blob", action="store_true", help="Only visualize the blob with the highest average attention.")
     parser.add_argument("--dilate-highest-blob", type=int, default=0, help="Kernel size to dilate the highest attention blob (if shown). 0 or 1 means no dilation.")
 
-
     quant_group = parser.add_mutually_exclusive_group()
     quant_group.add_argument("--load-4bit", action="store_true", help="Load model in 4-bit quantization.")
     quant_group.add_argument("--load-8bit", action="store_true", help="Load model in 8-bit quantization.")
@@ -550,21 +717,28 @@ def main() -> None:
     # Optional: Disable init for faster loading
     # disable_torch_init()
 
+    # SAFETY LOGIC: Check for mutually exclusive quantization flags
+    if args.load_4bit and args.load_8bit:
+        print("[ERROR] Cannot load in both 4-bit and 8-bit mode.")
+        return 1
+
     # Load model - pass quantization and attn_implementation args
     print(f"Loading model with attn_implementation='{args.attn_implementation}', load_4bit={args.load_4bit}, load_8bit={args.load_8bit}...")
-    try:
-        tokenizer, model, image_processor, max_length = load_model(
-            attn_implementation=args.attn_implementation,
-            load_4bit=args.load_4bit,
-            load_8bit=args.load_8bit,
-            attn_layer_ind=args.attn_layer_ind # Pass the argument here
-        )
-        model.eval()
-        print("Model loaded.")
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("If attention extraction fails, try running again with --attn-implementation eager")
+    tokenizer = model = image_processor = max_length = None
+    model_load_failed = False
+
+    tokenizer, model, image_processor, max_length = load_model(
+        attn_implementation=args.attn_implementation,
+        load_4bit=args.load_4bit,
+        load_8bit=args.load_8bit,
+        attn_layer_ind=args.attn_layer_ind # Pass the argument here
+    )
+    # Post-checks for model loading
+    if model_load_failed or any(x is None for x in [tokenizer, model, image_processor]):
+        print("[ERROR] Model loading failed. If attention extraction fails, try running again with --attn-implementation eager")
         return 1 # Indicate error
+    model.eval()
+    print("Model loaded.")
 
     # Output directory is already relative to CWD, no need to fix WSL path for it.
     # The fix_wsl_paths was likely intended for input image paths if given in Windows format.

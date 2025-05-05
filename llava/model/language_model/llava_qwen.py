@@ -79,8 +79,38 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        # image_features = None
+        # user_prompt_features = None
+        # Check if we need to prepare multimodal inputs
         if inputs_embeds is None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
+            # Check if images are actually provided for this specific forward call
+            if images is not None:
+                # Unpack 8 values when images are present
+                (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, image_features, user_prompt_features) = \
+                    self.prepare_inputs_labels_for_multimodal(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        labels=labels,
+                        images=images,
+                        modalities=modalities,
+                        image_sizes=image_sizes
+                    )
+            else:
+                # Unpack 6 values when images are not present (e.g., subsequent generation steps)
+                # This path is taken when processing text-only inputs or during generation steps after the first one.
+                (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = \
+                    self.prepare_inputs_labels_for_multimodal(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    labels=labels,
+                    images=images,
+                    modalities=modalities,
+                    image_sizes=image_sizes
+                )
 
         if dpo_forward:
             outputs = self.model(

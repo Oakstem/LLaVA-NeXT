@@ -263,11 +263,13 @@ def process_feature(train_latents, test_latents, feature_idx, model_name, featur
     compare = np.c_[list(test_latents.keys()), y_test, Z_test, np.abs(y_test-Z_test)]
 
     if save_latents:
+# Transform data using the PLS model
         reduced_train_dim_latents = model.transform(X_train)
         reduced_test_dim_latents = model.transform(X_test)
 
         if model_name is not None and feature_name is not None:
-            save_latent_vectors(
+            # Save latent vectors
+            output_dir = save_latent_vectors(
                 model_name,
                 feature_name,
                 train_latents,
@@ -278,6 +280,20 @@ def process_feature(train_latents, test_latents, feature_idx, model_name, featur
                 save_dir
             )
 
+            # Save the fitted model
+            import joblib
+            model_filename = (output_dir /
+                              f"{feature_name}_{n_components}comp_pls_model.joblib")
+            model_filename.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(model, model_filename)
+
+            # Save the scalers if they exist
+            if hasattr(model, 'steps') and 'y_scaler' in locals() and y_scaler is not None:
+                scaler_filename = output_dir / f"{feature_name}_{n_components}comp_y_scaler.joblib"
+                joblib.dump(y_scaler, scaler_filename)
+
+            print(f"Saved PLS model to {model_filename}")
+
 
 
     return r2, corr, mae, cv_score, n_components, scaler
@@ -287,7 +303,7 @@ def main():
     # latents_dir_path = r"D:\Projects\Annotators\data\moments\gazzele_results"
     latents_dir_path = r"D:\Projects\Annotators\data\moments\llm_image_embeds"
     latents_dir_path = r"D:\Projects\Annotators\data\moments\llava_general_people_desc"
-    latents_dir_path = r"D:\Projects\Annotators\data\moments\llava_facing_llm_cls"
+    # latents_dir_path = r"D:\Projects\Annotators\data\moments\llava_facing_llm_cls"
     # latents_dir_path = r"D:\Projects\gazelle\facingness_results.csv"        # gazelle post processed facing results
     # latents_dir_path = r"D:\Projects\Annotators\data\moments\comm_llm_cls"
     # latents_dir_path = r"D:\Projects\Annotators\data\moments\llava_joint_action_cls"
