@@ -72,7 +72,7 @@ def find_persons_and_gaze_targets(text_array):
                         break
         i += 1
 
-    # Now, look for "looking at" phrases and associate them with the nearest preceding person
+    # Now, look for "looking" phrases and associate them with the nearest preceding person
     i = 0
     last_person = None
 
@@ -88,17 +88,18 @@ def find_persons_and_gaze_targets(text_array):
         # Check if current token contains "looking"
         if "looking" in current_token and last_person is not None:
             start_idx = i
-            phrase_indices = [text_array[i+2][0]]       # skip "looking" and "at"
-
+            # phrase_indices = [text_array[i+2][0]]       # skip "looking" and "at"
+            phrase_indices = [text_array[i+1][0]]       # skip "looking"
+            persons_data[last_person]['gaze_target_indices'] = phrase_indices
             # Check if "at" is in the same token or the next one
-            if "at" in current_token:
-                # "looking at" in the same token
-                persons_data[last_person]['gaze_target_indices'] = phrase_indices
-            elif i + 1 < len(text_array) and "at" in text_array[i + 1][1].lower():
-                # "at" is in the next token
-                phrase_indices.append(text_array[i + 1][0])
-                persons_data[last_person]['gaze_target_indices'] = phrase_indices
-                i += 1  # Skip the next token since we've processed it
+            # if "at" in current_token:
+            #     # "looking at" in the same token
+            #     persons_data[last_person]['gaze_target_indices'] = phrase_indices
+            # elif i + 1 < len(text_array) and "at" in text_array[i + 1][1].lower():
+            #     # "at" is in the next token
+            #     phrase_indices.append(text_array[i + 1][0])
+            #     persons_data[last_person]['gaze_target_indices'] = phrase_indices
+            #     i += 1  # Skip the next token since we've processed it
 
         i += 1
 
