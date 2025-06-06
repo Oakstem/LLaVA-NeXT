@@ -17,6 +17,9 @@ from typing import List, Optional, Tuple, Union, Dict
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
+import ast
+import re
+import math
 
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaModel, LlamaForCausalLM
@@ -27,6 +30,7 @@ from transformers.generation.utils import GenerateOutput
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
+from llava.mm_utils import select_best_resolution # Import the helper from mm_utils
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -51,6 +55,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         Qwen2ForCausalLM.__init__(self, config)
         config.model_type = "llava_qwen"
         config.rope_scaling = None
+        # Store image_grid_pinpoints and final_patch_division_size if available in config
+        # These are usually part of data_args or model_cfg in scripts, need to ensure they are in self.config
+        self.image_grid_pinpoints_config = getattr(config, "image_grid_pinpoints", None)
+        # final_patch_division_size typically from processor.crop_size["height"]
+        # This might need to be explicitly passed or inferred if not in main config
+        self.final_patch_division_size_config = getattr(config, "final_patch_division_size", 224) # Example default
+
 
         self.model = LlavaQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -72,23 +83,25 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
-        image_sizes: Optional[List[List[int]]] = None,
+        image_sizes: Optional[List[List[int]]] = None, # List of [original_h, original_w]
         return_dict: Optional[bool] = None,
         modalities: Optional[List[str]] = ["image"],
         dpo_forward: Optional[bool] = False,
         cache_position=None,
+        atten_ids=[],
+        pixel_coords_for_attention: Optional[List[Tuple[int, int]]] = None, # New parameter
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        # image_features = None
-        # user_prompt_features = None
-        # Check if we need to prepare multimodal inputs
+        ids_to_attend_pixels = []
+        original_input_ids = input_ids # Save before potential modification
+        # original_attention_mask = attention_mask # Keep a reference if needed
+
         if inputs_embeds is None:
-            # Check if images are actually provided for this specific forward call
-            if images is not None:
-                # Unpack 8 values when images are present
-                (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, image_features, user_prompt_features) = \
+            if images is not None and image_sizes is not None:
+                (input_ids, position_ids, attention_mask_prepared, past_key_values, inputs_embeds, labels,
+                 _image_features_ret, _user_prompt_features_ret) = \
                     self.prepare_inputs_labels_for_multimodal(
-                        input_ids=input_ids,
+                        input_ids=original_input_ids,
                         position_ids=position_ids,
                         attention_mask=attention_mask,
                         past_key_values=past_key_values,
@@ -111,6 +124,35 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     modalities=modalities,
                     image_sizes=image_sizes
                 )
+
+        final_ids_to_attend = atten_ids
+
+        # if inputs_embeds is not None:   # todo: uncomment once done testing, commenting out to get custom mask during generation too
+        if inputs_embeds is None:
+            input_embeds_shape = torch.Size([1, past_key_values[0][0].shape[2]+1, 1])
+            input_device = past_key_values[0][0].device
+            input_dtype = past_key_values[0][0].dtype
+        else:
+            input_embeds_shape = inputs_embeds.shape
+            input_device = inputs_embeds.device
+            input_dtype = inputs_embeds.dtype
+        # Only build custom mask if final_ids_to_attend is populated.
+        # Otherwise, the attention_mask from prepare_inputs_labels_for_multimodal (which should be causal) or passed in, is used.
+        if final_ids_to_attend:
+            attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
+                inputs_embeds_shape=input_embeds_shape,
+                ids_to_attend=final_ids_to_attend,
+                device=input_device,
+                dtype=input_dtype,
+            )
+        if inputs_embeds is None:
+            tokens_to_take = 1
+            attention_mask = attention_mask[:, :, -tokens_to_take:, :]
+            # attention_mask = attention_mask[:, :, None, :]
+        # If final_ids_to_attend is empty, attention_mask remains as is.
+        # It's assumed that if images were processed, prepare_inputs_labels_for_multimodal
+        # would have set up a suitable (e.g., causal) attention_mask for inputs_embeds.
+        # If inputs_embeds was passed directly, then the passed attention_mask is used.
 
         if dpo_forward:
             outputs = self.model(
@@ -174,6 +216,38 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if image_sizes is not None:
             inputs["image_sizes"] = image_sizes
         return inputs
+
+    @staticmethod
+    def _build_custom_attention_mask_static(inputs_embeds_shape: Tuple[int, ...],
+                                            ids_to_attend: List[int],
+                                            device: torch.device,
+                                            dtype: torch.dtype = torch.float16) -> torch.Tensor:
+        """
+        Builds a custom attention mask.
+        The mask allows causal attention for all tokens.
+        For the last token, it ONLY allows attention to `ids_to_attend`.
+        """
+        batch_size, seq_len, embed_size = inputs_embeds_shape
+
+        # Initialize with causal mask properties
+        mask = torch.full((seq_len, seq_len), float("0"), device=device, dtype=dtype)
+        causal_indices = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
+        mask[causal_indices] = 1.
+
+        # Modify the last row for specific attention if ids_to_attend is provided
+        if ids_to_attend and seq_len > 0:
+            last_token_idx = seq_len - 1
+            mask[last_token_idx, :] = float("0")  # Disallow all by default for the last token
+
+            valid_ids_to_attend = [idx for idx in ids_to_attend if 0 <= idx < seq_len]
+            if valid_ids_to_attend:
+                mask[last_token_idx, torch.tensor(valid_ids_to_attend, device=device, dtype=torch.long)] = 1.
+
+        # Reshape to [batch_size, 1, seq_len, seq_len] for broadcasting with attention heads
+        # Qwen2 expects (batch_size, num_heads, query_length, kv_length) or (batch_size, 1, query_length, kv_length)
+        # The original code produced [1,1,SL,SL]. We assume batch_size is handled by broadcasting if this is [1,1,SL,SL]
+        # or we make it [B,1,SL,SL]
+        return mask.unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
 
 
 AutoConfig.register("llava_qwen", LlavaQwenConfig)

@@ -7,6 +7,7 @@ import socket
 import warnings
 import copy
 from typing import Dict, List, Optional, Any, Tuple, Union
+from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres
 
 # Add project root to sys.path to allow imports like 'from docs. ...' or 'from llava. ...'
 project_root = Path(__file__).resolve().parent.parent
@@ -53,7 +54,7 @@ def fix_wsl_paths(path: str) -> str:
         # If it doesn't look like a Windows path either, return original
         return path
 # Suppress warnings
-warnings.filterwarnings("ignore")
+# warnings.filterwarnings("ignore")
 
 def setup_environment(hostname: str) -> None:
     """Setup environment variables based on hostname."""
@@ -360,6 +361,141 @@ def save_raw_attention_tensor(
     torch.save(data, file_path)
     print(f"Saved raw attention tensor to {file_path}")
 
+# --- Helper functions for the generation loop ---
+def prepare_model_inputs(step_idx, curr_input_ids, past_kvs, attn_inds, img_tens=None, img_szs=None):
+    """Prepare inputs for the model's forward pass at the current generation step."""
+    inputs = {
+        "input_ids": curr_input_ids,
+        "past_key_values": past_kvs,
+        "use_cache": True,
+        "output_attentions": True,
+        "output_hidden_states": True,
+        "atten_ids": attn_inds
+    }
+
+    # Only pass image data in the first step
+    if step_idx == 0 and img_tens is not None:
+        inputs["images"] = img_tens
+        inputs["image_sizes"] = img_szs
+        inputs["modalities"] = ["image"]
+
+    return inputs
+
+def extract_attention_map(step_idx, tokenizer, outputs, token_idx, attn_indices, image_start_idx, image_end_idx, grid_sz, n_patches):
+    """Extract and prepare the attention map from model outputs."""
+    # Get attention matrices from output
+    attentions = outputs.attentions
+    if attentions is None:
+        return None, None
+
+    # Process attention matrices
+    selected_attentions = attentions[0][0]  # Get from first batch
+    selected_attentions = selected_attentions.squeeze(0)  # Remove batch dimension
+    avg_attentions = selected_attentions.mean(dim=0)  # Average across heads
+
+    # Get attention from current token to image patches
+    token_attention_to_image = avg_attentions[token_idx, image_start_idx:image_end_idx]
+
+    # Verify shape matches expected number of patches
+    if token_attention_to_image.shape[0] != n_patches:
+        return None, None
+
+    # Handle padding for square grid
+    expected_elements = grid_sz * grid_sz
+    if expected_elements > n_patches:
+        padding_size = expected_elements - n_patches
+        token_attention_to_image = torch.cat([
+            token_attention_to_image,
+            torch.zeros(padding_size, device=token_attention_to_image.device)
+        ])
+    elif expected_elements < n_patches:
+        return None, None
+
+    # Convert to numpy for visualization
+    attention_map = token_attention_to_image.reshape(grid_sz, grid_sz).cpu().numpy()
+
+    # # Extract token text for debugging
+    # token_text = None
+    # if len(attn_indices) > 0:
+    #     txt_ids = torch.argmax(outputs.logits, dim=-1)[0]
+    #     if step_idx == 0:  # First token
+    #         txt_np = np.array([tokenizer.decode(val).strip() for val in txt_ids])
+    #         resulted_description = ",".join(txt_np[attn_indices])
+    #         token_text = resulted_description
+    #     else:
+    #         token_text = tokenizer.decode(txt_ids[0])
+
+    return attention_map        #, token_text
+
+def save_attention_visualizations(attention_map, image, token_id, token_text, step_idx,
+                                 vis_raw_dir, vis_processed_dir, tensor_dir,
+                                 attn_threshold, opening_kernel_size, min_blob_area,
+                                 min_avg_attention, show_highest_blob, dilate_kernel_size,
+                                 visualize_overlays=True, create_collage_maps=None):
+    """Save attention visualizations and tensors."""
+    # Skip if attention map is invalid
+    if not isinstance(attention_map, np.ndarray) or attention_map.ndim != 2:
+        print(f"[ERROR] Invalid attention map for step {step_idx}, skipping visualization.")
+        return None
+
+    # Generate safe token text for filenames
+    safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text)
+    if not safe_token_text:
+        safe_token_text = f"tokenid_{token_id}"
+
+    # Create filenames
+    token_filename = f"token_{step_idx:03d}_{safe_token_text}"
+    raw_path = vis_raw_dir / f"{token_filename}.png"
+    processed_path = vis_processed_dir / f"{token_filename}.png"
+
+    # Save raw visualization if requested
+    if visualize_overlays:
+        # Convert map to image and resize to match original image
+        map_img = Image.fromarray(attention_map.astype(np.float32))
+        resized_map = np.array(map_img.resize(image.size, Image.Resampling.LANCZOS))
+
+        # Normalize the map for visualization
+        min_val, max_val = np.min(resized_map), np.max(resized_map)
+        norm_map = np.zeros_like(resized_map) if max_val <= min_val else \
+                  (resized_map - min_val) / (max_val - min_val)
+
+        # Create heatmap overlay
+        heatmap = cm.viridis(norm_map)[:, :, :3]
+        heatmap_uint8 = (heatmap * 255).astype(np.uint8)
+        img_rgb = image if image.mode == "RGB" else image.convert("RGB")
+        overlay_img = Image.blend(img_rgb, Image.fromarray(heatmap_uint8), alpha=0.5)
+        overlay_img.save(raw_path)
+
+    # Save raw tensor
+    save_raw_attention_tensor(
+        attention_map=attention_map,
+        output_path=tensor_dir,
+        token_id=token_id,
+        token_text=token_text,
+        step_idx=step_idx
+    )
+
+    # Create processed visualization if requested
+    overlay_img = None
+    if visualize_overlays:
+        overlay_img = visualize_processed_attention(
+            attention_map=attention_map,
+            original_image=image,
+            output_path=processed_path,
+            threshold_value=attn_threshold,
+            opening_kernel_size=opening_kernel_size,
+            min_blob_area=min_blob_area,
+            min_avg_attention=min_avg_attention,
+            show_highest_attn_blob=show_highest_blob,
+            dilate_kernel_size=dilate_kernel_size
+        )
+
+        # Add to collage collection if requested
+        if create_collage_maps is not None and overlay_img is not None:
+            create_collage_maps.append((overlay_img, token_text))
+
+    return overlay_img
+
 def process_image_and_prompt(
     image_path: Union[str, Path],
     prompt: str,
@@ -380,7 +516,7 @@ def process_image_and_prompt(
     create_collage: bool = True,
     collage_grid_rows: int = 3,
     collage_grid_cols: int = 4,
-    visualize_attn_overlays: bool = False,
+    visualize_attn_overlays: bool = True,
 ) -> None:
     """
     Process a single image and prompt to generate text and extract attention,
@@ -451,7 +587,7 @@ def process_image_and_prompt(
 
     # --- Determine image patch information before the loop ---
     # Get num_patches directly from the vision tower config using hasattr checks
-    num_patches = 576 # Default fallback
+    num_patches = 729 # Default fallback
     vision_tower = None
     if hasattr(model, 'get_vision_tower'):
         vision_tower = model.get_vision_tower()
@@ -492,158 +628,85 @@ def process_image_and_prompt(
     # Storage for collecting attention maps for the collage
     collected_maps = []  # Store (attention_map, token_text) pairs
 
+    # todo: remove once done
+    mask_file = r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000466_masks.npy"
+    mask_file = r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000318_masks.npy"
+    mask_file = fix_wsl_paths(mask_file)
+    # with open(mask_file, "rb") as f:
+    #     import pickle
+    #     mask = pickle.load(f)
+    mask = np.load(mask_file, allow_pickle=True).item()['masks'][0]
+    # lets extract the coordinates of each pixel in the mask
+    mask_coords = np.argwhere(mask)
+    print(f"Mask coordinates shape: {mask_coords.shape}")
+    vision_tower_config = model.get_vision_tower().config
+    atten_indices, base_xy_indices = _pixel_to_token_indices_helper_anyres(mask_coords, image.size, possible_resolutions=model.config.image_grid_pinpoints)
+
+    # atten_indices = atten_indices + np.arange(4750, 4753).tolist()       # todo: remove this line, its just for testing
+    atten_indices = atten_indices + [4753]       # todo: remove this line, its just for testing
+    print(f"Attention mask shape: {len(atten_indices)}")
+
     # --- Generation Loop ---
     for i in range(max_new_tokens):
         with torch.inference_mode():
-            # Prepare inputs for the current step
-            model_inputs = {"input_ids": current_input_ids,
-                            "past_key_values": past_key_values,
-                            "use_cache": True, # Use cache within the loop
-                            "output_attentions": True, # Re-enable attention output
-                            # "atten_layer": 0, # Specify the layer for attention extraction
-                            "output_hidden_states": True} # Often needed
-
-            # If it's the first step, pass images; otherwise, only pass input_ids and cache
-            if i == 0:
-                 model_inputs["images"] = image_tensor
-                 model_inputs["image_sizes"] = image_sizes
-                 model_inputs["modalities"] = ["image"]
-
-            # Forward pass
+            # 1. Prepare inputs and run model
+            model_inputs = prepare_model_inputs(
+                i, current_input_ids, past_key_values, atten_indices,
+                image_tensor, image_sizes
+            )
             outputs = model(**model_inputs)
 
-            # Get logits for the next token
-            next_token_logits = outputs.logits[:, -1, :] # Logits for the last token position
-
-            # Greedy decoding
+            # 2. Get next token (greedy decoding)
+            next_token_logits = outputs.logits[:, -1, :]
             next_token_id = torch.argmax(next_token_logits, dim=-1)
 
-            # Check for EOS
+            # 3. Check for end of sequence
             if next_token_id.item() == eos_token_id:
                 print("EOS token generated. Stopping.")
                 break
 
-            # Store generated token
+            # 4. Store the generated token
             generated_ids.append(next_token_id.item())
 
-            # --- Extract and Visualize Attention for this step ---
-            attentions = outputs.attentions # Attentions from this forward pass
-            if attentions is None:
-                print(f"Warning: No attention scores found for step {i}. Skipping visualization.")
+            # 5. Extract attention map for visualization
+            current_token_index = outputs.logits.shape[1] - 1
+            attention_map = extract_attention_map(i, tokenizer,
+                outputs, current_token_index, atten_indices,
+                image_token_start_index_in_llm, image_token_end_index_in_llm,
+                grid_size, num_patches
+            )
+
+            ## Print the debug text like in the original code
+            if i == 0:
+                txt_ids = torch.argmax(outputs.logits, dim=-1)[0]
+                txt_np = np.array([tokenizer.decode(val).strip() for val in txt_ids])
+                resulted_description = ",".join(txt_np[atten_indices])
             else:
-                # --- Select Attention Layer ---
-                # Use the layer index specified during model loading, stored in config
-                target_layer_index = model.config.attn_layer_ind
-                # if target_layer_index < 0 or target_layer_index >= len(attentions):
-                #     # Default to last layer if index is invalid or -1
-                #     if target_layer_index != -1:
-                #          print(f"Warning: Invalid attn_layer_ind ({target_layer_index}). Using last layer ({len(attentions) - 1}).")
-                #     target_layer_index = len(attentions) - 1
+                resulted_description = tokenizer.decode(next_token_id.item())
+            print(f"Resulted words from mask: {resulted_description}")
 
-                print(f"Extracting attention from layer: {target_layer_index}")
-                selected_layer_attentions = attentions[0][0] # Shape: (batch_size, num_heads, step_seq_len, step_seq_len)
-                selected_layer_attentions = selected_layer_attentions.squeeze(0) # Shape: (num_heads, step_seq_len, step_seq_len)
-                avg_attentions_step = selected_layer_attentions.mean(dim=0) # Shape: (step_seq_len, step_seq_len)
+            # 6. Process and save attention map if valid
+            if attention_map is not None:
+                token_text = tokenizer.decode([next_token_id.item()]).strip()
+                save_attention_visualizations(
+                    attention_map, image, next_token_id.item(), token_text, i,
+                    vis_output_dir_raw, vis_output_dir_processed, output_dir / "attention_tensors",
+                    attn_threshold, opening_kernel_size, min_blob_area, min_avg_attention,
+                    show_highest_attn_blob, dilate_kernel_size,
+                    visualize_attn_overlays, collected_maps if create_collage else None
+                )
+            else:
+                print(f"Warning: Could not extract valid attention map for step {i}. Skipping visualization.")
 
-                # The token whose attention we want is the *last one* in the input sequence for this step
-                current_token_index_in_step = avg_attentions_step.shape[0] - 1
+            # 7. Prepare for next iteration
+            current_input_ids = next_token_id.unsqueeze(-1)
+            past_key_values = outputs.past_key_values
 
-                # The image patches are at fixed indices relative to the start
-                token_attention_to_image = avg_attentions_step[current_token_index_in_step, image_token_start_index_in_llm:image_token_end_index_in_llm]
-
-                if token_attention_to_image.shape[0] == num_patches:
-                    # --- Reshape ---
-                    # Check if padding is needed and possible
-                    expected_elements = grid_size * grid_size
-                    if expected_elements > num_patches:
-                        padding_size = expected_elements - num_patches
-                        token_attention_to_image = torch.cat([token_attention_to_image, torch.zeros(padding_size, device=token_attention_to_image.device)])
-                    elif expected_elements < num_patches:
-                        print(f"Warning: grid_size^2 ({expected_elements}) < num_patches ({num_patches}) at step {i}. Cannot reshape correctly. Skipping visualization.")
-                        continue # Skip to next token
-
-                    # Check if total elements match before reshaping
-                    if token_attention_to_image.numel() != expected_elements:
-                         print(f"Warning: Element count mismatch before reshape at step {i}. Expected {expected_elements}, got {token_attention_to_image.numel()}. Skipping visualization.")
-                         continue # Skip to next token
-
-                    attention_map_np = token_attention_to_image.reshape(grid_size, grid_size).cpu().numpy()
-
-                    # --- Prepare filename ---
-                    token_text = tokenizer.decode([next_token_id.item()]).strip()
-                    safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text)
-                    if not safe_token_text: safe_token_text = f"tokenid_{next_token_id.item()}"
-
-                    # --- Save Raw Attention Map (with checks) ---
-                    save_path_raw = vis_output_dir_raw / f"token_{i:03d}_{safe_token_text}.png"
-                    # SAFETY LOGIC: Check for valid numpy array and PIL image before proceeding
-                    if not isinstance(attention_map_np, np.ndarray):
-                        print(f"[ERROR] Attention map is not a numpy array for step {i}, skipping save.")
-                    elif attention_map_np.ndim != 2:
-                        print(f"[ERROR] Attention map is not 2D for step {i}, skipping save.")
-                    elif not isinstance(image, Image.Image):
-                        print(f"[ERROR] Original image is not a PIL Image for step {i}, skipping save.")
-                    else:
-                        map_img_raw = Image.fromarray(attention_map_np.astype(np.float32))
-                        resized_map_img_raw = map_img_raw.resize(image.size, Image.Resampling.LANCZOS)
-                        resized_map_raw = np.array(resized_map_img_raw)
-
-                        # Check for division by zero before normalization
-                        min_val, max_val = np.min(resized_map_raw), np.max(resized_map_raw)
-                        if max_val > min_val:
-                            norm_map_raw = (resized_map_raw - min_val) / (max_val - min_val)
-                        else:
-                            norm_map_raw = np.zeros_like(resized_map_raw)
-
-                        heatmap_raw = cm.viridis(norm_map_raw)[:, :, :3]
-                        heatmap_uint8_raw = (heatmap_raw * 255).astype(np.uint8)
-                        # Ensure image is RGB before blending
-                        if image.mode != "RGB":
-                            img_rgb = image.convert("RGB")
-                        else:
-                            img_rgb = image
-                        overlay_img_raw = Image.blend(img_rgb, Image.fromarray(heatmap_uint8_raw), alpha=0.5)
-                        # Check if save path is writable
-                        if visualize_attn_overlays:
-                            overlay_img_raw.save(save_path_raw)
-
-                    # --- Save Raw Attention Tensor ---
-                    tensor_output_dir = output_dir / "attention_tensors"
-                    save_raw_attention_tensor(
-                        attention_map=attention_map_np,  # Original tensor before reshaping
-                        output_path=tensor_output_dir,
-                        token_id=next_token_id.item(),
-                        token_text=token_text,
-                        step_idx=i
-                    )
-                    if visualize_attn_overlays:
-                        save_path_processed = vis_output_dir_processed / f"token_{i:03d}_{safe_token_text}.png"
-                        image_overlay = visualize_processed_attention(
-                            attention_map=attention_map_np, # Pass the raw map
-                            original_image=image,
-                            output_path=save_path_processed,
-                            threshold_value=attn_threshold,
-                            opening_kernel_size=opening_kernel_size,
-                            min_blob_area=min_blob_area,
-                            min_avg_attention=min_avg_attention,
-                            show_highest_attn_blob=show_highest_attn_blob,
-                            dilate_kernel_size=dilate_kernel_size
-                        )
-                        # Collect this map for the collage
-                        if create_collage:
-                            collected_maps.append((image_overlay, token_text))
-
-                else:
-                     print(f"Warning: Attention shape mismatch at step {i}. Expected {num_patches}, got {token_attention_to_image.shape[0]}. Skipping visualization.")
-
-
-            # Prepare for the next iteration
-            current_input_ids = next_token_id.unsqueeze(-1) # Input for next step is just the new token
-            past_key_values = outputs.past_key_values # Update cache
-
-        # Optional: Clear CUDA cache periodically if memory pressure is still high
-        # if i % 10 == 0:
-        #     torch.cuda.empty_cache()
+            # Update attention indices
+            if i == 0:
+                initial_token_length = past_key_values[0][0].shape[2]
+            input_token_length = past_key_values[0][0].shape[2]
+            atten_indices = atten_indices + [current_token_index+1]
 
     # After the generation loop, create collages from the collected maps
     if create_collage and collected_maps:

@@ -38,6 +38,7 @@ def find_image_files(path, extensions, recursive=False):
 
     # If path is a directory, find all image files
     if recursive:
+        print(f"Recursively searching for images in {path}")
         for ext in extensions:
             image_files.extend(path.glob(f'**/*{ext}'))
     else:
@@ -96,6 +97,20 @@ def main():
                        " Person 2: {short description}, looking at {short description} .\n"
                        " Additional rules • Keep the phrase **“looking at”** unchanged. • {short description} = ≤ 6 words (e.g., “man in red jacket”). • If no foreground person is detected, write exactly: `No foreground people detected.` • If gaze cannot be determined, use “uncertain”."
                        " Do **not** output your reasoning or any extra text.")
+        args.prompt = ("Caption: <one short sentence about the whole image>"
+                       "For each large‑enough person in the foreground, from left to right:"
+                       "Person <#>: <short description>, looking at <object description | outside of frame | uncertain>"
+                       "If no foreground people: No foreground people detected.")
+        args.prompt = ("Describe the image and where each person is looking in the following format:"
+                       "Caption: <one short sentence about the whole image>"
+                       "For each large‑enough person in the foreground, from left to right:"
+                       "Person <#>: <short description>, looking at <object | outside of frame | uncertain>"
+                       "If no foreground people: No foreground people detected."
+                       "Always use 'looking at' to describe gaze direction.")
+        args.prompt = ("Complete the sentence. The man is looking at")
+        # args.prompt = ("Complete the sentence. The man is wearing a")
+        # args.prompt = ("Complete the sentence. This area in the image has")
+
     # Handle layer selection logic
     if args.layer is not None:
         # If specific layer is provided, use it for both start and end
@@ -207,27 +222,27 @@ def main():
             original_stdout = sys.stdout
             original_stderr = sys.stderr
 
-            with open(log_file_path, 'w') as log_file:
-                sys.stdout = log_file
-                sys.stderr = log_file
+            # with open(log_file_path, 'w') as log_file:
+            #     sys.stdout = log_file
+            #     sys.stderr = log_file
 
-                # Process the current layer
-                process_image_and_prompt(
-                    str(image_path),
-                    args.prompt,
-                    model,
-                    tokenizer,
-                    image_processor,
-                    layer_output_dir,
-                    attn_threshold=args.attn_threshold,
-                    opening_kernel_size=args.opening_kernel,
-                    min_blob_area=args.min_blob_area,
-                    min_avg_attention=args.min_avg_attn,
-                    show_highest_attn_blob=args.show_highest_attn_blob,
-                    dilate_kernel_size=args.dilate_highest_blob
-                )
+            # Process the current layer
+            process_image_and_prompt(
+                str(image_path),
+                args.prompt,
+                model,
+                tokenizer,
+                image_processor,
+                layer_output_dir,
+                attn_threshold=args.attn_threshold,
+                opening_kernel_size=args.opening_kernel,
+                min_blob_area=args.min_blob_area,
+                min_avg_attention=args.min_avg_attn,
+                show_highest_attn_blob=args.show_highest_attn_blob,
+                dilate_kernel_size=args.dilate_highest_blob
+            )
 
-                print(f"Layer {layer_idx} processing completed successfully.")
+            print(f"Layer {layer_idx} processing completed successfully.")
 
             sys.stdout = original_stdout
             sys.stderr = original_stderr
