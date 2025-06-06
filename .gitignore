@@ -73,3 +73,5 @@ data_processing/
 # demo/
 /llava_attention_maps/
 /llava_attention_sweep/
+# all png files
+*.png
