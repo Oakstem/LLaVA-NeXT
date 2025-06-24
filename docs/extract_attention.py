@@ -498,6 +498,7 @@ def save_attention_visualizations(attention_map, image, token_id, token_text, st
 
 def process_image_and_prompt(
     image_path: Union[str, Path],
+    mask_path: Optional[Union[str, Path]],
     prompt: str,
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
@@ -517,7 +518,8 @@ def process_image_and_prompt(
     collage_grid_rows: int = 3,
     collage_grid_cols: int = 4,
     visualize_attn_overlays: bool = True,
-) -> None:
+    return_masked_tokens: bool = False,
+) -> str:
     """
     Process a single image and prompt to generate text and extract attention,
     saving both raw and processed attention maps.
@@ -629,9 +631,9 @@ def process_image_and_prompt(
     collected_maps = []  # Store (attention_map, token_text) pairs
 
     # todo: remove once done
-    mask_file = r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000466_masks.npy"
-    mask_file = r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000318_masks.npy"
-    mask_file = fix_wsl_paths(mask_file)
+    # mask_file = r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000466_masks.npy"
+    # mask_file = r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000318_masks.npy"
+    mask_file = fix_wsl_paths(mask_path)
     # with open(mask_file, "rb") as f:
     #     import pickle
     #     mask = pickle.load(f)
@@ -643,7 +645,7 @@ def process_image_and_prompt(
     atten_indices, base_xy_indices = _pixel_to_token_indices_helper_anyres(mask_coords, image.size, possible_resolutions=model.config.image_grid_pinpoints)
 
     # atten_indices = atten_indices + np.arange(4750, 4753).tolist()       # todo: remove this line, its just for testing
-    atten_indices = atten_indices + [4753]       # todo: remove this line, its just for testing
+    # atten_indices = atten_indices + np.arange(4740, 4749).tolist()       # todo: remove this line, its just for testing
     print(f"Attention mask shape: {len(atten_indices)}")
 
     # --- Generation Loop ---
@@ -681,6 +683,8 @@ def process_image_and_prompt(
                 txt_ids = torch.argmax(outputs.logits, dim=-1)[0]
                 txt_np = np.array([tokenizer.decode(val).strip() for val in txt_ids])
                 resulted_description = ",".join(txt_np[atten_indices])
+                if return_masked_tokens:
+                    return resulted_description
             else:
                 resulted_description = tokenizer.decode(next_token_id.item())
             print(f"Resulted words from mask: {resulted_description}")
@@ -706,7 +710,9 @@ def process_image_and_prompt(
             if i == 0:
                 initial_token_length = past_key_values[0][0].shape[2]
             input_token_length = past_key_values[0][0].shape[2]
-            atten_indices = atten_indices + [current_token_index+1]
+            atten_indices = atten_indices + [input_token_length-1]
+            print(f"Total token length: {input_token_length}")
+            print(f"Current Attention indices: {atten_indices}")
 
     # After the generation loop, create collages from the collected maps
     if create_collage and collected_maps:

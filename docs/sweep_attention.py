@@ -6,6 +6,7 @@ import sys
 import re # Import re for sanitization
 from datetime import datetime # Import datetime
 import time # Import time for ETA calculation
+import json # Import json for saving results
 
 # Add project root to sys.path to allow imports like 'from docs. ...'
 project_root = Path(__file__).resolve().parent.parent
@@ -14,6 +15,21 @@ if str(project_root) not in sys.path:
 
 # Import functions directly from extract_attention.py
 from docs.extract_attention import load_model, process_image_and_prompt, fix_wsl_paths
+
+def save_results_to_json(results_dict, output_path):
+    """
+    Save results dictionary to a JSON file.
+
+    Args:
+        results_dict (dict): Dictionary with image names as keys and descriptions as values
+        output_path (Path): Path where to save the JSON file
+    """
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(results_dict, f, indent=2, ensure_ascii=False)
+        print(f"Results saved to: {output_path}")
+    except Exception as e:
+        print(f"Error saving results to JSON: {e}")
 
 def find_image_files(path, extensions, recursive=False):
     """
@@ -82,6 +98,7 @@ def main():
     parser.add_argument("--min-avg-attn", type=float, default=0.15, help="Minimum average attention within a blob (0-1).")
     parser.add_argument("--show-highest-attn-blob", action="store_true", help="Only visualize the blob with the highest average attention.")
     parser.add_argument("--dilate-highest-blob", type=int, default=0, help="Kernel size to dilate the highest attention blob (if shown). 0 or 1 means no dilation.")
+    parser.add_argument("--gazefollow_dataset", type=str, default=r"D:\Projects\data\gazefollow", help="Path to gaze follow dataset annotations (optional). If provided, will use gaze follow logic for attention extraction.")
 
 
     args = parser.parse_args()
@@ -108,6 +125,7 @@ def main():
                        "If no foreground people: No foreground people detected."
                        "Always use 'looking at' to describe gaze direction.")
         args.prompt = ("Complete the sentence. The man is looking at")
+        args.prompt = ("Describe the image.")
         # args.prompt = ("Complete the sentence. The man is wearing a")
         # args.prompt = ("Complete the sentence. This area in the image has")
 
@@ -128,6 +146,8 @@ def main():
         original_image_path = args.image_path
         args.base_output_dir = fix_wsl_paths(args.base_output_dir)
         args.image_path = fix_wsl_paths(args.image_path)
+        args.gazefollow_dataset = fix_wsl_paths(args.gazefollow_dataset)
+        args.masks_dir = Path(args.gazefollow_dataset) / "train_gaze_segmentations" / "masks"
         if args.base_output_dir != original_base_dir:
              print(f"Fixed base_output_dir: {args.base_output_dir}")
         if args.image_path != original_image_path:
@@ -182,13 +202,21 @@ def main():
     model.eval()
     print("Model loaded successfully")
 
+    # Dictionary to hold results for JSON export
+    results_dict = {}
+
     # Process all images
     start_time = time.time()
     for img_idx, image_path in enumerate(image_paths):
         # Progress reporting
         percent_complete = (img_idx / len(image_paths)) * 100
         time_elapsed = time.time() - start_time
-
+        # check if mask exists for this image
+        if args.gazefollow_dataset:
+            mask_path = args.masks_dir / f"gaze__{Path(image_path).stem}_masks.npy"
+            if not mask_path.exists():
+                print(f"Warning: Mask file {mask_path} does not exist. Skipping image {image_path}")
+                continue
         # Calculate ETA if more than one image has been processed
         if img_idx > 0:
             time_per_image = time_elapsed / img_idx
@@ -227,25 +255,36 @@ def main():
             #     sys.stderr = log_file
 
             # Process the current layer
-            process_image_and_prompt(
-                str(image_path),
-                args.prompt,
-                model,
-                tokenizer,
-                image_processor,
-                layer_output_dir,
-                attn_threshold=args.attn_threshold,
-                opening_kernel_size=args.opening_kernel,
-                min_blob_area=args.min_blob_area,
-                min_avg_attention=args.min_avg_attn,
-                show_highest_attn_blob=args.show_highest_attn_blob,
-                dilate_kernel_size=args.dilate_highest_blob
-            )
-
+            results = process_image_and_prompt(
+                        str(image_path),
+                        str(mask_path),
+                        args.prompt,
+                        model,
+                        tokenizer,
+                        image_processor,
+                        layer_output_dir,
+                        attn_threshold=args.attn_threshold,
+                        opening_kernel_size=args.opening_kernel,
+                        min_blob_area=args.min_blob_area,
+                        min_avg_attention=args.min_avg_attn,
+                        show_highest_attn_blob=args.show_highest_attn_blob,
+                        dilate_kernel_size=args.dilate_highest_blob,
+                        return_masked_tokens=True)
+            print(f"Resulted masked tokens: {results}")
             print(f"Layer {layer_idx} processing completed successfully.")
+
+            # Add result to dictionary for JSON export
+            image_key = str('/'.join(rel_path.parts[-3:]))  # Use image file name as key
+            if image_key not in results_dict:
+                results_dict[image_key] = {}
+            results_dict[image_key][f"mask_tokens"] = results
 
             sys.stdout = original_stdout
             sys.stderr = original_stderr
+
+        # Save all results to a single JSON file at the end
+        json_output_path = Path(args.gazefollow_dataset) / "masked_gazetargets.json"
+        save_results_to_json(results_dict, json_output_path)
 
     total_time = time.time() - start_time
     print(f"\n{'-'*80}")

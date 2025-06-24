@@ -57,7 +57,7 @@ def prepare_gaze_follow_dataset(annot_path: str, data_base_dir: str):
 
 # Helper function to convert pixel coordinates to token indices
 def _pixel_to_token_indices_helper_anyres(
-    pixel_coords: List[Tuple[int, int]],  # List of (x, y) coordinates from top-left of original image
+    pixel_coords: List[Tuple[int, int]],  # List of (y, x) coordinates from top-left of original image
     original_image_size: Tuple[int, int],  # (original_height, original_width)
     possible_resolutions: List[Tuple[int, int]],  # List of (W,H) tuples from grid_pinpoints
     final_patch_division_size: int=384,  # The size used in `divide_to_patches`, e.g., processor.crop_size["height"]
@@ -168,7 +168,7 @@ def _pixel_to_token_indices_helper_anyres(
         token_indices.append(final_base_img_idx)
 
     # lets also add the start text tokens to the mask (initial prompt text)
-    # for i in range(12,26):
-    #     token_indices.append(i)
+    # for i in range(0, 26):
+        # token_indices.append(i)
 
     return sorted(list(set(token_indices))), base_xy_coords

@@ -90,6 +90,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         cache_position=None,
         atten_ids=[],
         pixel_coords_for_attention: Optional[List[Tuple[int, int]]] = None, # New parameter
+        **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         ids_to_attend_pixels = []
@@ -145,7 +146,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 device=input_device,
                 dtype=input_dtype,
             )
-        if inputs_embeds is None:
+        if inputs_embeds is None and attention_mask is not None:
             tokens_to_take = 1
             attention_mask = attention_mask[:, :, -tokens_to_take:, :]
             # attention_mask = attention_mask[:, :, None, :]
@@ -183,6 +184,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                boost_positions=kwargs.get("boost_positions", None),
+                bias_strength=kwargs.get("bias_strength", None),
             )
 
     @torch.no_grad()
