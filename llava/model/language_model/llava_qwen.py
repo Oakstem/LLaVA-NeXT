@@ -100,7 +100,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if inputs_embeds is None:
             if images is not None and image_sizes is not None:
                 (input_ids, position_ids, attention_mask_prepared, past_key_values, inputs_embeds, labels,
-                 _image_features_ret, _user_prompt_features_ret) = \
+                 _image_features_ret, _user_prompt_features_ret, self.tokens_indexing) = \
                     self.prepare_inputs_labels_for_multimodal(
                         input_ids=original_input_ids,
                         position_ids=position_ids,
@@ -126,13 +126,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     image_sizes=image_sizes
                 )
 
-        final_ids_to_attend = atten_ids
+        final_ids_to_attend = kwargs.get("boost_positions" , None)
 
         # if inputs_embeds is not None:   # todo: uncomment once done testing, commenting out to get custom mask during generation too
         if inputs_embeds is None:
             input_embeds_shape = torch.Size([1, past_key_values[0][0].shape[2]+1, 1])
             input_device = past_key_values[0][0].device
             input_dtype = past_key_values[0][0].dtype
+            # final_ids_to_attend = None
+            # kwargs["boost_positions"] = None
         else:
             input_embeds_shape = inputs_embeds.shape
             input_device = inputs_embeds.device
@@ -141,14 +143,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # Otherwise, the attention_mask from prepare_inputs_labels_for_multimodal (which should be causal) or passed in, is used.
         if final_ids_to_attend:
             attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
+                input_embeds=inputs_embeds,
                 inputs_embeds_shape=input_embeds_shape,
                 ids_to_attend=final_ids_to_attend,
+                tokens_indexing=self.tokens_indexing,
                 device=input_device,
                 dtype=input_dtype,
             )
         if inputs_embeds is None and attention_mask is not None:
             tokens_to_take = 1
-            attention_mask = attention_mask[:, :, -tokens_to_take:, :]
+            attention_mask = attention_mask[:, :, -tokens_to_take:, :]      # reduce only to the last query token
             # attention_mask = attention_mask[:, :, None, :]
         # If final_ids_to_attend is empty, attention_mask remains as is.
         # It's assumed that if images were processed, prepare_inputs_labels_for_multimodal
@@ -186,6 +190,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
                 boost_positions=kwargs.get("boost_positions", None),
                 bias_strength=kwargs.get("bias_strength", None),
+                tokens_indexing=self.tokens_indexing,
             )
 
     @torch.no_grad()
@@ -221,8 +226,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         return inputs
 
     @staticmethod
-    def _build_custom_attention_mask_static(inputs_embeds_shape: Tuple[int, ...],
+    def _build_custom_attention_mask_static(input_embeds: Optional[torch.Tensor],
+                                            inputs_embeds_shape: Tuple[int, ...],
                                             ids_to_attend: List[int],
+                                            tokens_indexing: dict,
                                             device: torch.device,
                                             dtype: torch.dtype = torch.float16) -> torch.Tensor:
         """
@@ -237,14 +244,20 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         causal_indices = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
         mask[causal_indices] = 1.
 
+        if input_embeds is None:
+             # lets mask all the image tokens
+            mask[:, tokens_indexing['image'][0]] = 0.
+        
         # Modify the last row for specific attention if ids_to_attend is provided
         if ids_to_attend and seq_len > 0:
             last_token_idx = seq_len - 1
-            mask[last_token_idx, :] = float("0")  # Disallow all by default for the last token
+            # mask[last_token_idx, :] = float("0")  # Disallow all by default for the last token
 
             valid_ids_to_attend = [idx for idx in ids_to_attend if 0 <= idx < seq_len]
             if valid_ids_to_attend:
                 mask[last_token_idx, torch.tensor(valid_ids_to_attend, device=device, dtype=torch.long)] = 1.
+        else:            
+            k = 1
 
         # Reshape to [batch_size, 1, seq_len, seq_len] for broadcasting with attention heads
         # Qwen2 expects (batch_size, num_heads, query_length, kv_length) or (batch_size, 1, query_length, kv_length)

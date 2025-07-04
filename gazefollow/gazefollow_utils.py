@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import pandas as pd
 from typing import List, Optional, Tuple, Union, Dict
 from llava.mm_utils import select_best_resolution  # Import the helper from mm_utils
@@ -63,6 +64,12 @@ def _pixel_to_token_indices_helper_anyres(
     final_patch_division_size: int=384,  # The size used in `divide_to_patches`, e.g., processor.crop_size["height"]
     image_token_start_index_in_embeds: int=14,
     patch_size: int=14,
+    add_system_prompt_tokens: bool=False,
+    add_user_prompt_tokens: bool=False,
+    user_prompt_len: Optional[int] = 20,
+    system_prompt_len: Optional[int] = 14,
+    user_prompt_range: Optional[Union[int, Tuple[int, int]]] = [1849, 1869],
+    bias_offset: int = 0     
 ) -> Tuple[List[int], List[Tuple[int, int]]]:
     """
     Converts pixel coordinates to token indices for 'anyres' processed images.
@@ -73,7 +80,6 @@ def _pixel_to_token_indices_helper_anyres(
      2. check if during flatting every anyres [large] patch is being flattened separately, or they all flattented as one
      3. to find anyres based patch indices, we need to account for: - newline patch at the end of every row, - unpadded structure
     """
-
     original_w, original_h = original_image_size  # Note: mm_utils.select_best_resolution expects (width, height)
 
     # 1. Determine the "best_resolution" the image was padded/resized to.
@@ -167,7 +173,24 @@ def _pixel_to_token_indices_helper_anyres(
         # token_indices.append(final_anyres_idx)
         token_indices.append(final_base_img_idx)
 
+    # remove duplicates
+    token_indices = np.unique(np.array(token_indices))
+    # added constant bias
+    token_indices = token_indices + bias_offset
+    token_indices = token_indices.tolist()
     # lets also add the start text tokens to the mask (initial prompt text)
+    if add_system_prompt_tokens:
+        for i in range(0, system_prompt_len):
+            token_indices.append(i)
+    if add_user_prompt_tokens:
+        if isinstance(user_prompt_range, int):
+            user_prompt_len = user_prompt_range
+            for i in range(system_prompt_len, system_prompt_len + user_prompt_len):
+                token_indices.append(i)
+        elif isinstance(user_prompt_range, list) and len(user_prompt_range) == 2:
+            for i in range(user_prompt_range[0], user_prompt_range[1]):
+                token_indices.append(i)
+
     # for i in range(0, 26):
         # token_indices.append(i)
 

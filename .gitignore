@@ -75,3 +75,4 @@ data_processing/
 /llava_attention_sweep/
 # all png files
 *.png
+*.pt

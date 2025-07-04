@@ -437,6 +437,8 @@ class LlavaMetaForCausalLM(ABC):
             position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
+            # insert the image token labels
+            labels = torch.where(input_ids == IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, labels)
 
         # remove the padding using attention_mask -- FIXME
         _input_ids = input_ids
@@ -458,7 +460,7 @@ class LlavaMetaForCausalLM(ABC):
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
-
+            
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
             cur_input_ids_noim = []
             cur_labels = labels[batch_idx]
@@ -478,11 +480,13 @@ class LlavaMetaForCausalLM(ABC):
                 if i < num_images:
                     try:
                         cur_image_features = image_features[cur_image_idx]
+                        label_type = IMAGE_TOKEN_INDEX
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
+                        label_type = IGNORE_INDEX
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), label_type, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
@@ -532,7 +536,16 @@ class LlavaMetaForCausalLM(ABC):
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
         # rank0_print("tokenizer padding")
 
+        tokens_indexing = {'image': [], 'text': []}
+        for i, cur_labels in enumerate(new_labels_padded):
+            image_tokens_inds = (cur_labels == IMAGE_TOKEN_INDEX).nonzero().reshape(-1)
+            text_tokens_inds = (cur_labels != IMAGE_TOKEN_INDEX).nonzero().reshape(-1)
+            tokens_indexing['image'].append(image_tokens_inds)
+            tokens_indexing['text'].append(text_tokens_inds)
+
         if _labels is None:
+            # Extract indexes where the labels are image labels (IMAGE_TOKEN_INDEX)
+            image_label_indexes = (new_labels_padded == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)
             new_labels = None
         else:
             new_labels = new_labels_padded
@@ -554,7 +567,7 @@ class LlavaMetaForCausalLM(ABC):
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
         user_prompt_features = cur_input_embeds_no_im[-1]
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, image_features, user_prompt_features
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, image_features, user_prompt_features, tokens_indexing
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
