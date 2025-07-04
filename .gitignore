@@ -76,3 +76,4 @@ data_processing/
 # all png files
 *.png
 *.pt
+*.json
