@@ -29,7 +29,8 @@ from transformers.generation.utils import GenerateOutput
 
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
-from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
+from transformers import Qwen2Config        #, Qwen2Model, Qwen2ForCausalLM
+from qwen2.modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from llava.mm_utils import select_best_resolution # Import the helper from mm_utils
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
