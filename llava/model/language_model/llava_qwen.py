@@ -141,6 +141,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             input_dtype = inputs_embeds.dtype
         # Only build custom mask if final_ids_to_attend is populated.
         # Otherwise, the attention_mask from prepare_inputs_labels_for_multimodal (which should be causal) or passed in, is used.
+        if isinstance(final_ids_to_attend, dict):
+            source_ids_to_attend = final_ids_to_attend.get("gaze_source", None)
+            final_ids_to_attend = final_ids_to_attend.get("gaze_target", None)
+        else:
+            source_ids_to_attend = None
+            
         if final_ids_to_attend:
             attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
                 input_embeds=inputs_embeds,
@@ -150,10 +156,25 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 device=input_device,
                 dtype=input_dtype,
             )
+        if source_ids_to_attend is not None:
+            # If source_ids_to_attend is provided, we also build a mask for it.
+            # This is useful for cases where we want to boost attention to specific tokens.
+            source_attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
+                input_embeds=inputs_embeds,
+                inputs_embeds_shape=input_embeds_shape,
+                ids_to_attend=source_ids_to_attend,
+                tokens_indexing=self.tokens_indexing,
+                device=input_device,
+                dtype=input_dtype,
+            )
+        else:
+            source_attention_mask = None
+
         if inputs_embeds is None and attention_mask is not None:
             tokens_to_take = 1
             attention_mask = attention_mask[:, :, -tokens_to_take:, :]      # reduce only to the last query token
-            # attention_mask = attention_mask[:, :, None, :]
+            if source_attention_mask is not None:
+                source_attention_mask = source_attention_mask[:, :, -tokens_to_take:, :]
         # If final_ids_to_attend is empty, attention_mask remains as is.
         # It's assumed that if images were processed, prepare_inputs_labels_for_multimodal
         # would have set up a suitable (e.g., causal) attention_mask for inputs_embeds.
@@ -180,6 +201,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             return super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                source_attention_mask=source_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds,
@@ -191,6 +213,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 boost_positions=kwargs.get("boost_positions", None),
                 bias_strength=kwargs.get("bias_strength", None),
                 tokens_indexing=self.tokens_indexing,
+                query_indices=kwargs.get("query_indices", None),
             )
 
     @torch.no_grad()

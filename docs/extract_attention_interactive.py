@@ -51,6 +51,7 @@ from llava.constants import (
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.utils import disable_torch_init
 from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres
+import traceback
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -151,8 +152,10 @@ def load_mask_from_file(mask_path: Union[str, Path]) -> np.ndarray:
     if isinstance(mask_data, np.ndarray) and mask_data.dtype == object:
         # Handle pickled dict format
         mask_dict = mask_data.item()
-        if 'masks' in mask_dict:
-            mask = mask_dict['masks'][0]  # Take first mask
+        if 'static_masks' in mask_dict:
+            mask = mask_dict['static_masks'][0]  # Take first mask
+        elif 'masks' in mask_dict:
+            mask = mask_dict['masks'][0]
         else:
             mask = mask_dict
     else:
@@ -387,8 +390,8 @@ def _prepare_configs(generation_config: Optional[Dict], attention_config: Option
     """Prepare and merge generation and attention configurations with defaults."""
     default_generation_config = {
         "max_new_tokens": 50,
-        "temperature": 0.0,
-        "do_sample": False
+        "temperature": 0.5,
+        "do_sample": True
     }
 
     default_attention_config = {
@@ -434,15 +437,22 @@ def _prepare_inputs(
     model: PreTrainedModel
 ) -> Tuple[Any, Any, torch.Tensor, List, List[int], Any]:
     """Load and prepare image, mask, and input tensors."""
+    person_mask = None
+    person_mask_indices = None
     # Load image and mask
     image_path = fix_wsl_paths(str(image_path))
     mask_path = fix_wsl_paths(str(mask_path))
 
     image = load_image(image_path)
     mask = load_mask_from_file(mask_path)
+    person_mask_path = mask_path.replace("gaze__", "person__")
+    if Path(person_mask_path).exists():
+        person_mask = load_mask_from_file(person_mask_path)
+
 
     print(f"Image size: {image.size}")
     print(f"Mask shape: {mask.shape}")
+
 
     # Process image
     image_tensor = process_images([image], image_processor, model.config)
@@ -453,6 +463,8 @@ def _prepare_inputs(
 
     # Get attention indices from mask
     atten_indices = get_attention_indices_from_mask(mask, image.size, model.config)
+    if person_mask is not None:
+        person_mask_indices = get_attention_indices_from_mask(person_mask, image.size, model.config)
     print(f"Initial attention indices: {len(atten_indices)} tokens")
 
     # Prepare conversation
@@ -475,7 +487,7 @@ def _prepare_inputs(
 
     image_sizes = [image.size]
     # tokenizer.decode(input_ids.cpu().numpy()[0][-11:-9])
-    return image, mask, image_tensor, image_sizes, atten_indices, input_ids
+    return image, mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids
 
 def _determine_image_patch_info(model: PreTrainedModel, input_ids: torch.Tensor) -> Tuple[int, int, int, int]:
     """Determine image patch information and token indices."""
@@ -528,7 +540,7 @@ def _generate_next_token(
         # Apply temperature
         if gen_config.get("temperature", 1.) != 1.0:
             next_token_logits = next_token_logits / gen_config["temperature"]
-        next_token_id = torch.multinomial(torch.softmax(next_token_logits, dim=-1), 1)
+        next_token_id = torch.multinomial(torch.softmax(next_token_logits[0], dim=-1), 1)
     else:
         next_token_id = torch.argmax(next_token_logits, dim=-1)
 
@@ -672,9 +684,10 @@ def run_generation_with_attention(
     output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir = _setup_output_directories(output_dir)
 
     # Load and prepare inputs
-    image, mask, image_tensor, image_sizes, atten_indices, input_ids = _prepare_inputs(image_path, mask_path, prompt, image_processor, tokenizer, model)
+    image, mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids = \
+    _prepare_inputs(image_path, mask_path, prompt, image_processor, tokenizer, model)
     # temp boost coordinates
-    boost_positions = atten_indices
+    boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
     # Determine image patch information
     num_patches, grid_size, image_token_start_index_in_llm, image_token_end_index_in_llm = _determine_image_patch_info(model, input_ids)
 
@@ -702,6 +715,7 @@ def run_generation_with_attention(
                 "atten_ids": None,
                 "boost_positions": boost_positions,
                 "bias_strength": bias_strength,
+                "query_indices": attn_config.get("query_indices", None),
             }
 
             # Add image data only in first step
@@ -735,8 +749,10 @@ def run_generation_with_attention(
             if i == 0:
                 txt_ids = torch.argmax(outputs.logits, dim=-1)[0]
                 txt_np = np.array([tokenizer.decode(val).strip() for val in txt_ids])
-                resulted_description = ",".join(txt_np[boost_positions])
-                print(f"Resulted words from mask: {resulted_description}")
+                resulted_description = ",".join(txt_np[boost_positions['gaze_target']])
+                resulted_source_description = ",".join(txt_np[boost_positions['gaze_source']])
+                print(f"Resulted words from gaze target mask: {resulted_description}")
+                print(f"Resulted words from gaze source mask: {resulted_source_description}")
             # else:
                 # print(f"Generated token {i}: '{token_text}'")
 
@@ -961,6 +977,7 @@ def process_batch_from_json(
         except Exception as e:
             error_msg = f"Unexpected error processing {image_key}: {str(e)}"
             print(f"❌ {error_msg}")
+            traceback.print_exc()
             results[image_key] = {
                 "subject_description": subject_description,
                 "generation_result": {"error": error_msg},
@@ -997,9 +1014,9 @@ for bias_i in np.linspace(0., 5., 10):
     print(f"Running experiment with bias strength: {bias_i:.2f}")
     EXPERIMENT_CONFIG = {
         # Input paths (MODIFY THESE)
-        "image_path": r"D:\Projects\data\gazefollow\train\00000000\00000010.jpg",  # Your image path
+        "image_path": r"D:\Projects\data\gazefollow\train\00000000\00000022.jpg",  # Your image path
         # "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000318_masks.npy",  # Your mask path
-        "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000010_masks.npy",  # Your mask path
+        "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_masks.npy",  # Your mask path
         # "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_masks.npy",  # Your mask path
         # "prompt": "Complete the sentence. The tattooed man at wedding reception is looking at",  # Your prompt
         # "prompt": "Complete the sentence in a few words answer. The object is",  # Your prompt
@@ -1013,8 +1030,8 @@ for bias_i in np.linspace(0., 5., 10):
         "generation_config": {
             "bias_strength": bias_i,  # Set to 0.0 for no bias, or adjust as needed
             "max_new_tokens": 50,
-            "temperature": 0.0,
-            "do_sample": False
+            "temperature": 1.,
+            "do_sample": True
         },
 
         # Attention visualization configuration
@@ -1029,7 +1046,10 @@ for bias_i in np.linspace(0., 5., 10):
             "collage_grid_rows": 3,
             "collage_grid_cols": 4,
             "visualize_attn_overlays": True,
-            "save_tensors": True
+            "save_tensors": True,
+            "query_indices": {"gaze_source": [-5, -3], # taking the person indices from the end of the prompt, using range format
+                              "gaze_target": [-3, 0]  # taking the attention indices from the end of the prompt
+                            },
         }
     }
 
@@ -1109,7 +1129,10 @@ JSON_BATCH_CONFIG = {
         "collage_grid_rows": 3,
         "collage_grid_cols": 4,
         "visualize_attn_overlays": True,
-        "save_tensors": True
+        "save_tensors": True,
+        "query_indices": {"gaze_source": [-5, -3], # taking the person indices from the end of the prompt, using range format
+                          "gaze_target": [-3, 0]  # taking the attention indices from the end of the prompt
+                            },
     }
 }
 
