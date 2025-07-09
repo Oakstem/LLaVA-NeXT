@@ -11,7 +11,8 @@
 # - Flexible attention visualization parameters
 # - Batch processing capabilities
 
-# Todo: finished adding indexes of image and text tokens to the output, lets try to limit the attention on the image tokens only
+# Todo: 1. clip the confidence to a certain range so that EOS tokens won't get too much weight in the average (1-5 instead of 3k)
+# 2. optimize the way we calculate attention correlation, some results seem very high correlation in the image maps, but overall getting low scores
 
 # %%
 # Setup and Imports
@@ -52,6 +53,13 @@ from llava.conversation import conv_templates, SeparatorStyle
 from llava.utils import disable_torch_init
 from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres
 import traceback
+
+# Import our enhanced generation metrics
+from generation_metrics import (
+    ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
+    generate_next_token_with_evaluation, create_generation_summary,
+    analyze_generation_quality
+)
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -390,8 +398,9 @@ def _prepare_configs(generation_config: Optional[Dict], attention_config: Option
     """Prepare and merge generation and attention configurations with defaults."""
     default_generation_config = {
         "max_new_tokens": 50,
-        "temperature": 0.5,
-        "do_sample": True
+        "temperature": 0.1,
+        "do_sample": True,
+        "top_k": None  # None = disabled, int > 0 = enabled with specified value
     }
 
     default_attention_config = {
@@ -536,12 +545,31 @@ def _generate_next_token(
 
     # Get next token
     next_token_logits = outputs.logits[:, -1, :]
+    
     if gen_config.get("do_sample", False):
-        # Apply temperature
+        # 1. Apply top-k filtering first (if enabled)
+        if gen_config.get("top_k") is not None and gen_config.get("top_k") > 0:
+            top_k = gen_config["top_k"]
+            # Get top-k indices and values
+            top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k, dim=-1)
+            # Create filtered logits tensor (set non-top-k to -inf)
+            filtered_logits = torch.full_like(next_token_logits, float('-inf'))
+            filtered_logits.scatter_(-1, top_k_indices, top_k_logits)
+            next_token_logits = filtered_logits
+        
+        # 2. Apply temperature scaling (after top-k filtering)
+
         if gen_config.get("temperature", 1.) != 1.0:
             next_token_logits = next_token_logits / gen_config["temperature"]
-        next_token_id = torch.multinomial(torch.softmax(next_token_logits[0], dim=-1), 1)
+        
+        # 3. Sample from the (potentially filtered) distribution
+        probs = torch.softmax(next_token_logits, dim=-1)
+        if len(probs.shape) == 3:
+            next_token_id = torch.multinomial(probs[0], 1)
+        else:
+            next_token_id = torch.multinomial(probs, 1)
     else:
+        # Greedy decoding (no sampling)
         next_token_id = torch.argmax(next_token_logits, dim=-1)
 
     token_text = tokenizer.decode([next_token_id.item()]).strip()
@@ -562,9 +590,9 @@ def _extract_and_process_attention(
     vis_output_dir_processed: Path,
     tensor_output_dir: Path
 ) -> Optional[Any]:
-    """Extract attention map and save visualizations. Returns processed image for collage or None."""
+    """Extract attention map and save visualizations. Returns processed image for collage and the raw attention map."""
     if outputs.attentions is None:
-        return None
+        return None, None
 
     attentions = outputs.attentions
     selected_attentions = attentions[0][0].squeeze(0)  # Remove batch dimension
@@ -574,7 +602,7 @@ def _extract_and_process_attention(
     token_attention_to_image = avg_attentions[current_token_index, image_token_start_index_in_llm:image_token_start_index_in_llm + num_patches]
 
     if token_attention_to_image.shape[0] != num_patches:
-        return None
+        return None, None
 
     # Handle padding for square grid
     expected_elements = grid_size * grid_size
@@ -627,7 +655,7 @@ def _extract_and_process_attention(
             next_token_id.item(), token_text, step_idx
         )
 
-    return processed_img
+    return processed_img, attention_map
 
 def _create_collages(
     collected_maps: List,
@@ -691,13 +719,20 @@ def run_generation_with_attention(
     # Determine image patch information
     num_patches, grid_size, image_token_start_index_in_llm, image_token_end_index_in_llm = _determine_image_patch_info(model, input_ids)
 
-    # Generation loop
-    print("Starting generation with attention extraction...")
+    # Enhanced generation loop with evaluation metrics
+    print("Starting generation with attention extraction and advanced evaluation...")
     max_new_tokens = gen_config["max_new_tokens"]
     generated_ids = []
     past_key_values = None
     current_input_ids = input_ids
     collected_maps = []  # For collage
+
+    # Initialize evaluation trackers
+    confidence_tracker = ConfidenceMetrics()
+    repetitivity_tracker = RepetitivityMetrics(window_size=10)
+    candidate_evaluator = TopKCandidateEvaluator(k=5, tokenizer=tokenizer)
+    all_step_metrics = []
+    all_attention_maps = [] # To collect attention maps for correlation
 
     eos_token_id = tokenizer.eos_token_id
     if isinstance(eos_token_id, list):
@@ -724,8 +759,29 @@ def run_generation_with_attention(
                 model_inputs["image_sizes"] = image_sizes
                 model_inputs["modalities"] = ["image"]
 
-            # Generate next token
-            next_token_id, token_text, outputs = _generate_next_token(model_inputs, model, tokenizer, gen_config)
+            # Enhanced generation with evaluation metrics
+            try:
+                next_token_id, token_text, outputs, evaluation_metrics = generate_next_token_with_evaluation(
+                    model_inputs, model, tokenizer, gen_config,
+                    confidence_tracker, repetitivity_tracker, candidate_evaluator, i
+                )
+                all_step_metrics.append(evaluation_metrics)
+                
+                # Print step details with metrics
+                conf_score = evaluation_metrics["confidence"].get("confidence_score", 0)
+                entropy = evaluation_metrics["confidence"].get("entropy", 0)
+                print(f"Step {i}: '{token_text}' | Confidence: {conf_score:.3f} | Entropy: {entropy:.3f}")
+                
+                # Show top candidates for interesting steps (low confidence)
+                if conf_score < 0.8 and len(evaluation_metrics["top_k_analysis"]["candidates"]) >= 3:
+                    print(f"  Top alternatives:")
+                    for j, candidate in enumerate(evaluation_metrics["top_k_analysis"]["candidates"][:3]):
+                        print(f"    {j+1}. '{candidate['token_text']}' (p={candidate['probability']:.3f})")
+                
+            except Exception as e:
+                print(f"Enhanced generation failed, falling back to standard generation: {e}")
+                # Fallback to original generation method
+                next_token_id, token_text, outputs = _generate_next_token(model_inputs, model, tokenizer, gen_config)
 
             # Check for EOS
             if next_token_id.item() == eos_token_id:
@@ -735,11 +791,13 @@ def run_generation_with_attention(
             generated_ids.append(next_token_id.item())
 
             # Extract and process attention
-            processed_img = _extract_and_process_attention(
+            processed_img, attention_map = _extract_and_process_attention(
                 outputs, next_token_id, token_text, i,
                 num_patches, grid_size, image_token_start_index_in_llm,
                 image, attn_config, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir
             )
+            if attention_map is not None:
+                all_attention_maps.append(attention_map)
 
             # Collect for collage
             if attn_config["create_collage"] and processed_img is not None:
@@ -753,18 +811,20 @@ def run_generation_with_attention(
                 resulted_source_description = ",".join(txt_np[boost_positions['gaze_source']])
                 print(f"Resulted words from gaze target mask: {resulted_description}")
                 print(f"Resulted words from gaze source mask: {resulted_source_description}")
-            # else:
-                # print(f"Generated token {i}: '{token_text}'")
 
             # Update for next iteration
-            current_input_ids = next_token_id.unsqueeze(-1)
+            if next_token_id.dim() == 0:
+                # Scalar tensor - convert to proper batch format
+                current_input_ids = next_token_id.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1]
+            else:
+                # Already has some dimensions - ensure it's [batch_size, 1]
+                current_input_ids = next_token_id.view(1, -1)
             past_key_values = outputs.past_key_values
 
             # Update attention indices
             if i == 0:
                 initial_token_length = past_key_values[0][0].shape[2]
             input_token_length = past_key_values[0][0].shape[2]
-            # boost_positions = boost_positions + [input_token_length - 1]
 
     # Create collages
     # _create_collages(collected_maps, attn_config, collage_output_dir)
@@ -772,12 +832,95 @@ def run_generation_with_attention(
     # Generate final text
     final_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
+    # Calculate attention correlation metric``
+    attention_correlation = {}
+    if all_attention_maps and len(atten_indices) > 0:
+        attention_correlation = calculate_attention_correlation(
+            collected_maps=all_attention_maps,
+            target_indices=np.array(atten_indices)
+        )
+
+    # Generate comprehensive evaluation summary
+    generation_summary = None
+    quality_analysis = None
+    if all_step_metrics:
+        try:
+            generation_summary = create_generation_summary(
+                confidence_tracker, repetitivity_tracker, candidate_evaluator,
+                final_text, all_step_metrics
+            )
+            quality_analysis = analyze_generation_quality(generation_summary)
+        except Exception as e:
+            print(f"Error creating generation summary: {e}")
+
     print("\\n" + "="*50)
     print("GENERATION COMPLETE")
     print("="*50)
     print(f"Generated text: {final_text}")
     print(f"Generated {len(generated_ids)} tokens")
     print(f"Output directory: {output_dir}")
+
+    # Print enhanced evaluation summary
+    if generation_summary and quality_analysis:
+        print("\\n" + "="*50)
+        print("ENHANCED EVALUATION SUMMARY")
+        print("="*50)
+        
+        # Overall quality score
+        overall_score = quality_analysis.get("overall_quality_score", 0)
+        interpretation = quality_analysis.get("interpretation", {})
+        quality_level = "Unknown"
+        for level, is_level in interpretation.items():
+            if is_level:
+                quality_level = level.title()
+                break
+        
+        print(f"Overall Quality Score: {overall_score:.2f}/10 ({quality_level})")
+        
+        # Key metrics
+        gen_metrics = generation_summary.get("average_confidence", {})
+        print(f"Average Confidence: {gen_metrics.get('confidence_score', 0):.3f}")
+        print(f"Average Entropy: {gen_metrics.get('entropy', 0):.3f}")
+        print(f"Confidence Trend: {generation_summary.get('confidence_trajectory', {}).get('trend', 'unknown')}")
+        
+        # Diversity metrics
+        diversity = generation_summary.get("diversity_metrics", {})
+        print(f"Type-Token Ratio: {diversity.get('type_token_ratio', 0):.3f}")
+        print(f"Bigram Repetition: {diversity.get('repetition_penalty_2gram', 0):.3f}")
+        
+        # Decision points
+        decision_points = generation_summary.get("decision_points", [])
+        print(f"Decision Points (low confidence): {len(decision_points)}")
+        
+        if decision_points:
+            print("\\nKey Decision Points:")
+            for dp in decision_points[:3]:  # Show first 3
+                step = dp["step"]
+                prob = dp["top1_probability"]
+                alts = dp.get("alternatives", [])[:2]  # Show top 2 alternatives
+                print(f"  Step {step}: Low confidence ({prob:.3f})")
+                for alt in alts:
+                    print(f"    {alt}")
+        
+        # Quality factors breakdown
+        factors = quality_analysis.get("quality_factors", {})
+        print(f"\\nQuality Breakdown:")
+        print(f"  Confidence Factor: {factors.get('confidence', 0):.2f}")
+        print(f"  Diversity Factor: {factors.get('diversity', 0):.2f}")
+        print(f"  Repetition Penalty: {factors.get('repetition', 0):.2f}")
+        print(f"  Stability Factor: {factors.get('stability', 0):.2f}")
+
+    # Print Attention Correlation
+    if attention_correlation:
+        print("\n" + "="*50)
+        print("ATTENTION CORRELATION METRICS")
+        print("="*50)
+        corr_score = attention_correlation.get('normalized_correlation_score', 0)
+        print(f"Normalized Correlation Score: {corr_score:.3f}")
+        print(f"  - On-Target Attention Mean: {attention_correlation.get('target_attention_mean', 0):.4f}")
+        print(f"  - Off-Target Attention Mean: {attention_correlation.get('off_target_attention_mean', 0):.4f}")
+        print(f"  - Focus Ratio: {attention_correlation.get('attention_focus_ratio', 0):.2f}x")
+
 
     return {
         "generated_text": final_text,
@@ -793,7 +936,11 @@ def run_generation_with_attention(
         "config_used": {
             "generation": gen_config,
             "attention": attn_config
-        }
+        },
+        "evaluation_summary": generation_summary,
+        "quality_analysis": quality_analysis,
+        "attention_correlation": attention_correlation,
+        "step_metrics": all_step_metrics
     }
 
 # %%
@@ -1003,6 +1150,15 @@ def process_batch_from_json(
     return results
 
 # %%
+# Additional Helper Functions for Enhanced Evaluation Analysis
+
+# Analysis functions have been moved to generation_metrics.py
+# Import them from there:
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+from generation_metrics import print_detailed_step_analysis, compare_generation_configs, analyze_top_k_impact, calculate_attention_correlation
+
+# %%
 # Interactive Configuration and Usage
 # This is the main cell you'll modify for different experiments
 
@@ -1030,8 +1186,9 @@ for bias_i in np.linspace(0., 5., 10):
         "generation_config": {
             "bias_strength": bias_i,  # Set to 0.0 for no bias, or adjust as needed
             "max_new_tokens": 50,
-            "temperature": 1.,
-            "do_sample": True
+            "temperature": 0.1,
+            "do_sample": True,
+            "top_k": 50  # Set to None (disabled) or int > 0 (e.g., 50 for top-50 sampling)
         },
 
         # Attention visualization configuration
@@ -1114,7 +1271,8 @@ JSON_BATCH_CONFIG = {
         "bias_strength": 2.78,  # Set to 0.0 for no bias, or adjust as needed
         "max_new_tokens": 50,
         "temperature": 0.0,
-        "do_sample": False
+        "do_sample": False,
+        "top_k": None  # Set to None (disabled) or int > 0 (e.g., 50 for top-50 sampling)
     },
 
     # Attention visualization configuration
@@ -1187,44 +1345,130 @@ print("1. Modify EXPERIMENT_CONFIG and re-run the experiment cell")
 print("2. Use JSON_BATCH_CONFIG for processing images with subject descriptions from JSON")
 print("3. Use the manual batch processing cell for multiple images")
 print("4. Adjust model configuration and reload if needed")
-print("\\nNew Features Added:")
-print("- JSON-based batch processing with subject descriptions")
-print("- Automatic prompt generation using subject descriptions")
-print("- Results saved in same structure as input JSON")
+print("5. Use helper functions for detailed analysis: print_detailed_step_analysis(results)")
+print("6. Compare different configurations: compare_generation_configs(config_a, config_b, ..., run_generation_fn=run_generation_with_attention)")
+print("7. Analyze top-k sampling impact: analyze_top_k_impact(image_path, mask_path, prompt, run_generation_fn=run_generation_with_attention)")
+print("\\nEnhanced Features Available:")
+print("- Advanced generation metrics with confidence, entropy, and logit gap analysis")
+print("- Repetitivity and diversity tracking (type-token ratio, n-gram repetition)")
+print("- Top-k candidate analysis at each generation step")
+print("- Quality scoring and interpretation (excellent/good/fair/poor)")
+print("- Decision point identification (low-confidence steps)")
+print("- Generation trend analysis (confidence/entropy over time)")
+print("- Comprehensive step-by-step evaluation reports")
+print("\\nTop-K Sampling:")
+print("  * Set 'top_k': None to disable (default)")
+print("  * Set 'top_k': 50 for top-50 sampling (recommended values: 10-100)")
+print("  * Works with temperature and attention biasing")
+print("  * Use analyze_top_k_impact() to find optimal values")
+print("\\nEvaluation Metrics:")
+print("  * Confidence: entropy, logit gap, confidence score")
+print("  * Diversity: type-token ratio, n-gram repetition, unique token ratio")
+print("  * Quality: Overall score (0-10) with interpretation")
+print("  * Decision Points: Steps where model had low confidence")
 
 # %%
 # Example Usage Instructions
 """
-## How to use the new JSON-based processing:
+## How to use the enhanced generation and evaluation system:
 
-1. **Single Image with JSON data:**
+1. **Basic usage with enhanced evaluation:**
    ```python
-   # Load the JSON data
-   train_data = load_train_results_json("D:/Projects/data/gazefollow/train_results.json")
-
-   # Get info for a specific image
-   image_key = "00000000_00000021"
-   image_info = get_image_info_from_json(train_data, image_key)
-
-   # Build the prompt
-   prompt = build_prompt_with_subject_description(image_info['subject_description'])
-   print(f"Generated prompt: {prompt}")
+   results = run_generation_with_attention(
+       image_path="path/to/image.jpg",
+       mask_path="path/to/mask.npy", 
+       prompt="Complete the sentence. The person is looking at",
+       output_dir="output_dir",
+       generation_config={"top_k": 50, "temperature": 0.8, "do_sample": True},
+       attention_config=None  # Use defaults
+   )
+   
+   # Results now include:
+   # - evaluation_summary: Comprehensive generation analysis
+   # - quality_analysis: Overall quality score and breakdown
+   # - step_metrics: Detailed metrics for each generation step
    ```
 
-2. **Batch processing with JSON data:**
+2. **Detailed step analysis:**
+   ```python
+   # Print detailed step-by-step analysis
+   print_detailed_step_analysis(results, max_steps=10)
+   
+   # Access specific metrics
+   quality_score = results["quality_analysis"]["overall_quality_score"]
+   confidence_trend = results["evaluation_summary"]["confidence_trajectory"]["trend"]
+   decision_points = results["evaluation_summary"]["decision_points"]
+   ```
+
+3. **Compare different configurations:**
+   ```python
+   config_a = {"top_k": 50, "temperature": 0.8, "do_sample": True}
+   config_b = {"top_k": None, "temperature": 0.5, "do_sample": True}
+   
+   comparison = compare_generation_configs(
+       config_a, config_b, image_path, mask_path, prompt,
+       run_generation_fn=run_generation_with_attention
+   )
+   ```
+
+4. **Analyze top-k impact:**
+   ```python
+   # Test different top-k values automatically
+   top_k_analysis = analyze_top_k_impact(
+       image_path, mask_path, prompt, 
+       top_k_values=[None, 10, 50, 100],
+       run_generation_fn=run_generation_with_attention
+   )
+   ```
+
+5. **Evaluation metrics available:**
+   - **Confidence Metrics:**
+     * entropy: Shannon entropy of probability distribution
+     * logit_gap: Gap between top-2 logits (higher = more confident)
+     * confidence_score: Composite confidence measure
+   
+   - **Repetitivity Metrics:**
+     * type_token_ratio: Unique tokens / total tokens (higher = more diverse)
+     * bigram_repetition: Ratio of repeated 2-grams
+     * trigram_repetition: Ratio of repeated 3-grams
+   
+   - **Top-K Analysis:**
+     * Top candidate probabilities and alternatives at each step
+     * Decision points where model had low confidence
+     * Probability mass distribution analysis
+
+6. **Quality interpretation:**
+   - **Excellent (8.0-10.0):** High confidence, good diversity, minimal repetition
+   - **Good (6.0-8.0):** Generally confident with acceptable diversity
+   - **Fair (4.0-6.0):** Mixed confidence or some repetition issues
+   - **Poor (0.0-4.0):** Low confidence or significant repetition problems
+
+7. **JSON-based batch processing:**
    - Modify the JSON_BATCH_CONFIG above
    - Set limit_items to a small number for testing (e.g., 5)
    - Set filter_keys to specific image keys if needed
    - Run the JSON batch processing cell
+   - All enhanced metrics are automatically included in batch results
 
-3. **Expected output structure:**
+8. **Output structure:**
    The results JSON will have the same keys as the input, but with additional fields:
-   - generation_result: Contains the generated text and metadata
+   - generation_result: Contains the generated text and all evaluation metadata
+   - evaluation_summary: Comprehensive analysis including quality metrics
+   - quality_analysis: Overall quality score and factor breakdown
+   - step_metrics: Detailed metrics for each generation step
    - prompt_used: The actual prompt that was used
    - processing_timestamp: When the item was processed
 
-4. **File naming conventions:**
+9. **File naming conventions:**
    - Images: {base_image_dir}/{folder}/{filename}.jpg
    - Masks: {base_mask_dir}/gaze__{folder}_{filename}_masks.npy
    - Example: "00000000_00000021" → image: "00000000/00000021.jpg", mask: "gaze__00000000_00000021_masks.npy"
+
+10. **Advanced usage tips:**
+    - Use top_k=50 for balanced quality vs diversity
+    - Use top_k=10 for more focused generation
+    - Use top_k=None (disabled) for maximum diversity
+    - Monitor decision_points to identify uncertainty in generation
+    - Use confidence_trend to understand generation stability
+    - Compare quality_scores across different configurations
 """
