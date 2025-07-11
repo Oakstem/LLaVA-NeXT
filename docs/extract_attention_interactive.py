@@ -11,8 +11,13 @@
 # - Flexible attention visualization parameters
 # - Batch processing capabilities
 
-# Todo: 1. clip the confidence to a certain range so that EOS tokens won't get too much weight in the average (1-5 instead of 3k)
-# 2. optimize the way we calculate attention correlation, some results seem very high correlation in the image maps, but overall getting low scores
+# Todo: 1. fix the focus ratio so it won't get results such as '2267577.26x'
+# 2. idea - instead of trying to make the LM generate some text description based on our attention mask. lets just use the encoding vector of that region (we can average over several patches in the mask):
+# eg: 'the person is looking at the <insert here the embedded vector of the mask region>'
+# we're getting:     1. 'ceiling' (p=0.532)
+                    # 2. 'hands' (p=0.175)
+                    # 3. 'sky' (p=0.140)
+# so we're very close to the correct answer (even though 'ceiling' is not that wrong)
 
 # %%
 # Setup and Imports
@@ -177,14 +182,14 @@ def get_attention_indices_from_mask(mask: np.ndarray, image_size: Tuple[int, int
     print(f"Mask coordinates shape: {mask_coords.shape}")
 
     # Get attention indices from pixel coordinates
-    atten_indices, base_xy_indices = _pixel_to_token_indices_helper_anyres(
+    atten_indices, resized_mask = _pixel_to_token_indices_helper_anyres(
         mask_coords, image_size, possible_resolutions=model_config.image_grid_pinpoints,
         add_system_prompt_tokens= False,
         add_user_prompt_tokens= False,
         user_prompt_range=[1849, 1860]
     )
 
-    return atten_indices
+    return atten_indices, resized_mask
 
 def save_raw_attention_tensor(attention_map: np.ndarray, full_attention, output_path: Path,
                              token_id: int, token_text: str, step_idx: int) -> None:
@@ -341,10 +346,67 @@ def visualize_attention_collage(
     plt.close(fig)
     print(f"Saved attention collage to: {output_path}")
 
+
+def visualize_embedding_similarity(
+    text_token_embedding: torch.Tensor,
+    image_token_embeddings: torch.Tensor,
+    original_image: Image.Image,
+    grid_size: int,
+    output_path: Union[str, Path],
+    threshold_value: float = 0.6
+) -> None:
+    """
+    Calculates and visualizes the semantic similarity between a text token's embedding
+    and all image patch embeddings.
+
+    Args:
+        text_token_embedding: The feature embedding of the generated text token. Shape: [hidden_dim].
+        image_token_embeddings: The feature embeddings of all image patches. Shape: [num_patches, hidden_dim].
+        original_image: The original PIL image for the background.
+        grid_size: The dimension of the square patch grid (e.g., 27 for a 27x27 grid).
+        output_path: The path to save the visualization.
+    """
+    # 1. Calculate dot product similarity
+    # text_token_embedding: [D], image_token_embeddings: [N, D] -> similarity_scores: [N]
+    similarity_scores = torch.nn.functional.cosine_similarity(
+        image_token_embeddings, text_token_embedding.unsqueeze(0), dim=1
+    )
+
+    # 2. Reshape into a 2D grid
+    num_patches = image_token_embeddings.shape[0]
+    expected_elements = grid_size * grid_size
+    if expected_elements > num_patches:
+        padding_size = expected_elements - num_patches
+        similarity_scores = torch.cat([
+            similarity_scores,
+            torch.zeros(padding_size, device=similarity_scores.device)
+        ])
+    
+    similarity_map = similarity_scores.reshape(grid_size, grid_size).cpu().numpy()
+    # threshold the similarity map to remove low values
+    similarity_map = np.where(similarity_map >= threshold_value, similarity_map, 0)
+
+    # Resize heatmap to image size for overlay
+    map_img = Image.fromarray(similarity_map.astype(np.float32))
+    resized_map_img = map_img.resize(original_image.size, Image.Resampling.LANCZOS)
+    
+    heatmap_colors = cm.inferno(np.array(resized_map_img))[:, :, :3]
+    heatmap_uint8 = (heatmap_colors * 255).astype(np.uint8)
+
+    # 4. Blend with original image and save
+    overlay_img = Image.blend(original_image, Image.fromarray(heatmap_uint8), alpha=0.6)
+    
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    overlay_img.save(output_path)
+
+    return similarity_map
+
+
 # %%
 # JSON Data Loading and Prompt Building Functions
 
-def load_train_results_json(json_path: Union[str, Path]) -> Dict[str, Any]:
+def load_train_results_json(json_path: Union[str, Path]) -> Dict[str, str]:
     """Load the train_results.json file."""
     json_path = fix_wsl_paths(str(json_path))
     if not Path(json_path).exists():
@@ -422,7 +484,7 @@ def _prepare_configs(generation_config: Optional[Dict], attention_config: Option
 
     return gen_config, attn_config
 
-def _setup_output_directories(output_dir: Union[str, Path]) -> Tuple[Path, Path, Path, Path, Path]:
+def _setup_output_directories(output_dir: Union[str, Path]) -> Tuple[Path, Path, Path, Path, Path, Path]:
     """Create and return all output directory paths."""
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
@@ -431,11 +493,12 @@ def _setup_output_directories(output_dir: Union[str, Path]) -> Tuple[Path, Path,
     vis_output_dir_processed = output_dir / "attention_maps_processed"
     tensor_output_dir = output_dir / "attention_tensors"
     collage_output_dir = output_dir / "attention_collages"
+    similarity_output_dir = output_dir / "embedding_similarity_overlays" # New directory
 
-    for dir_path in [vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir]:
+    for dir_path in [vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir]:
         dir_path.mkdir(exist_ok=True, parents=True)
 
-    return output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir
+    return output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir
 
 def _prepare_inputs(
     image_path: Union[str, Path],
@@ -449,9 +512,6 @@ def _prepare_inputs(
     person_mask = None
     person_mask_indices = None
     # Load image and mask
-    image_path = fix_wsl_paths(str(image_path))
-    mask_path = fix_wsl_paths(str(mask_path))
-
     image = load_image(image_path)
     mask = load_mask_from_file(mask_path)
     person_mask_path = mask_path.replace("gaze__", "person__")
@@ -471,9 +531,9 @@ def _prepare_inputs(
         image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
     # Get attention indices from mask
-    atten_indices = get_attention_indices_from_mask(mask, image.size, model.config)
+    atten_indices, resized_mask = get_attention_indices_from_mask(mask, image.size, model.config)
     if person_mask is not None:
-        person_mask_indices = get_attention_indices_from_mask(person_mask, image.size, model.config)
+        person_mask_indices, _ = get_attention_indices_from_mask(person_mask, image.size, model.config)
     print(f"Initial attention indices: {len(atten_indices)} tokens")
 
     # Prepare conversation
@@ -496,7 +556,7 @@ def _prepare_inputs(
 
     image_sizes = [image.size]
     # tokenizer.decode(input_ids.cpu().numpy()[0][-11:-9])
-    return image, mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids
+    return image, resized_mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids
 
 def _determine_image_patch_info(model: PreTrainedModel, input_ids: torch.Tensor) -> Tuple[int, int, int, int]:
     """Determine image patch information and token indices."""
@@ -703,16 +763,25 @@ def run_generation_with_attention(
 
     # Prepare configurations
     gen_config, attn_config = _prepare_configs(generation_config, attention_config)
+    mask_path = fix_wsl_paths(str(mask_path))
+    image_path = fix_wsl_paths(str(image_path))
+    mask_embedding_path = mask_path.replace("masks.npy", "_target_embeddings.pt")
+
+    if Path(mask_embedding_path).exists():
+        target_mask_embedding = torch.load(mask_embedding_path)
+        print(f"Using existing mask embedding from {mask_embedding_path}")
+    else:
+        target_mask_embedding = None
 
     print(f"Processing image: {image_path}")
     print(f"Using mask: {mask_path}")
     print(f"Prompt: {prompt}")
 
     # Setup output directories
-    output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir = _setup_output_directories(output_dir)
+    output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir = _setup_output_directories(output_dir)
 
     # Load and prepare inputs
-    image, mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids = \
+    image, resized_mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids = \
     _prepare_inputs(image_path, mask_path, prompt, image_processor, tokenizer, model)
     # temp boost coordinates
     boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
@@ -738,6 +807,8 @@ def run_generation_with_attention(
     if isinstance(eos_token_id, list):
         eos_token_id = eos_token_id[0]
 
+    image_embeddings = None
+    all_correlation_metrics = []
     for i in range(max_new_tokens):
         with torch.inference_mode():
             # Prepare model inputs
@@ -751,6 +822,7 @@ def run_generation_with_attention(
                 "boost_positions": boost_positions,
                 "bias_strength": bias_strength,
                 "query_indices": attn_config.get("query_indices", None),
+                "target_mask_embedding": target_mask_embedding,
             }
 
             # Add image data only in first step
@@ -790,6 +862,37 @@ def run_generation_with_attention(
 
             generated_ids.append(next_token_id.item())
 
+            # --- Semantic Similarity Visualization ---
+            if outputs.hidden_states:
+                last_hidden_state = outputs.hidden_states[-1].squeeze(0) # Shape: [Seq_Len, Hidden_Dim]
+                text_embedding = last_hidden_state[-1] # Embedding of the new token
+                if image_embeddings is None:
+                    # store the image embeddings that exist only at the first step
+                    image_embeddings = last_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
+
+                safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text)
+                if not safe_token_text:
+                    safe_token_text = f"tokenid_{next_token_id.item()}"
+                
+                sim_path = similarity_output_dir / f"similarity_{i:03d}_{safe_token_text}.png"
+                similarity_map = visualize_embedding_similarity(
+                    text_token_embedding=text_embedding,
+                    image_token_embeddings=image_embeddings,
+                    original_image=image,
+                    grid_size=grid_size,
+                    output_path=sim_path
+                )
+
+                # lets extract the image embeddings for the target resized_mask
+                mask_indices = np.where(resized_mask > 0)
+                if i==0 and len(mask_indices[0]) > 0:
+                    mask_embeddings = image_embeddings[mask_indices[0], :].mean(dim=0)
+                    # save the mask embeddings
+                    torch.save(mask_embeddings, mask_embedding_path)
+                    print(f"Saved target mask embeddings to {mask_embedding_path}")
+
+
+
             # Extract and process attention
             processed_img, attention_map = _extract_and_process_attention(
                 outputs, next_token_id, token_text, i,
@@ -826,19 +929,16 @@ def run_generation_with_attention(
                 initial_token_length = past_key_values[0][0].shape[2]
             input_token_length = past_key_values[0][0].shape[2]
 
-    # Create collages
-    # _create_collages(collected_maps, attn_config, collage_output_dir)
+            # Calculate attention correlation metric
+            if all_attention_maps and len(atten_indices) > 0:
+                attention_correlation = calculate_attention_correlation_from_similarity(
+                    text_to_image_similarity_matrix=similarity_map,
+                    attention_mask=resized_mask,
+                )
+                all_correlation_metrics.append(attention_correlation)
 
     # Generate final text
     final_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-    # Calculate attention correlation metric``
-    attention_correlation = {}
-    if all_attention_maps and len(atten_indices) > 0:
-        attention_correlation = calculate_attention_correlation(
-            collected_maps=all_attention_maps,
-            target_indices=np.array(atten_indices)
-        )
 
     # Generate comprehensive evaluation summary
     generation_summary = None
@@ -847,13 +947,13 @@ def run_generation_with_attention(
         try:
             generation_summary = create_generation_summary(
                 confidence_tracker, repetitivity_tracker, candidate_evaluator,
-                final_text, all_step_metrics
+                final_text, all_step_metrics, all_correlation_metrics,
             )
             quality_analysis = analyze_generation_quality(generation_summary)
         except Exception as e:
             print(f"Error creating generation summary: {e}")
 
-    print("\\n" + "="*50)
+    print("" + "="*50)
     print("GENERATION COMPLETE")
     print("="*50)
     print(f"Generated text: {final_text}")
@@ -862,7 +962,7 @@ def run_generation_with_attention(
 
     # Print enhanced evaluation summary
     if generation_summary and quality_analysis:
-        print("\\n" + "="*50)
+        print("" + "="*50)
         print("ENHANCED EVALUATION SUMMARY")
         print("="*50)
         
@@ -893,7 +993,7 @@ def run_generation_with_attention(
         print(f"Decision Points (low confidence): {len(decision_points)}")
         
         if decision_points:
-            print("\\nKey Decision Points:")
+            print("Key Decision Points:")
             for dp in decision_points[:3]:  # Show first 3
                 step = dp["step"]
                 prob = dp["top1_probability"]
@@ -904,19 +1004,20 @@ def run_generation_with_attention(
         
         # Quality factors breakdown
         factors = quality_analysis.get("quality_factors", {})
-        print(f"\\nQuality Breakdown:")
+        print(f"Quality Breakdown:")
         print(f"  Confidence Factor: {factors.get('confidence', 0):.2f}")
         print(f"  Diversity Factor: {factors.get('diversity', 0):.2f}")
         print(f"  Repetition Penalty: {factors.get('repetition', 0):.2f}")
         print(f"  Stability Factor: {factors.get('stability', 0):.2f}")
+        print(f"  Attention Correlation with Mask Factor: {factors.get('attention_correlation', 0):.2f}")
 
     # Print Attention Correlation
+    attention_correlation = generation_summary.get('average_attention_correlation', 0)
     if attention_correlation:
-        print("\n" + "="*50)
+        print("" + "="*50)
         print("ATTENTION CORRELATION METRICS")
         print("="*50)
-        corr_score = attention_correlation.get('normalized_correlation_score', 0)
-        print(f"Normalized Correlation Score: {corr_score:.3f}")
+        print(f"Normalized Correlation Score: {attention_correlation.get('normalized_correlation_score', 0):.3f}")
         print(f"  - On-Target Attention Mean: {attention_correlation.get('target_attention_mean', 0):.4f}")
         print(f"  - Off-Target Attention Mean: {attention_correlation.get('off_target_attention_mean', 0):.4f}")
         print(f"  - Focus Ratio: {attention_correlation.get('attention_focus_ratio', 0):.2f}x")
@@ -930,6 +1031,7 @@ def run_generation_with_attention(
             "main": str(output_dir),
             "raw_attention": str(vis_output_dir_raw) if attn_config["visualize_attn_overlays"] else None,
             "processed_attention": str(vis_output_dir_processed) if attn_config["visualize_attn_overlays"] else None,
+            "embedding_similarity": str(similarity_output_dir),
             "tensors": str(tensor_output_dir) if attn_config["save_tensors"] else None,
             "collages": str(collage_output_dir) if attn_config["create_collage"] and collected_maps else None
         },
@@ -960,7 +1062,7 @@ def process_batch(
     results = []
 
     for i, item in enumerate(batch_items):
-        print(f"\\n{'='*60}")
+        print(f"{'='*60}")
         print(f"Processing batch item {i+1}/{len(batch_items)}: {item.get('name', f'item_{i+1}')}")
         print('='*60)
 
@@ -1045,7 +1147,7 @@ def process_batch_from_json(
     total_items = len(person_desc_data)
 
     for i, (image_key, subject_description) in enumerate(person_desc_data.items(), 1):
-        print(f"\\n{'='*80}")
+        print(f"{'='*80}")
         print(f"Processing {i}/{total_items}: {image_key}")
         print('='*80)
 
@@ -1137,7 +1239,7 @@ def process_batch_from_json(
     results_path = base_output_dir / results_filename
     save_results_to_json(results, results_path)
 
-    print(f"\\n{'='*80}")
+    print(f"{'='*80}")
     print(f"BATCH PROCESSING COMPLETE")
     print('='*80)
     print(f"Processed {len(results)} items")
@@ -1156,7 +1258,7 @@ def process_batch_from_json(
 # Import them from there:
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
-from generation_metrics import print_detailed_step_analysis, compare_generation_configs, analyze_top_k_impact, calculate_attention_correlation
+from generation_metrics import print_detailed_step_analysis, compare_generation_configs, analyze_top_k_impact, calculate_attention_correlation_from_similarity
 
 # %%
 # Interactive Configuration and Usage
@@ -1166,18 +1268,19 @@ from generation_metrics import print_detailed_step_analysis, compare_generation_
 all_results = {}
 # for bias_i in np.linspace(2.5, 3.5, 5):     # good for hands detection
 for bias_i in np.linspace(0., 5., 10):     
-    print(f"\n{'='*60}")
+    print(f"{'='*60}")
     print(f"Running experiment with bias strength: {bias_i:.2f}")
     EXPERIMENT_CONFIG = {
         # Input paths (MODIFY THESE)
         "image_path": r"D:\Projects\data\gazefollow\train\00000000\00000022.jpg",  # Your image path
         # "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000318_masks.npy",  # Your mask path
         "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_masks.npy",  # Your mask path
+        "target_mask_embedding_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_target_embeddings.pt",  # Your target mask embedding path
         # "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_masks.npy",  # Your mask path
         # "prompt": "Complete the sentence. The tattooed man at wedding reception is looking at",  # Your prompt
         # "prompt": "Complete the sentence in a few words answer. The object is",  # Your prompt
         # "prompt": "Complete the sentence. Start your answer with 'The object in focus is'",  # Your prompt
-        "prompt": "Complete the sentence. The person is looking at",  # Your prompt
+        "prompt": "Complete the sentence. The person is looking at _ which is",  # Your prompt
         # "prompt": "Describe the image in 3 words.",  # Your prompt
         # "prompt": "Start the sentence with 'the object is'",  # Your prompt
         "output_dir": f"attention_output/experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}_bias_{bias_i:.2f}",  # Output directory with timestamp and bias value
@@ -1188,7 +1291,8 @@ for bias_i in np.linspace(0., 5., 10):
             "max_new_tokens": 50,
             "temperature": 0.1,
             "do_sample": True,
-            "top_k": 50  # Set to None (disabled) or int > 0 (e.g., 50 for top-50 sampling)
+            "top_k": 50,  # Set to None (disabled) or int > 0 (e.g., 50 for top-50 sampling)
+            "output_hidden_states": True, # Ensure hidden states are output
         },
 
         # Attention visualization configuration
@@ -1230,17 +1334,17 @@ for bias_i in np.linspace(0., 5., 10):
 
 # Display results
 if "error" not in results:
-    print("\\n" + "="*60)
+    print("" + "="*60)
     print("EXPERIMENT RESULTS")
     print("="*60)
     print(f"Generated Text: {results['generated_text']}")
     print(f"Number of tokens: {results['num_tokens']}")
-    print("\\nOutput Directories:")
+    print("Output Directories:")
     for key, path in results['output_directories'].items():
         if path:
             print(f"  {key}: {path}")
 else:
-    print(f"\\n❌ Experiment failed: {results['error']}")
+    print(f"❌ Experiment failed: {results['error']}")
 
 # %%
 # JSON-based Batch Processing Configuration
@@ -1268,14 +1372,12 @@ JSON_BATCH_CONFIG = {
 
     # Generation configuration
     "generation_config": {
-        "bias_strength": 2.78,  # Set to 0.0 for no bias, or adjust as needed
-        "max_new_tokens": 50,
+        "bias_strength": 2.78,        "max_new_tokens": 50,
         "temperature": 0.0,
         "do_sample": False,
-        "top_k": None  # Set to None (disabled) or int > 0 (e.g., 50 for top-50 sampling)
+        "top_k": None,
+        "output_hidden_states": True, # Ensure hidden states are output
     },
-
-    # Attention visualization configuration
     "attention_config": {
         "attn_threshold": 0.4,
         "opening_kernel_size": 5,

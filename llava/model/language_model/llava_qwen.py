@@ -112,6 +112,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         modalities=modalities,
                         image_sizes=image_sizes
                     )
+                # todo: this is a temporary hardcoded index, fix it later
+                # if kwargs.get("target_mask_embedding", None) is not None:
+                #     target_mask_embedding = kwargs["target_mask_embedding"]
+                #     inputs_embeds[:, -8, :] = target_mask_embedding
+
             else:
                 # Unpack 6 values when images are not present (e.g., subsequent generation steps)
                 # This path is taken when processing text-only inputs or during generation steps after the first one.

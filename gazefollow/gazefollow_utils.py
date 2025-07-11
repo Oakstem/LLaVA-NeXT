@@ -94,7 +94,7 @@ def _pixel_to_token_indices_helper_anyres(
 
     token_indices = []
     base_xy_coords = []
-
+    resized_mask = np.zeros([final_patch_division_size//patch_size, final_patch_division_size//patch_size], dtype=np.float32)
     for y_pixel_orig, x_pixel_orig in pixel_coords:     # coordinates are inverted: row, col
         # 2. Transform pixel coordinates from original image to the padded "best_processing_resolution".
         # This simulates resize_and_pad_image logic.
@@ -122,6 +122,8 @@ def _pixel_to_token_indices_helper_anyres(
         base_img_idx = base_patch_row * total_patches_in_row + base_patch_col
         final_base_img_idx = image_token_start_index_in_embeds + base_img_idx
         base_xy_coords.append((base_patch_col, base_patch_row))
+
+        resized_mask[base_patch_row, base_patch_col] = 1.0  # Mark the base image patch in the mask
 
         # Coordinates on the scaled (but not yet padded) image
         x_on_scaled_img = (x_pixel_orig / original_w) * scaled_to_w
@@ -193,5 +195,10 @@ def _pixel_to_token_indices_helper_anyres(
 
     # for i in range(0, 26):
         # token_indices.append(i)
+    # build a mask with the base_xy_coords
+    # mask = np.zeros([best_processing_resolution_h, best_processing_resolution_w], dtype=np.float32)
+    # base_xy_coords_np = np.c_[base_xy_coords]
+    # mask[base_xy_coords_np[:, 1], base_xy_coords_np[:, 0]] = 1.0
 
-    return sorted(list(set(token_indices))), base_xy_coords
+
+    return sorted(list(set(token_indices))), resized_mask
