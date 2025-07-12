@@ -601,7 +601,7 @@ def _generate_next_token(
     gen_config: Dict
 ) -> Tuple[torch.Tensor, str, Any]:
     """Generate next token and return token info and model outputs."""
-    outputs = model(**model_inputs)
+    outputs = model(**model_inputs) 
 
     # Get next token
     next_token_logits = outputs.logits[:, -1, :]
@@ -884,12 +884,12 @@ def run_generation_with_attention(
                 )
 
                 # lets extract the image embeddings for the target resized_mask
-                mask_indices = np.where(resized_mask > 0)
-                if i==0 and len(mask_indices[0]) > 0:
-                    mask_embeddings = image_embeddings[mask_indices[0], :].mean(dim=0)
-                    # save the mask embeddings
-                    torch.save(mask_embeddings, mask_embedding_path)
-                    print(f"Saved target mask embeddings to {mask_embedding_path}")
+                # mask_indices = np.where(resized_mask.flatten() > 0)[0]
+                # if i==0 and len(mask_indices) > 0:
+                #     mask_embeddings = image_embeddings[mask_indices, :].mean(dim=0)
+                #     # save the mask embeddings
+                #     torch.save(mask_embeddings, mask_embedding_path)
+                #     print(f"Saved target mask embeddings to {mask_embedding_path}")
 
 
 
@@ -911,7 +911,7 @@ def run_generation_with_attention(
                 txt_ids = torch.argmax(outputs.logits, dim=-1)[0]
                 txt_np = np.array([tokenizer.decode(val).strip() for val in txt_ids])
                 resulted_description = ",".join(txt_np[boost_positions['gaze_target']])
-                resulted_source_description = ",".join(txt_np[boost_positions['gaze_source']])
+                resulted_source_description = ",".join(txt_np[boost_positions['gaze_source']]) if boost_positions['gaze_source'] is not None else "N/A"
                 print(f"Resulted words from gaze target mask: {resulted_description}")
                 print(f"Resulted words from gaze source mask: {resulted_source_description}")
 
@@ -1274,7 +1274,7 @@ for bias_i in np.linspace(0., 5., 10):
         # Input paths (MODIFY THESE)
         "image_path": r"D:\Projects\data\gazefollow\train\00000000\00000022.jpg",  # Your image path
         # "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000318_masks.npy",  # Your mask path
-        "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_masks.npy",  # Your mask path
+        "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__00000022_masks.npy",  # Your mask path
         "target_mask_embedding_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_target_embeddings.pt",  # Your target mask embedding path
         # "mask_path": r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000022_masks.npy",  # Your mask path
         # "prompt": "Complete the sentence. The tattooed man at wedding reception is looking at",  # Your prompt

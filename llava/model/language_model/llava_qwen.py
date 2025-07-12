@@ -20,7 +20,7 @@ from torch.nn import CrossEntropyLoss
 import ast
 import re
 import math
-
+import numpy as np
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaModel, LlamaForCausalLM
 
@@ -113,9 +113,22 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         image_sizes=image_sizes
                     )
                 # todo: this is a temporary hardcoded index, fix it later
-                # if kwargs.get("target_mask_embedding", None) is not None:
-                #     target_mask_embedding = kwargs["target_mask_embedding"]
-                #     inputs_embeds[:, -8, :] = target_mask_embedding
+                # if kwargs.get("base_image_token_inds", None) is not None:
+                #     base_image_embedding = inputs_embeds[:, kwargs["base_image_token_inds"][0]:kwargs["base_image_token_inds"][1], :]
+                #     attn_mask_indices = kwargs.get("resized_mask", np.array([])).flatten()
+                #     attn_mask_indices = np.where(attn_mask_indices > 0)[0]
+                #     if len(attn_mask_indices) > 0:
+                #         # Use the first mask index to get the target mask embedding
+                #         target_mask_embedding = base_image_embedding[:, attn_mask_indices, :].mean(dim=1)[0]
+                #         inputs_embeds[:, -8, :] = target_mask_embedding
+                if kwargs.get("target_mask_embedding", None) is not None:
+                    target_mask_embedding = kwargs["target_mask_embedding"]
+                    attn_mask_indices = kwargs.get("resized_mask", np.array([])).flatten()
+                    attn_mask_indices = np.where(attn_mask_indices > 0)[0]
+                    if len(attn_mask_indices) > 0:
+                #         # Use the first mask index to get the target mask embedding
+                        target_mask_embedding = target_mask_embedding[attn_mask_indices, :].mean(dim=0)
+                    inputs_embeds[:, -8, :] = target_mask_embedding
 
             else:
                 # Unpack 6 values when images are not present (e.g., subsequent generation steps)
