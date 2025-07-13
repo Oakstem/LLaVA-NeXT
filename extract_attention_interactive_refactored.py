@@ -59,6 +59,8 @@ Step 6: 'man' | Confidence: 0.232 | Entropy: 2.832
 
 This only works for hidden state-based embedding (and not the raw image embeddings) ->
 Maybe, we can try using the image embeddings after the projections
+
+todo: during the end of sweep, we need to find the best bias strength with the highest score
 """
 
 # Set device
@@ -157,14 +159,35 @@ def run_generation_with_attention(
                 if image_embeddings is None:    # happens only on the first step
                     # Store the first step (last) hidden state for later output
                     first_step_hidden_state = last_hidden_state
+                    first_step_all_layers = outputs.hidden_states
                     image_embeddings = last_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
-                    set_layer_hidden_state = outputs.hidden_states[attn_config["layer_idx"]].squeeze(0)
+                    set_layer_hidden_state = outputs.hidden_states[26].squeeze(0)
                     set_layer_image_embeddings = set_layer_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
                     # set_layer_last_token_embedding = set_layer_hidden_state[-1]
 
                 safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text) or f"tokenid_{next_token_id.item()}"
-                sim_path = similarity_output_dir / f"similarity_{i:03d}_{safe_token_text}.png"
+                # if bias_strength > 2.2:
+                #     # lets do a grid search for the best localization layer for both text and image embeddings
+                #     for layer_idx in range(len(outputs.hidden_states)):
+                #         set_layer_hidden_state = first_step_all_layers[layer_idx].squeeze(0)
+                #         set_layer_image_embeddings = set_layer_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
+                #         set_layer_text_embedding = outputs.hidden_states[attn_config["layer_idx"]].squeeze(0)[-1]
+                #         set_layer_text_embedding = outputs.hidden_states[-1].squeeze(0)[-1]
+                #         sim_path = similarity_output_dir / f"layer_{layer_idx}" / f"similarity_{i:03d}_{safe_token_text}_layer_{layer_idx}.png"
+                #         sim_path.parent.mkdir(parents=True, exist_ok=True)
+                #         # Direct embedding similarity visualization
+                #         similarity_map = visualize_embedding_similarity(
+                #             text_token_embedding=set_layer_text_embedding,
+                #             image_token_embeddings=set_layer_image_embeddings,
+                #             original_image=image,
+                #             grid_size=grid_size,
+                #             output_path=sim_path,
+                #             # threshold_value=0.3
+                #         )
+                
                 # Direct embedding similarity visualization
+                # else:
+                sim_path = similarity_output_dir / f"similarity_{i:03d}_{safe_token_text}.png"
                 similarity_map = visualize_embedding_similarity(
                     text_token_embedding=text_embedding,
                     image_token_embeddings=set_layer_image_embeddings,
@@ -173,7 +196,7 @@ def run_generation_with_attention(
                     output_path=sim_path,
                     # threshold_value=0.3
                 )
-                # Compute mask indices only for valid numpy arrays
+                # Compute mask indices only for valid numpy arrays^
                 # if isinstance(resized_mask, np.ndarray):
                 #     mask_indices = np.where(resized_mask.flatten() > 0)[0]
                 # else:
@@ -365,6 +388,97 @@ def run_bias_sweep_experiment(
         )
         all_results[bias_i] = results
         print(f"Finished experiment for bias {bias_i:.2f}. Results saved to: {results['output_directories']['main']}")
+
+    # Summary and analysis of all bias sweep results
+    print(f"\n{'='*80}")
+    print("BIAS SWEEP EXPERIMENT SUMMARY")
+    print(f"{'='*80}")
+    
+    # Analyze and sort results by performance
+    performance_summary = []
+    for bias_val, result in all_results.items():
+        evaluation_summary = result.get("evaluation_summary", {})
+        quality_analysis = result.get("quality_analysis", {})
+        attention_correlation = result.get("attention_correlation", {})
+        
+        # Extract key performance metrics
+        avg_confidence = evaluation_summary.get("average_confidence", 0.0)
+        avg_entropy = evaluation_summary.get("average_entropy", float('inf'))
+        correlation_score = attention_correlation.get("mean_correlation", 0.0)
+        generated_text = result.get("generated_text", "")
+        num_tokens = result.get("num_tokens", 0)
+        
+        # Calculate composite performance score (higher is better)
+        # Weight: confidence (40%), correlation (40%), low entropy (20%)
+        entropy_score = max(0, 1 - (avg_entropy / 4.0))  # Normalize entropy (assuming max ~4)
+        composite_score = (0.4 * avg_confidence) + (0.4 * correlation_score) + (0.2 * entropy_score)
+        
+        performance_summary.append({
+            'bias_strength': bias_val,
+            'composite_score': composite_score,
+            'avg_confidence': avg_confidence,
+            'avg_entropy': avg_entropy,
+            'correlation_score': correlation_score,
+            'generated_text': generated_text,
+            'num_tokens': num_tokens,
+            'quality_analysis': quality_analysis
+        })
+    
+    # Sort by composite score (descending - higher is better)
+    performance_summary.sort(key=lambda x: x['composite_score'], reverse=True)
+    
+    # Display top performers
+    print(f"\nTOP 5 PERFORMING BIAS STRENGTHS:")
+    print(f"{'Rank':<4} {'Bias':<6} {'Score':<7} {'Confidence':<11} {'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}")
+    print("-" * 95)
+    
+    for i, result in enumerate(performance_summary[:5], 1):
+        print(f"{i:<4} {result['bias_strength']:<6.2f} {result['composite_score']:<7.3f} "
+              f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
+              f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
+              f"{result['generated_text'][:30]:<30}")
+    
+    # Display worst performers for comparison
+    print(f"\nWORST 3 PERFORMING BIAS STRENGTHS:")
+    print(f"{'Rank':<4} {'Bias':<6} {'Score':<7} {'Confidence':<11} {'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}")
+    print("-" * 95)
+    
+    for i, result in enumerate(performance_summary[-3:], len(performance_summary)-2):
+        print(f"{i:<4} {result['bias_strength']:<6.2f} {result['composite_score']:<7.3f} "
+              f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
+              f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
+              f"{result['generated_text'][:30]:<30}")
+    
+    # Best bias strength recommendation
+    best_result = performance_summary[0]
+    print(f"\n🏆 RECOMMENDED BIAS STRENGTH: {best_result['bias_strength']:.2f}")
+    print(f"   • Composite Score: {best_result['composite_score']:.3f}")
+    print(f"   • Average Confidence: {best_result['avg_confidence']:.3f}")
+    print(f"   • Average Entropy: {best_result['avg_entropy']:.3f}")
+    print(f"   • Attention Correlation: {best_result['correlation_score']:.3f}")
+    print(f"   • Generated Text: '{best_result['generated_text']}'")
+    
+    # Save detailed summary to file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_path = Path(base_output_dir) / f"bias_sweep_summary_{timestamp}.json"
+    summary_data = {
+        "experiment_timestamp": timestamp,
+        "bias_range": bias_range.tolist(),
+        "performance_ranking": performance_summary,
+        "best_bias_strength": best_result['bias_strength'],
+        "summary_metrics": {
+            "total_experiments": len(all_results),
+            "best_composite_score": best_result['composite_score'],
+            "score_range": [performance_summary[-1]['composite_score'], performance_summary[0]['composite_score']]
+        }
+    }
+    
+    with open(summary_path, 'w') as f:
+        import json
+        json.dump(summary_data, f, indent=2)
+    
+    print(f"\n📊 Detailed summary saved to: {summary_path}")
+    print(f"{'='*80}")
 
     return all_results
 
