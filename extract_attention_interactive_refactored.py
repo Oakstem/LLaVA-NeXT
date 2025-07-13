@@ -33,6 +33,7 @@ from generation_utils import (
     build_prompt_with_subject_description,
     save_results_to_json,
     print_summary,
+    analyze_bias_sweep_results,
 )
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
@@ -272,38 +273,89 @@ def process_batch_from_json(
     mask_filename_template: str = "gaze__{}_masks.npy",
     prompt_template: str = "Complete the sentence. The {} is looking at",
     generation_config: Optional[Dict] = None, attention_config: Optional[Dict] = None,
-    limit_items: Optional[int] = None, filter_keys: Optional[List[str]] = None
+    limit_items: Optional[int] = None, filter_keys: Optional[List[str]] = None,
+    bias_range: Optional[np.ndarray] = None
 ) -> Dict[str, Dict[str, Any]]:
+    """
+    Process multiple images from JSON file, performing bias sweeps for each image.
+    
+    Args:
+        bias_range: Array of bias strengths to sweep. Defaults to np.linspace(1.0, 4.0, 4)
+    """
     person_desc_data = load_train_results_json(json_path)
     if filter_keys:
         person_desc_data = {k: v for k, v in person_desc_data.items() if k in filter_keys}
     if limit_items:
         person_desc_data = dict(list(person_desc_data.items())[:limit_items])
     
+    if bias_range is None:
+        bias_range = np.linspace(1.0, 4.0, 4)  # Default bias sweep range
+    
     base_image_dir, base_mask_dir, base_output_dir = Path(base_image_dir), Path(base_mask_dir), Path(base_output_dir)
-    results = {}
+    all_image_results = {}
+    
     for i, (image_key, subject_description) in enumerate(person_desc_data.items(), 1):
         print(f"{'='*80}\nProcessing {i}/{len(person_desc_data)}: {image_key}\n{'='*80}")
         prompt = build_prompt_with_subject_description(subject_description, prompt_template)
         folder_name, filename = image_key.split('/')[-2:]
         image_path = base_image_dir / folder_name / f"{filename}"
         mask_path = base_mask_dir / mask_filename_template.format(filename.split('.')[0])
+        
         if not image_path.exists() or not mask_path.exists():
             raise FileNotFoundError(f"Image or mask not found for {image_key}")
+        
         output_dir = base_output_dir / image_key
-        result = run_generation_with_attention(
-            image_path=str(image_path), mask_path=str(mask_path), prompt=prompt, output_dir=str(output_dir),
-            model=model, tokenizer=tokenizer, image_processor=image_processor,
-            generation_config=generation_config, attention_config=attention_config,
-            bias_strength=generation_config.get("bias_strength", 4.5)
+        
+        # Prepare experiment config for bias sweep
+        base_experiment_config = {
+            "image_path": str(image_path),
+            "mask_path": str(mask_path),
+            "prompt": prompt,
+            "output_dir": str(output_dir),
+            "generation_config": generation_config or {},
+            "attention_config": attention_config or {},
+        }
+        
+        # Run bias sweep for this image
+        print(f"Running bias sweep for {image_key} with range {bias_range}")
+        bias_sweep_results = run_bias_sweep_experiment(
+            base_experiment_config=base_experiment_config,
+            model=model,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            bias_range=bias_range,
+            save_summary=False  # Disable individual summary dumps
         )
-        results[image_key] = {"subject_description": subject_description, "generation_result": result, "prompt_used": prompt, "processing_timestamp": str(datetime.now())}
+        
+        # Analyze results for this image (without saving detailed summary)
+        performance_summary = analyze_bias_sweep_results(
+            bias_sweep_results, output_dir, save_summary=False
+        )
+        
+        # Store results for this image
+        all_image_results[image_key] = {
+            "subject_description": subject_description,
+            "bias_sweep_results": bias_sweep_results,
+            "performance_summary": performance_summary,
+            "best_bias_strength": performance_summary[0]['bias_strength'] if performance_summary else None,
+            "prompt_used": prompt,
+            "processing_timestamp": str(datetime.now())
+        }
+        
+        # Save results for this image immediately
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        image_results_path = output_dir / f"bias_sweep_results_{timestamp}.json"
+        image_results_path.parent.mkdir(parents=True, exist_ok=True)
+        save_results_to_json(all_image_results[image_key], image_results_path)
+        print(f"Results for {image_key} saved to: {image_results_path}")
 
+    # Save final combined results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_path = base_output_dir / f"generation_results_{timestamp}.json"
-    save_results_to_json(results, results_path)
-    print(f"\nBATCH PROCESSING COMPLETE. Results saved to: {results_path}")
-    return results
+    final_results_path = base_output_dir / f"batch_bias_sweep_results_{timestamp}.json"
+    save_results_to_json(all_image_results, final_results_path)
+    print(f"\nBATCH BIAS SWEEP PROCESSING COMPLETE. Final results saved to: {final_results_path}")
+    
+    return all_image_results
 
 def log_generation_step(step: int,
                         token_text: str,
@@ -338,7 +390,8 @@ def run_bias_sweep_experiment(
     model,
     tokenizer,
     image_processor,
-    bias_range: np.ndarray = np.linspace(0., 5., 10)
+    bias_range: np.ndarray = np.linspace(0., 5., 5),
+    save_summary: bool = True
 ) -> Dict[float, Dict[str, Any]]:
     """
     Runs the generation experiment across a range of bias strengths.
@@ -390,95 +443,7 @@ def run_bias_sweep_experiment(
         print(f"Finished experiment for bias {bias_i:.2f}. Results saved to: {results['output_directories']['main']}")
 
     # Summary and analysis of all bias sweep results
-    print(f"\n{'='*80}")
-    print("BIAS SWEEP EXPERIMENT SUMMARY")
-    print(f"{'='*80}")
-    
-    # Analyze and sort results by performance
-    performance_summary = []
-    for bias_val, result in all_results.items():
-        evaluation_summary = result.get("evaluation_summary", {})
-        quality_analysis = result.get("quality_analysis", {})
-        attention_correlation = result.get("attention_correlation", {})
-        
-        # Extract key performance metrics
-        avg_confidence = evaluation_summary.get("average_confidence", 0.0)
-        avg_entropy = evaluation_summary.get("average_entropy", float('inf'))
-        correlation_score = attention_correlation.get("mean_correlation", 0.0)
-        generated_text = result.get("generated_text", "")
-        num_tokens = result.get("num_tokens", 0)
-        
-        # Calculate composite performance score (higher is better)
-        # Weight: confidence (40%), correlation (40%), low entropy (20%)
-        entropy_score = max(0, 1 - (avg_entropy / 4.0))  # Normalize entropy (assuming max ~4)
-        composite_score = (0.4 * avg_confidence) + (0.4 * correlation_score) + (0.2 * entropy_score)
-        
-        performance_summary.append({
-            'bias_strength': bias_val,
-            'composite_score': composite_score,
-            'avg_confidence': avg_confidence,
-            'avg_entropy': avg_entropy,
-            'correlation_score': correlation_score,
-            'generated_text': generated_text,
-            'num_tokens': num_tokens,
-            'quality_analysis': quality_analysis
-        })
-    
-    # Sort by composite score (descending - higher is better)
-    performance_summary.sort(key=lambda x: x['composite_score'], reverse=True)
-    
-    # Display top performers
-    print(f"\nTOP 5 PERFORMING BIAS STRENGTHS:")
-    print(f"{'Rank':<4} {'Bias':<6} {'Score':<7} {'Confidence':<11} {'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}")
-    print("-" * 95)
-    
-    for i, result in enumerate(performance_summary[:5], 1):
-        print(f"{i:<4} {result['bias_strength']:<6.2f} {result['composite_score']:<7.3f} "
-              f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
-              f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
-              f"{result['generated_text'][:30]:<30}")
-    
-    # Display worst performers for comparison
-    print(f"\nWORST 3 PERFORMING BIAS STRENGTHS:")
-    print(f"{'Rank':<4} {'Bias':<6} {'Score':<7} {'Confidence':<11} {'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}")
-    print("-" * 95)
-    
-    for i, result in enumerate(performance_summary[-3:], len(performance_summary)-2):
-        print(f"{i:<4} {result['bias_strength']:<6.2f} {result['composite_score']:<7.3f} "
-              f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
-              f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
-              f"{result['generated_text'][:30]:<30}")
-    
-    # Best bias strength recommendation
-    best_result = performance_summary[0]
-    print(f"\n🏆 RECOMMENDED BIAS STRENGTH: {best_result['bias_strength']:.2f}")
-    print(f"   • Composite Score: {best_result['composite_score']:.3f}")
-    print(f"   • Average Confidence: {best_result['avg_confidence']:.3f}")
-    print(f"   • Average Entropy: {best_result['avg_entropy']:.3f}")
-    print(f"   • Attention Correlation: {best_result['correlation_score']:.3f}")
-    print(f"   • Generated Text: '{best_result['generated_text']}'")
-    
-    # Save detailed summary to file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary_path = Path(base_output_dir) / f"bias_sweep_summary_{timestamp}.json"
-    summary_data = {
-        "experiment_timestamp": timestamp,
-        "bias_range": bias_range.tolist(),
-        "performance_ranking": performance_summary,
-        "best_bias_strength": best_result['bias_strength'],
-        "summary_metrics": {
-            "total_experiments": len(all_results),
-            "best_composite_score": best_result['composite_score'],
-            "score_range": [performance_summary[-1]['composite_score'], performance_summary[0]['composite_score']]
-        }
-    }
-    
-    with open(summary_path, 'w') as f:
-        import json
-        json.dump(summary_data, f, indent=2)
-    
-    print(f"\n📊 Detailed summary saved to: {summary_path}")
-    print(f"{'='*80}")
+    performance_summary = analyze_bias_sweep_results(all_results, base_output_dir, save_summary=save_summary)
 
     return all_results
 
@@ -486,7 +451,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
-    parser.add_argument('--mode', type=str, default='sweep', choices=['single', 'batch', 'sweep'],
+    parser.add_argument('--mode', type=str, default='batch', choices=['single', 'batch', 'sweep'],
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
 
     # --- Model Loading Arguments ---
@@ -497,21 +462,21 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000001.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000001_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000004.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000004_masks.npy", help="Path to the attention mask.")
     parser.add_argument('--prompt', type=str, default="Complete the sentence. The person is looking at _ which is", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
     # --- Batch Processing Arguments ---
-    parser.add_argument('--json_path', type=str, default="llava_cls_general_desc_rdm.csv", help="Path to the JSON file with image descriptions for batch processing.")
+    parser.add_argument('--json_path', type=str, default=r"D:\Projects\data\gazefollow\train_results.json", help="Path to the JSON file with image descriptions for batch processing.")
     parser.add_argument('--base_image_dir', type=str, default=r"D:\Projects\data\gazefollow\train", help="Base directory for images in batch mode.")
     parser.add_argument('--base_mask_dir', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks", help="Base directory for masks in batch mode.")
     parser.add_argument('--limit_items', type=int, default=None, help="Limit the number of items to process in batch mode.")
 
     # --- Bias Sweep Arguments ---
-    parser.add_argument('--bias_min', type=float, default=0.0, help="Minimum bias strength for the sweep.")
-    parser.add_argument('--bias_max', type=float, default=5.0, help="Maximum bias strength for the sweep.")
-    parser.add_argument('--bias_steps', type=int, default=10, help="Number of steps in the bias sweep.")
+    parser.add_argument('--bias_min', type=float, default=1.0, help="Minimum bias strength for the sweep.")
+    parser.add_argument('--bias_max', type=float, default=4.0, help="Maximum bias strength for the sweep.")
+    parser.add_argument('--bias_steps', type=int, default=3, help="Number of steps in the bias sweep.")
 
     args = parser.parse_args()
 
@@ -528,7 +493,7 @@ if __name__ == '__main__':
     # --- Common Generation & Attention Configs ---
     # These can be further customized or exposed as arguments if needed
     generation_config = {
-        "bias_strength": 2.5, "max_new_tokens": 50, "temperature": 0.1,
+        "bias_strength": 2.5, "max_new_tokens": 20, "temperature": 0.1,
         "do_sample": False, "top_k": 50, "output_hidden_states": True,
     }
     attention_config = {
@@ -557,7 +522,8 @@ if __name__ == '__main__':
         )
 
     elif args.mode == 'batch':
-        print("--- Running Batch Processing ---")
+        print("--- Running Batch Processing with Bias Sweeps ---")
+        bias_range = np.linspace(args.bias_min, args.bias_max, args.bias_steps)
         process_batch_from_json(
             json_path=args.json_path,
             base_image_dir=args.base_image_dir,
@@ -568,7 +534,8 @@ if __name__ == '__main__':
             image_processor=image_processor,
             generation_config=generation_config,
             attention_config=attention_config,
-            limit_items=args.limit_items
+            limit_items=args.limit_items,
+            bias_range=bias_range
         )
 
     elif args.mode == 'sweep':
@@ -587,5 +554,6 @@ if __name__ == '__main__':
             model=model,
             tokenizer=tokenizer,
             image_processor=image_processor,
-            bias_range=bias_range
+            bias_range=bias_range,
+            save_summary=True
         )
