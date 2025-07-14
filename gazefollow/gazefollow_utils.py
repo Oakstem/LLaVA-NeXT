@@ -116,8 +116,8 @@ def _pixel_to_token_indices_helper_anyres(
         y_on_base_img = y_pixel_orig * base_scale_h_factor
 
         # Find the patch based indices
-        base_patch_col = int(x_on_base_img // patch_size)
-        base_patch_row = int(y_on_base_img // patch_size)
+        base_patch_col = np.clip(int(x_on_base_img // patch_size), 0, final_patch_division_size // patch_size - 1)
+        base_patch_row = np.clip(int(y_on_base_img // patch_size), 0, final_patch_division_size // patch_size - 1)
         total_patches_in_row = final_patch_division_size // patch_size
         base_img_idx = base_patch_row * total_patches_in_row + base_patch_col
         final_base_img_idx = image_token_start_index_in_embeds + base_img_idx
