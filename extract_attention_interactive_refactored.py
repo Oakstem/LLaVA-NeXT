@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 from datetime import datetime
 from pathlib import Path
 import copy
@@ -9,6 +10,8 @@ from typing import Dict, List, Optional, Any, Tuple, Union
 import torch
 import numpy as np
 from PIL import Image
+from transformers import PreTrainedModel, PreTrainedTokenizer
+from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
 
 # Add project root to sys.path
 try:
@@ -34,6 +37,12 @@ from generation_utils import (
     save_results_to_json,
     print_summary,
     analyze_bias_sweep_results,
+    prepare_person_desc_data,
+    default_bias_range,
+    prepare_batch_paths,
+    create_experiment_config,
+    save_image_results,
+    summarize_batch_results,
 )
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
@@ -267,6 +276,103 @@ def run_generation_with_attention(
     }
 
 
+def load_previous_batch_results(results_dir: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Load the most recent batch summary file to determine completed images.
+    
+    Args:
+        results_dir: Path to the directory containing previous batch results
+        
+    Returns:
+        Dictionary of completed image results from the batch summary file
+    """
+    results_dir = Path(results_dir)
+    
+    if not results_dir.exists():
+        print(f"Results directory {results_dir} does not exist.")
+        return {}
+    
+    # Look for batch summary results file
+    batch_files = list(results_dir.glob("batch_bias_sweep_results_*.json"))
+    if not batch_files:
+        print(f"No batch summary files found in {results_dir}")
+        return {}
+    
+    # Use the most recent batch file
+    latest_batch_file = max(batch_files, key=lambda p: p.stat().st_mtime)
+    print(f"Loading completed results from: {latest_batch_file}")
+    
+    try:
+        with open(latest_batch_file, 'r') as f:
+            completed_results = json.load(f)
+            print(f"Found {len(completed_results)} completed images")
+            return completed_results
+    except Exception as e:
+        print(f"Error loading batch summary: {e}")
+        return {}
+
+
+def validate_resume_directory(resume_dir: Union[str, Path]) -> bool:
+    """
+    Validate that the resume directory exists and contains valid batch results.
+    
+    Args:
+        resume_dir: Path to the directory to validate
+        
+    Returns:
+        True if the directory is valid for resuming, False otherwise
+    """
+    resume_dir = Path(resume_dir)
+    
+    if not resume_dir.exists():
+        print(f"ERROR: Resume directory does not exist: {resume_dir}")
+        return False
+    
+    if not resume_dir.is_dir():
+        print(f"ERROR: Resume path is not a directory: {resume_dir}")
+        return False
+    
+    # Check for any subdirectories (image results) or batch summary files
+    has_subdirs = any(item.is_dir() and not item.name.startswith('.') for item in resume_dir.iterdir())
+    has_batch_files = any(resume_dir.glob("batch_bias_sweep_results_*.json"))
+    
+    if not has_subdirs and not has_batch_files:
+        print(f"ERROR: Resume directory appears empty or invalid: {resume_dir}")
+        return False
+    
+    print(f"Resume directory validation passed: {resume_dir}")
+    return True
+
+
+def get_remaining_images(
+    person_desc_data: Dict[str, str], 
+    completed_results: Dict[str, Any]
+) -> Dict[str, str]:
+    """
+    Determine which images still need to be processed.
+    
+    Args:
+        person_desc_data: Dictionary of all images to process
+        completed_results: Dictionary of already completed results
+        
+    Returns:
+        Dictionary of remaining images to process
+    """
+    remaining = {}
+    for image_key, subject_description in person_desc_data.items():
+        if image_key not in completed_results:
+            remaining[image_key] = subject_description
+        # else:
+        #     # Check if the results are complete (has bias sweep results)
+        #     result_entry = completed_results[image_key]
+        #     if not result_entry.get('bias_sweep_results') or not result_entry.get('performance_summary'):
+        #         print(f"Results for {image_key} appear incomplete, will reprocess")
+        #         remaining[image_key] = subject_description
+    
+    print(f"Found {len(remaining)} images remaining to process out of {len(person_desc_data)} total")
+    return remaining
+
+
 def process_batch_from_json(
     json_path: Union[str, Path], base_image_dir: Union[str, Path], base_mask_dir: Union[str, Path],
     base_output_dir: Union[str, Path], model, tokenizer, image_processor,
@@ -274,87 +380,102 @@ def process_batch_from_json(
     prompt_template: str = "Complete the sentence. The {} is looking at",
     generation_config: Optional[Dict] = None, attention_config: Optional[Dict] = None,
     limit_items: Optional[int] = None, filter_keys: Optional[List[str]] = None,
-    bias_range: Optional[np.ndarray] = None
+    bias_range: Optional[np.ndarray] = None,
+    resume_from_dir: Optional[Union[str, Path]] = None
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process multiple images from JSON file, performing bias sweeps for each image.
     
     Args:
         bias_range: Array of bias strengths to sweep. Defaults to np.linspace(1.0, 4.0, 4)
+        resume_from_dir: Optional path to previous run directory to resume from
     """
-    person_desc_data = load_train_results_json(json_path)
-    if filter_keys:
-        person_desc_data = {k: v for k, v in person_desc_data.items() if k in filter_keys}
-    if limit_items:
-        person_desc_data = dict(list(person_desc_data.items())[:limit_items])
+    # Handle resume functionality
+    all_image_results: Dict[str, Any] = {}
+    if resume_from_dir:
+        resume_from_dir = fix_wsl_paths(str(resume_from_dir))
+        if not validate_resume_directory(resume_from_dir):
+            print("Resume directory validation failed. Starting fresh batch processing.")
+            resume_from_dir = None
+        else:
+            print(f"Attempting to resume from previous run: {resume_from_dir}")
+            all_image_results = load_previous_batch_results(resume_from_dir)
     
-    if bias_range is None:
-        bias_range = np.linspace(1.0, 4.0, 4)  # Default bias sweep range
+    # Prepare description data and directories
+    person_desc_data = prepare_person_desc_data(json_path, filter_keys, limit_items)
     
-    base_image_dir, base_mask_dir, base_output_dir = Path(base_image_dir), Path(base_mask_dir), Path(base_output_dir)
-    all_image_results = {}
+    # Determine which images still need processing
+    if resume_from_dir and all_image_results:
+        person_desc_data = get_remaining_images(person_desc_data, all_image_results)
+        if not person_desc_data:
+            print("All images already processed! Nothing to resume.")
+            summary_results = summarize_batch_results(all_image_results)
+            final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
+            print(f"Final results saved to: {final_path}")
+            return all_image_results
+    bias_vals = bias_range if bias_range is not None else default_bias_range()
+    base_image_dir = fix_wsl_paths(str(base_image_dir))
+    base_mask_dir = fix_wsl_paths(str(base_mask_dir))
+    base_output_dir = Path(fix_wsl_paths(str(base_output_dir)))
+
+    # Report resume status
+    total_images = len(prepare_person_desc_data(json_path, filter_keys, limit_items))
+    completed_count = len(all_image_results)
+    remaining_count = len(person_desc_data)
     
-    for i, (image_key, subject_description) in enumerate(person_desc_data.items(), 1):
-        print(f"{'='*80}\nProcessing {i}/{len(person_desc_data)}: {image_key}\n{'='*80}")
+    if resume_from_dir:
+        print(f"RESUME STATUS: {completed_count}/{total_images} images completed, {remaining_count} remaining")
+    else:
+        print(f"BATCH PROCESSING: {remaining_count} images to process")
+
+    # Iterate through each remaining image entry
+    for idx, (image_key, subject_description) in enumerate(person_desc_data.items(), start=1):
+        current_index = completed_count + idx
+        print(f"{'='*80}\nProcessing {current_index}/{total_images}: {image_key} (remaining: {idx}/{remaining_count})\n{'='*80}")
         prompt = build_prompt_with_subject_description(subject_description, prompt_template)
-        folder_name, filename = image_key.split('/')[-2:]
-        image_path = base_image_dir / folder_name / f"{filename}"
-        mask_path = base_mask_dir / mask_filename_template.format(filename.split('.')[0])
-        
-        if not image_path.exists() or not mask_path.exists():
-            raise FileNotFoundError(f"Image or mask not found for {image_key}")
-        
-        output_dir = base_output_dir / image_key
-        
-        # Prepare experiment config for bias sweep
-        base_experiment_config = {
-            "image_path": str(image_path),
-            "mask_path": str(mask_path),
-            "prompt": prompt,
-            "output_dir": str(output_dir),
-            "generation_config": generation_config or {},
-            "attention_config": attention_config or {},
-        }
-        
-        # Run bias sweep for this image
-        print(f"Running bias sweep for {image_key} with range {bias_range}")
-        bias_sweep_results = run_bias_sweep_experiment(
-            base_experiment_config=base_experiment_config,
-            model=model,
-            tokenizer=tokenizer,
-            image_processor=image_processor,
-            bias_range=bias_range,
-            save_summary=False  # Disable individual summary dumps
+        image_path, mask_path = prepare_batch_paths(
+            image_key, base_image_dir, base_mask_dir, mask_filename_template
         )
-        
-        # Analyze results for this image (without saving detailed summary)
-        performance_summary = analyze_bias_sweep_results(
+        if image_path is None or mask_path is None:
+            print(f"Skipping {image_key} due to missing image or mask.")
+            continue
+        output_dir = base_output_dir / image_key
+
+        # Run bias sweep experiment
+        print(f"Running bias sweep for {image_key} with range {bias_vals}")
+        base_config = create_experiment_config(
+            image_path, mask_path, prompt, output_dir,
+            generation_config, attention_config
+        )
+        bias_sweep_results = run_bias_sweep_experiment(
+            base_experiment_config=base_config,
+            model=model, tokenizer=tokenizer,
+            image_processor=image_processor, bias_range=bias_vals,
+            save_summary=False
+        )
+
+        # Analyze and store results
+        perf_summary = analyze_bias_sweep_results(
             bias_sweep_results, output_dir, save_summary=False
         )
-        
-        # Store results for this image
-        all_image_results[image_key] = {
+        result_entry = {
             "subject_description": subject_description,
             "bias_sweep_results": bias_sweep_results,
-            "performance_summary": performance_summary,
-            "best_bias_strength": performance_summary[0]['bias_strength'] if performance_summary else None,
+            "performance_summary": perf_summary,
+            "best_bias_strength": perf_summary[0]['bias_strength'] if perf_summary else None,
             "prompt_used": prompt,
-            "processing_timestamp": str(datetime.now())
+            "processing_timestamp": str(datetime.now()),
         }
-        
-        # Save results for this image immediately
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        image_results_path = output_dir / f"bias_sweep_results_{timestamp}.json"
-        image_results_path.parent.mkdir(parents=True, exist_ok=True)
-        save_results_to_json(all_image_results[image_key], image_results_path)
-        print(f"Results for {image_key} saved to: {image_results_path}")
+        all_image_results[image_key] = result_entry
 
-    # Save final combined results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    final_results_path = base_output_dir / f"batch_bias_sweep_results_{timestamp}.json"
-    save_results_to_json(all_image_results, final_results_path)
-    print(f"\nBATCH BIAS SWEEP PROCESSING COMPLETE. Final results saved to: {final_results_path}")
-    
+        # Save individual image results
+        saved_path = save_image_results(result_entry, output_dir)
+        print(f"Results for {image_key} saved to: {saved_path}")
+
+    # Final summary and saving of all results
+    summary_results = summarize_batch_results(all_image_results)
+    final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
+    print(f"\nBATCH BIAS SWEEP PROCESSING COMPLETE. Final results saved to: {final_path}")
     return all_image_results
 
 def log_generation_step(step: int,
@@ -439,6 +560,7 @@ def run_bias_sweep_experiment(
             prev_run_last_hidden_state=init_run_results['first_step_hidden_state']  # Use initial run results for embeddings
 
         )
+        results.pop('first_step_hidden_state', None)
         all_results[bias_i] = results
         print(f"Finished experiment for bias {bias_i:.2f}. Results saved to: {results['output_directories']['main']}")
 
@@ -446,6 +568,33 @@ def run_bias_sweep_experiment(
     performance_summary = analyze_bias_sweep_results(all_results, base_output_dir, save_summary=save_summary)
 
     return all_results
+
+def print_resume_usage_examples():
+    """Print usage examples for the resume functionality."""
+    print("\n" + "="*80)
+    print("RESUME FUNCTIONALITY USAGE EXAMPLES:")
+    print("="*80)
+    print("1. Resume a previous batch run:")
+    print("   python extract_attention_interactive_refactored.py --mode batch \\")
+    print("          --resume_from_dir /path/to/previous/run/output \\")
+    print("          --json_path /path/to/data.json \\")
+    print("          --base_image_dir /path/to/images \\")
+    print("          --base_mask_dir /path/to/masks")
+    print()
+    print("2. The script will automatically:")
+    print("   - Load the most recent batch_bias_sweep_results_*.json file")
+    print("   - Determine which images were already processed")
+    print("   - Continue processing only the remaining images")
+    print()
+    print("3. Example directory structure for resuming:")
+    print("   /previous/run/output/")
+    print("   ├── batch_bias_sweep_results_20250714_123456.json  <- Resume from here")
+    print("   ├── image1/")
+    print("   │   └── bias_sweep_results_*.json")
+    print("   └── image2/")
+    print("       └── bias_sweep_results_*.json")
+    print("="*80 + "\n")
+
 
 if __name__ == '__main__':
     import argparse
@@ -462,8 +611,8 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000004.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000004_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000023.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000023_masks.npy", help="Path to the attention mask.")
     parser.add_argument('--prompt', type=str, default="Complete the sentence. The person is looking at _ which is", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
@@ -472,13 +621,22 @@ if __name__ == '__main__':
     parser.add_argument('--base_image_dir', type=str, default=r"D:\Projects\data\gazefollow\train", help="Base directory for images in batch mode.")
     parser.add_argument('--base_mask_dir', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks", help="Base directory for masks in batch mode.")
     parser.add_argument('--limit_items', type=int, default=None, help="Limit the number of items to process in batch mode.")
+    parser.add_argument('--resume_from_dir', type=str, default=r"D:\Projects\LLaVA-NeXT\attention_output\refactored_experiment_20250714_000947", help="Path to previous run directory to resume batch processing from.")
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1.0, help="Minimum bias strength for the sweep.")
     parser.add_argument('--bias_max', type=float, default=4.0, help="Maximum bias strength for the sweep.")
     parser.add_argument('--bias_steps', type=int, default=3, help="Number of steps in the bias sweep.")
+    
+    # --- Help and Usage ---
+    parser.add_argument('--show_resume_examples', action='store_true', help="Show usage examples for resume functionality and exit.")
 
     args = parser.parse_args()
+    
+    # Show resume examples if requested
+    if args.show_resume_examples:
+        print_resume_usage_examples()
+        sys.exit(0)
 
     # --- Model Loading ---
     MODEL_CONFIG = {
@@ -493,7 +651,7 @@ if __name__ == '__main__':
     # --- Common Generation & Attention Configs ---
     # These can be further customized or exposed as arguments if needed
     generation_config = {
-        "bias_strength": 2.5, "max_new_tokens": 20, "temperature": 0.1,
+        "bias_strength": 2.5, "max_new_tokens": 30, "temperature": 0.1,
         "do_sample": False, "top_k": 50, "output_hidden_states": True,
     }
     attention_config = {
@@ -523,6 +681,8 @@ if __name__ == '__main__':
 
     elif args.mode == 'batch':
         print("--- Running Batch Processing with Bias Sweeps ---")
+        if args.resume_from_dir:
+            print(f"Resuming from previous run: {args.resume_from_dir}")
         bias_range = np.linspace(args.bias_min, args.bias_max, args.bias_steps)
         process_batch_from_json(
             json_path=args.json_path,
@@ -535,7 +695,8 @@ if __name__ == '__main__':
             generation_config=generation_config,
             attention_config=attention_config,
             limit_items=args.limit_items,
-            bias_range=bias_range
+            bias_range=bias_range,
+            resume_from_dir=args.resume_from_dir
         )
 
     elif args.mode == 'sweep':
