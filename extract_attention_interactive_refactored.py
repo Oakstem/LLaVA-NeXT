@@ -110,7 +110,7 @@ def run_generation_with_attention(
 
     output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir = _setup_output_directories(output_dir)
 
-    image, resized_mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids = \
+    image, input_masks, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids = \
         _prepare_inputs(image_path, mask_path, prompt, image_processor, tokenizer, model)
     
     boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
@@ -144,7 +144,7 @@ def run_generation_with_attention(
                 "query_indices": attn_config.get("query_indices", None),
                 "target_mask_embedding": prev_run_last_hidden_state,        # target_mask_embedding
                 "base_image_token_inds": [image_token_start_index_in_llm, image_token_start_index_in_llm + num_patches],
-                "resized_mask": resized_mask,
+                "input_masks": input_masks,
             }
             if i == 0:
                 model_inputs.update({"images": image_tensor, "image_sizes": image_sizes, "modalities": ["image"]})
@@ -230,7 +230,7 @@ def run_generation_with_attention(
 
             if all_attention_maps and len(atten_indices) > 0:
                 attention_correlation = calculate_attention_correlation_from_similarity(
-                    text_to_image_similarity_matrix=similarity_map, attention_mask=resized_mask,
+                    text_to_image_similarity_matrix=similarity_map, attention_mask=input_masks.get('target_mask', None),
                 )
                 all_correlation_metrics.append(attention_correlation)
             
@@ -430,6 +430,7 @@ def process_batch_from_json(
 
     # Iterate through each remaining image entry
     for idx, (image_key, subject_description) in enumerate(person_desc_data.items(), start=1):
+        subject_description = False  # todo: remove this to use person (gaze source) description in the prompt
         current_index = completed_count + idx
         print(f"{'='*80}\nProcessing {current_index}/{total_images}: {image_key} (remaining: {idx}/{remaining_count})\n{'='*80}")
         prompt = build_prompt_with_subject_description(subject_description, prompt_template)
@@ -472,9 +473,9 @@ def process_batch_from_json(
         saved_path = save_image_results(result_entry, output_dir)
         print(f"Results for {image_key} saved to: {saved_path}")
 
-    # Final summary and saving of all results
-    summary_results = summarize_batch_results(all_image_results)
-    final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
+        # Final summary and saving of all results
+        summary_results = summarize_batch_results(all_image_results)
+        final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
     print(f"\nBATCH BIAS SWEEP PROCESSING COMPLETE. Final results saved to: {final_path}")
     return all_image_results
 
@@ -600,7 +601,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
-    parser.add_argument('--mode', type=str, default='batch', choices=['single', 'batch', 'sweep'],
+    parser.add_argument('--mode', type=str, default='sweep', choices=['single', 'batch', 'sweep'],
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
 
     # --- Model Loading Arguments ---
@@ -611,9 +612,10 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000023.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000023_masks.npy", help="Path to the attention mask.")
-    parser.add_argument('--prompt', type=str, default="Complete the sentence. The person is looking at _ which is", help="Input prompt.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000004.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000004_masks.npy", help="Path to the attention mask.")
+    # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
+    parser.add_argument('--prompt', type=str, default="The _ is looking at _ . Repeat the sentence.", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
     # --- Batch Processing Arguments ---
@@ -621,12 +623,13 @@ if __name__ == '__main__':
     parser.add_argument('--base_image_dir', type=str, default=r"D:\Projects\data\gazefollow\train", help="Base directory for images in batch mode.")
     parser.add_argument('--base_mask_dir', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks", help="Base directory for masks in batch mode.")
     parser.add_argument('--limit_items', type=int, default=None, help="Limit the number of items to process in batch mode.")
-    parser.add_argument('--resume_from_dir', type=str, default=r"D:\Projects\LLaVA-NeXT\attention_output\refactored_experiment_20250714_000947", help="Path to previous run directory to resume batch processing from.")
+    # parser.add_argument('--resume_from_dir', type=str, default=r"D:\Projects\LLaVA-NeXT\attention_output\refactored_experiment_20250714_000947", help="Path to previous run directory to resume batch processing from.")
+    parser.add_argument('--resume_from_dir', default=False, help="Path to previous run directory to resume batch processing from.")
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1.0, help="Minimum bias strength for the sweep.")
-    parser.add_argument('--bias_max', type=float, default=4.0, help="Maximum bias strength for the sweep.")
-    parser.add_argument('--bias_steps', type=int, default=3, help="Number of steps in the bias sweep.")
+    parser.add_argument('--bias_max', type=float, default=5., help="Maximum bias strength for the sweep.")
+    parser.add_argument('--bias_steps', type=int, default=4, help="Number of steps in the bias sweep.")
     
     # --- Help and Usage ---
     parser.add_argument('--show_resume_examples', action='store_true', help="Show usage examples for resume functionality and exit.")
@@ -658,10 +661,11 @@ if __name__ == '__main__':
         "attn_threshold": 0.4, "opening_kernel_size": 5, "min_blob_area": 50,
         "min_avg_attention": 0.2, "show_highest_attn_blob": False, "dilate_kernel_size": 0,
         "create_collage": False,
-        "query_indices": {"gaze_source": [-5, -3], # taking the person indices from the end of the prompt, using range format
+        "query_indices": {"gaze_source": [-6, -3], # taking the person indices from the end of the prompt, using range format
                           "gaze_target": [-3, 0]  # taking the attention indices from the end of the prompt
                          },
-        "layer_idx": args.attn_layer_ind
+        "layer_idx": args.attn_layer_ind,
+        "save_tensors": False
     }
 
     if args.mode == 'single':
@@ -696,7 +700,8 @@ if __name__ == '__main__':
             attention_config=attention_config,
             limit_items=args.limit_items,
             bias_range=bias_range,
-            resume_from_dir=args.resume_from_dir
+            resume_from_dir=args.resume_from_dir,
+            prompt_template=args.prompt,
         )
 
     elif args.mode == 'sweep':

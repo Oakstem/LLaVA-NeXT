@@ -122,13 +122,21 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 #         target_mask_embedding = base_image_embedding[:, attn_mask_indices, :].mean(dim=1)[0]
                 #         inputs_embeds[:, -8, :] = target_mask_embedding
                 if kwargs.get("target_mask_embedding", None) is not None:
-                    target_mask_embedding = kwargs["target_mask_embedding"]
-                    attn_mask_indices = kwargs.get("resized_mask", np.array([])).flatten()
-                    attn_mask_indices = np.where(attn_mask_indices > 0)[0]
-                    if len(attn_mask_indices) > 0:
+                    mask_embedding = kwargs["target_mask_embedding"]
+                    input_masks = kwargs.get("input_masks", {})
+                    target_attn_mask_indices = input_masks['target_mask'].flatten()
+                    person_attn_mask_indices = input_masks['person_mask'].flatten() 
+                    target_attn_mask_indices = np.where(target_attn_mask_indices > 0)[0]
+                    person_attn_mask_indices = np.where(person_attn_mask_indices > 0)[0]
+                    if len(target_attn_mask_indices) > 0:
                 #         # Use the first mask index to get the target mask embedding
-                        target_mask_embedding = target_mask_embedding[attn_mask_indices, :].mean(dim=0)
-                    inputs_embeds[:, -8, :] = target_mask_embedding
+                        target_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
+                        inputs_embeds[:, -6, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _
+                    if len(person_attn_mask_indices) > 0:
+                        person_mask_embedding = mask_embedding[person_attn_mask_indices, :].mean(dim=0)
+                        # inputs_embeds[:, -8, :] = person_mask_embedding     # this is hardcoded for the prompt "... the _ is looking at ..."
+                        inputs_embeds[:, -10, :] = person_mask_embedding
+                    # inputs_embeds[:, -8, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _ which is"
 
             else:
                 # Unpack 6 values when images are not present (e.g., subsequent generation steps)
@@ -285,6 +293,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         mask = torch.full((seq_len, seq_len), float("0"), device=device, dtype=dtype)
         causal_indices = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
         mask[causal_indices] = 1.
+        # mask[:, tokens_indexing['image'][0]] = 0.
 
         if input_embeds is None:
              # lets mask all the image tokens

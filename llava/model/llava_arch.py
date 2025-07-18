@@ -543,6 +543,16 @@ class LlavaMetaForCausalLM(ABC):
             tokens_indexing['image'].append(image_tokens_inds)
             tokens_indexing['text'].append(text_tokens_inds)
 
+        # find special tokens for embedding insertion, '_' == 716
+        special_tokens_inds = torch.where(cur_input_ids_noim[-1] == 716)
+        full_input_len = new_input_embeds.size(1)
+        user_prompt_len = len(cur_input_embeds_no_im[-1])
+        if special_tokens_inds[0].numel() > 0:
+            special_tokens_inds = full_input_len - user_prompt_len + special_tokens_inds[0]
+        else:
+            special_tokens_inds = None
+        tokens_indexing['insert_embd'] = special_tokens_inds
+
         if _labels is None:
             # Extract indexes where the labels are image labels (IMAGE_TOKEN_INDEX)
             image_label_indexes = (new_labels_padded == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)

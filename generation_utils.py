@@ -465,7 +465,7 @@ def _prepare_configs(generation_config: Optional[Dict], attention_config: Option
         "collage_grid_rows": 3,
         "collage_grid_cols": 4,
         "visualize_attn_overlays": True,
-        "save_tensors": True
+        "save_tensors": False
     }
 
     gen_config = {**default_generation_config, **(generation_config or {})}
@@ -520,11 +520,11 @@ def _prepare_inputs(
         image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
     # Get attention indices from mask
-    atten_indices, resized_mask = get_attention_indices_from_mask(mask, image.size, model.config)
+    atten_indices, target_mask = get_attention_indices_from_mask(mask, image.size, model.config)
     if person_mask is not None:
-        person_mask_indices, _ = get_attention_indices_from_mask(person_mask, image.size, model.config)
+        person_mask_indices, person_mask = get_attention_indices_from_mask(person_mask, image.size, model.config)
     print(f"Initial attention indices: {len(atten_indices)} tokens")
-
+    masks = {'target_mask': target_mask, 'person_mask': person_mask}        # masks in [model's] input image resolution 
     # Prepare conversation
     conv_template = "qwen_1_5"  # Default for the model
 
@@ -545,7 +545,7 @@ def _prepare_inputs(
 
     image_sizes = [image.size]
     # tokenizer.decode(input_ids.cpu().numpy()[0][-11:-9])
-    return image, resized_mask, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids
+    return image, masks, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids
 
 def _determine_image_patch_info(model: PreTrainedModel, input_ids: torch.Tensor) -> Tuple[int, int, int, int]:
     """Determine image patch information and token indices."""
