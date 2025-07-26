@@ -408,7 +408,11 @@ def calculate_average_correlation(all_correlation_metrics: Optional[List[Dict[st
         
     for metrics_dict in all_correlation_metrics:
         for key, value in metrics_dict.items():
-            correlation_sum[key] += value
+            if not isinstance(value, str):      # Ignore string values
+                try:
+                    correlation_sum[key] += value
+                except:
+                    pass
             
     avg_correlation = {key: value / num_metrics for key, value in correlation_sum.items()}
     return avg_correlation
@@ -420,7 +424,8 @@ def create_generation_summary(
     candidate_evaluator: TopKCandidateEvaluator,
     generated_text: str,
     all_step_metrics: List[Dict[str, Any]],
-    all_correlation_metrics: Optional[List[Dict[str, float]]] = None
+    all_correlation_metrics: Optional[List[Dict[str, float]]] = None,
+    person_mask_correlation_metrics: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Create a comprehensive summary of the generation process.
@@ -479,6 +484,11 @@ def create_generation_summary(
     if avg_correlation:
         summary["average_attention_correlation"] = avg_correlation
     
+    # Add person mask correlation summary
+    if person_mask_correlation_metrics:
+        avg_person_correlation = calculate_average_correlation(person_mask_correlation_metrics)
+        summary["person_mask_correlation"] = avg_person_correlation
+    
     return summary
 
 
@@ -510,7 +520,7 @@ def analyze_generation_quality(summary: Dict[str, Any]) -> Dict[str, Any]:
     
     # Repetition penalty (-2 to 0 points)
     rep_penalty_2gram = summary["diversity_metrics"].get("repetition_penalty_2gram", 0)
-    repetition_factor = -min(2.0, rep_penalty_2gram * 8)  # Penalty for repetition
+    repetition_factor = -min(2.0, rep_penalty_2gram * 6)  # Penalty for repetition
     quality_score += repetition_factor
     quality_factors["repetition"] = repetition_factor
     
@@ -527,8 +537,8 @@ def analyze_generation_quality(summary: Dict[str, Any]) -> Dict[str, Any]:
         correlation_score = avg_corr.get("normalized_correlation_score", 0.0)
         focus_ratio = avg_corr.get("attention_focus_ratio", 1.0)
 
-        # Scale correlation score to 0-1.5 points
-        correlation_component = min(1.5, correlation_score * 5.)
+        # Scale correlation score to 0-2 points
+        correlation_component = min(2.0, correlation_score * 8.)
         # Scale focus ratio to 0-1.0 points. A ratio of 1 is neutral (0 points).
         # A ratio of 11 or more gives the full 1.0 point.
         focus_component = min(1.0, max(0, (focus_ratio - 1) / 10.0))
@@ -556,59 +566,117 @@ def analyze_generation_quality(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def calculate_attention_correlation_from_similarity(
-    text_to_image_similarity_matrix: np.ndarray,
-    attention_mask: np.ndarray,
+    text_to_image_similarity_matrix: Optional[np.ndarray] = None,
+    attention_mask: Optional[np.ndarray] = None,
+    attention_map: Optional[np.ndarray] = None,
     threshold: float = 0.5
 ) -> Dict[str, float]:
     """
-    Calculates the correlation between a similarity matrix (of image shape) and a given binary mask.
+    Calculates the correlation between a similarity matrix/attention map and a given binary mask.
 
     Args:
         text_to_image_similarity_matrix: 2D numpy array representing similarity scores (e.g., image shape).
-        attention_mask: 2D numpy array (same shape) with boolean or 0/1 values indicating target regions.
-        threshold: (Unused, kept for compatibility).
+        attention_mask: 2D numpy array with boolean or 0/1 values indicating target regions.
+        attention_map: 2D numpy array representing raw attention values from the model.
+        threshold: Threshold for binarizing similarity matrix (unused for attention maps).
 
     Returns:
         A dictionary containing attention correlation metrics.
     """
-    if (
-        text_to_image_similarity_matrix is None or text_to_image_similarity_matrix.size == 0 or
-        attention_mask is None or attention_mask.size == 0 or
-        text_to_image_similarity_matrix.shape != attention_mask.shape
-    ):
+    if attention_mask is None or attention_mask.size == 0:
         return {
             "target_attention_mean": 0.0,
             "off_target_attention_mean": 0.0,
             "attention_focus_ratio": 0.0,
-            "normalized_correlation_score": 0.0
+            "normalized_correlation_score": 0.0,
+            "correlation": 0.0,
+            "coverage": 0.0
         }
-    # threshold the similarity matrix to binary values
-    text_to_image_similarity_matrix = np.where(text_to_image_similarity_matrix > threshold, 1.0, 0.0)
+    
+    # Use similarity matrix if available, otherwise use attention map
+    if text_to_image_similarity_matrix is not None and text_to_image_similarity_matrix.size > 0:
+        correlation_source = text_to_image_similarity_matrix
+        # Threshold the similarity matrix to binary values
+        correlation_source = np.where(correlation_source > threshold, 1.0, 0.0)
+    elif attention_map is not None and attention_map.size > 0:
+        correlation_source = attention_map
+    else:
+        return {
+            "target_attention_mean": 0.0,
+            "off_target_attention_mean": 0.0,
+            "attention_focus_ratio": 0.0,
+            "normalized_correlation_score": 0.0,
+            "correlation": 0.0,
+            "coverage": 0.0
+        }
+    
+    # Ensure same shape
+    if correlation_source.shape != attention_mask.shape:
+        # Resize correlation_source to match mask shape if needed
+        try:
+            from scipy.ndimage import zoom
+            scale_factors = [mask_dim / corr_dim for mask_dim, corr_dim in 
+                            zip(attention_mask.shape, correlation_source.shape)]
+            correlation_source = zoom(correlation_source, scale_factors, order=1)
+        except ImportError:
+            # Fallback: simple interpolation using numpy
+            from scipy import ndimage
+            correlation_source = ndimage.zoom(correlation_source, 
+                                            [attention_mask.shape[0] / correlation_source.shape[0],
+                                             attention_mask.shape[1] / correlation_source.shape[1]], 
+                                            order=1)
 
-    flat_similarity = text_to_image_similarity_matrix.flatten()
+    flat_correlation = correlation_source.flatten()
     flat_mask = attention_mask.astype(bool).flatten()
+    
     total_mask_count = np.sum(flat_mask)
     total_off_mask_count = flat_mask.size - total_mask_count
     
+    if total_mask_count == 0:
+        return {
+            "target_attention_mean": 0.0,
+            "off_target_attention_mean": 0.0,
+            "attention_focus_ratio": 0.0,
+            "normalized_correlation_score": 0.0,
+            "correlation": 0.0,
+            "coverage": 0.0
+        }
 
     # On-target: where mask is True; Off-target: where mask is False
-    on_target_similarity = flat_similarity[flat_mask]
-    off_target_similarity = flat_similarity[~flat_mask]
+    on_target_correlation = flat_correlation[flat_mask]
+    off_target_correlation = flat_correlation[~flat_mask]
 
-    mean_on_target = np.sum(on_target_similarity) / total_mask_count if on_target_similarity.size > 0 else 0.0
-    mean_off_target = np.sum(off_target_similarity) / total_off_mask_count if off_target_similarity.size > 0 else 0.0
+    mean_on_target = np.sum(on_target_correlation) / total_mask_count if on_target_correlation.size > 0 else 0.0
+    mean_off_target = np.sum(off_target_correlation) / total_off_mask_count if off_target_correlation.size > 0 else 0.0
 
-    # Ratio of on-target to off-target similarity
-    focus_ratio = np.sum(on_target_similarity) / (np.sum(off_target_similarity) + 1e-9)
+    # Ratio of on-target to off-target attention
+    focus_ratio = np.sum(on_target_correlation) / (np.sum(off_target_correlation) + 1e-9)
 
     # Normalized score (0 to 1), where 1 is perfect focus
     correlation_score = max(0, (mean_on_target - mean_off_target) / (mean_on_target + mean_off_target + 1e-9))
+
+    # Calculate Pearson correlation between attention values and mask
+    if len(np.unique(flat_mask)) > 1:  # Avoid correlation with constant mask
+        correlation = np.corrcoef(flat_mask.astype(float), flat_correlation)[0, 1]
+        if np.isnan(correlation):
+            correlation = 0.0
+    else:
+        correlation = 0.0
+    
+    # Coverage: how much attention is in masked regions
+    total_attention = np.sum(correlation_source)
+    masked_attention = np.sum(correlation_source[attention_mask.astype(bool)])
+    coverage = masked_attention / total_attention if total_attention > 0 else 0.0
 
     return {
         "target_attention_mean": float(mean_on_target),
         "off_target_attention_mean": float(mean_off_target),
         "attention_focus_ratio": float(focus_ratio),
-        "normalized_correlation_score": float(correlation_score)
+        "normalized_correlation_score": float(correlation_score),
+        "correlation": float(correlation),
+        "coverage": float(coverage),
+        "mean_attention_in_mask": float(np.mean(on_target_correlation)) if on_target_correlation.size > 0 else 0.0,
+        "mean_attention_outside_mask": float(np.mean(off_target_correlation)) if off_target_correlation.size > 0 else 0.0
     }
 
 

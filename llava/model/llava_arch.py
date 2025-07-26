@@ -549,6 +549,14 @@ class LlavaMetaForCausalLM(ABC):
         user_prompt_len = len(cur_input_embeds_no_im[-1])
         if special_tokens_inds[0].numel() > 0:
             special_tokens_inds = full_input_len - user_prompt_len + special_tokens_inds[0]
+            # Add ±1 indices to the special token positions
+            expanded_inds = []
+            for idx in special_tokens_inds:
+                expanded_inds.extend([idx - 1, idx, idx + 1])
+            special_tokens_inds = torch.tensor(expanded_inds, device=special_tokens_inds.device)
+            # Remove duplicates and keep within bounds
+            special_tokens_inds = torch.unique(special_tokens_inds)
+            special_tokens_inds = special_tokens_inds[(special_tokens_inds >= 0) & (special_tokens_inds < full_input_len)]
         else:
             special_tokens_inds = None
         tokens_indexing['insert_embd'] = special_tokens_inds

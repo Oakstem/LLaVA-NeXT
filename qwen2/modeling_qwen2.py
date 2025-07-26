@@ -800,8 +800,8 @@ class Qwen2DecoderLayer(nn.Module):
         if kwargs.get('tokens_indexing', None) is not None and kwargs.get('tokens_indexing', None).get('insert_embd', None) is not None:    # and kwargs.get('tokens_indexing', None)['insert_embd'][0] >= 2:
             abs_indexing = True
             tokens_indexing = kwargs.get('tokens_indexing', None)
-            gaze_target_query_positions = [tokens_indexing['insert_embd'][-1]]
-            gaze_source_query_positions = [tokens_indexing['insert_embd'][0]]
+            gaze_target_query_positions = [tokens_indexing['insert_embd'][3:]]
+            gaze_source_query_positions = [tokens_indexing['insert_embd'][:3]]
         else:
             abs_indexing = False
             gaze_target_query_positions = kwargs.get('query_indices', None).get('gaze_target', None)
@@ -825,20 +825,28 @@ class Qwen2DecoderLayer(nn.Module):
                 source_attention_mask = attention_mask
             target_bias_mat = self._add_positional_bias(attention_mask, attention_bias_positions_gaze_target, bsz, q_len, kv_seq_len, position_ids)
             source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids)
-            combined_bias = target_bias_mat + source_bias_mat
+            if kwargs.get("apply_only_target_mask", False):
+                combined_bias = target_bias_mat
+                # get all indices where target bias is 0 (not masked), without the source indices
+                zero_inds = torch.where(source_attention_mask >= 0)
+            else:
+                combined_bias = source_bias_mat
+                # get all indices where either target or source bias is 0 (not masked & not boosted)
+                zero_inds = torch.where(torch.logical_or(attention_mask >= 0, source_attention_mask >= 0))
+                # zero_inds = torch.where(source_attention_mask >= 0))
             # using bitwise-or with parentheses
             nonzero_inds = torch.where(combined_bias >= self.bias_strength)
-            zero_inds = torch.where(torch.logical_or(attention_mask >= 0, source_attention_mask >= 0))
+            
             combined_mask_attention_mask = torch.ones_like(attention_mask, device=attention_mask.device, dtype=attention_mask.dtype) * attention_mask.min()
             # nonzero_inds = torch.where(torch.logical_or(target_bias_mat >= self.bias_strength, source_bias_mat >= self.bias_strength))
             combined_mask_attention_mask[zero_inds] = 0.0
             combined_mask_attention_mask[nonzero_inds] = self.bias_strength
             attention_mask = combined_mask_attention_mask
             self._attn_mask_ind += 1
-            if self._attn_mask_ind == 1:
-                # save the attention mask to csv file
-                attention_mask.cpu().numpy().squeeze().tofile(f"attention_mask_{self._attn_mask_ind}.csv", sep=",")
-                print(f"Attention mask saved to attention_mask_{self._attn_mask_ind}.csv")
+            # if self._attn_mask_ind == 1:
+            #     # save the attention mask to csv file
+            #     np.c_[np.where(attention_mask.cpu().numpy().squeeze() >=0)].tofile(f"attention_mask_{self._attn_mask_ind}.csv", sep=",")
+            #     print(f"Attention mask saved to attention_mask_{self._attn_mask_ind}.csv")
 
             not_masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() >= 0)
             masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() < 0)
@@ -882,8 +890,8 @@ class Qwen2DecoderLayer(nn.Module):
             query_start = seq_len + query_positions[0] - 5    # last 5 tokens are system added tokens, we need to focus on the last user prompt tokens
             query_end = seq_len + query_positions[-1] - 5
         else:
-            query_start = query_positions[0]
-            query_end = query_positions[0] + 1
+            query_start = query_positions[0][0]
+            query_end = query_positions[0][-1] + 1
 
         if seq_len > 1:
             # range_fn = range(seq_len-8, seq_len-5) # works well for hands localization
@@ -1318,9 +1326,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         next_decoder_cache = None
 
         # check if boost_positions are provided
-        boost_positions = kwargs.get("boost_positions", None)
-        bias_strength = kwargs.get("bias_strength", 1.5)
-        query_indices = kwargs.get("query_indices", None)
+        # boost_positions = kwargs.get("boost_positions", None)
+        # bias_strength = kwargs.get("bias_strength", 1.5)
+        # query_indices = kwargs.get("query_indices", None)
 
         for layer_ind, decoder_layer in enumerate(self.layers):
             if layer_ind == getattr(self.config, 'attn_layer_ind', 0):
@@ -1345,15 +1353,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
-                    source_attention_mask=source_attention_mask,
+                    # source_attention_mask=source_attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    boost_positions=boost_positions,      # todo: finish testing this
-                    bias_strength=bias_strength,
-                    query_indices=query_indices,
-                    tokens_indexing=kwargs.get("tokens_indexing", None),
+                    **kwargs,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1466,7 +1471,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            source_attention_mask=kwargs.get("source_attention_mask", None),
+            # source_attention_mask=kwargs.get("source_attention_mask", None),
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -1474,10 +1479,11 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            boost_positions=kwargs.get("boost_positions", None),  # todo: finish testing this
-            bias_strength=kwargs.get("bias_strength", 1.),  # todo: finish testing this
-            query_indices=kwargs.get("query_indices", None),  # todo: finish testing this
-            tokens_indexing=kwargs.get("tokens_indexing", None),
+            # boost_positions=kwargs.get("boost_positions", None),  # todo: finish testing this
+            # bias_strength=kwargs.get("bias_strength", 1.),  # todo: finish testing this
+            # query_indices=kwargs.get("query_indices", None),  # todo: finish testing this
+            # tokens_indexing=kwargs.get("tokens_indexing", None),
+            **kwargs,
         )
 
         hidden_states = outputs[0]

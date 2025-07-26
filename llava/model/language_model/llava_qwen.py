@@ -129,13 +129,18 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     target_attn_mask_indices = np.where(target_attn_mask_indices > 0)[0]
                     person_attn_mask_indices = np.where(person_attn_mask_indices > 0)[0]
                     if len(target_attn_mask_indices) > 0:
-                #         # Use the first mask index to get the target mask embedding
-                        target_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
-                        inputs_embeds[:, -6, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _
-                    if len(person_attn_mask_indices) > 0:
+                        # Use the first mask index to get the person (source) mask embedding
                         person_mask_embedding = mask_embedding[person_attn_mask_indices, :].mean(dim=0)
                         # inputs_embeds[:, -8, :] = person_mask_embedding     # this is hardcoded for the prompt "... the _ is looking at ..."
-                        inputs_embeds[:, -10, :] = person_mask_embedding
+                        # inputs_embeds[:, -10, :] = person_mask_embedding
+                        inputs_embeds[:, self.tokens_indexing['insert_embd'][0], :] = person_mask_embedding
+
+                    if len(person_attn_mask_indices) > 0 and len(self.tokens_indexing['insert_embd']) > 1:
+                        # Use the second mask index to get the target mask embedding
+                        target_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
+                        # inputs_embeds[:, -6, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _
+                        inputs_embeds[:, self.tokens_indexing['insert_embd'][1], :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _"
+
                     # inputs_embeds[:, -8, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _ which is"
 
             else:
@@ -193,6 +198,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 tokens_indexing=self.tokens_indexing,
                 device=input_device,
                 dtype=input_dtype,
+                mask_all_image=True,  # Assuming we want to mask all image tokens in the source attention
             )
         else:
             source_attention_mask = None
@@ -237,10 +243,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                boost_positions=kwargs.get("boost_positions", None),
-                bias_strength=kwargs.get("bias_strength", None),
+                # boost_positions=kwargs.get("boost_positions", None),
+                # bias_strength=kwargs.get("bias_strength", None),
                 tokens_indexing=self.tokens_indexing,
-                query_indices=kwargs.get("query_indices", None),
+                # query_indices=kwargs.get("query_indices", None),
+                **kwargs
             )
 
     @torch.no_grad()
@@ -281,7 +288,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                                             ids_to_attend: List[int],
                                             tokens_indexing: dict,
                                             device: torch.device,
-                                            dtype: torch.dtype = torch.float16) -> torch.Tensor:
+                                            dtype: torch.dtype = torch.float16,
+                                            mask_all_image=False) -> torch.Tensor:
         """
         Builds a custom attention mask.
         The mask allows causal attention for all tokens.
@@ -293,11 +301,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         mask = torch.full((seq_len, seq_len), float("0"), device=device, dtype=dtype)
         causal_indices = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
         mask[causal_indices] = 1.
-        # mask[:, tokens_indexing['image'][0]] = 0.
+        if mask_all_image:
+            mask[:, tokens_indexing['image'][0]] = 0.
 
         if input_embeds is None:
              # lets mask all the image tokens
             mask[:, tokens_indexing['image'][0]] = 0.
+            # mask[tokens_indexing['image'][0], :] = 0.
         
         # Modify the last row for specific attention if ids_to_attend is provided
         if ids_to_attend and seq_len > 0:
@@ -305,8 +315,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             # mask[last_token_idx, :] = float("0")  # Disallow all by default for the last token
 
             valid_ids_to_attend = [idx for idx in ids_to_attend if 0 <= idx < seq_len]
-            if valid_ids_to_attend:
-                mask[last_token_idx, torch.tensor(valid_ids_to_attend, device=device, dtype=torch.long)] = 1.
+            valid_ids_to_attend = torch.tensor(valid_ids_to_attend, device=device, dtype=torch.long)
+            if any(valid_ids_to_attend):
+                mask[last_token_idx, valid_ids_to_attend] = 1.
+            # if mask_all_image:
+            #     mask[:, valid_ids_to_attend] = 1.
         else:            
             k = 1
 

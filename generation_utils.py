@@ -31,9 +31,462 @@ import traceback
 # Import our enhanced generation metrics
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
-    generate_next_token_with_evaluation, create_generation_summary,
+    generate_next_token_with_evaluation,
     analyze_generation_quality, calculate_attention_correlation_from_similarity
 )
+
+# Gaze-Guided Token Selection Functions
+
+def select_token_by_gaze_correlation(
+    logits: torch.Tensor,
+    text_embedding: torch.Tensor,
+    image_embeddings: torch.Tensor,
+    target_mask: Optional[np.ndarray],
+    tokenizer: "PreTrainedTokenizer",
+    model: "PreTrainedModel",
+    top_k: int = 10,
+    similarity_weight: float = 0.7,
+    probability_weight: float = 0.3
+) -> Tuple[torch.Tensor, str, Dict[str, Any]]:
+    """
+    Select next token based on correlation with target gaze area rather than just probability.
+    
+    Args:
+        logits: Model output logits for next token prediction
+        text_embedding: Current text token embedding (not used in updated version)
+        image_embeddings: Image patch embeddings
+        target_mask: Binary mask indicating target gaze area
+        tokenizer: Tokenizer for decoding candidate tokens
+        model: The language model to extract token embeddings from
+        top_k: Number of top probability candidates to consider
+        similarity_weight: Weight for similarity score (0-1)
+        probability_weight: Weight for probability score (0-1)
+        
+    Returns:
+        Tuple of (selected_token_id, token_text, selection_metrics)
+    """
+    # Get top-k candidates by probability
+    probs = torch.softmax(logits, dim=-1)
+    top_k_probs, top_k_indices = torch.topk(probs, top_k)
+    
+    # Calculate similarity scores for each candidate
+    candidate_scores = []
+    selection_metrics = {
+        "candidates": [],
+        "similarity_scores": [],
+        "probability_scores": [],
+        "combined_scores": [],
+        "selected_index": 0
+    }
+    
+    # If no target mask provided, fall back to probability-based selection
+    if target_mask is None or image_embeddings is None:
+        selected_idx = top_k_indices[0]
+        selected_text = tokenizer.decode([selected_idx], skip_special_tokens=True)
+        selection_metrics["fallback_reason"] = "no_mask_or_embeddings"
+        return selected_idx.unsqueeze(0), selected_text, selection_metrics
+    
+    # Get target area embeddings
+    target_indices = np.where(target_mask.flatten() > 0)[0]
+    if len(target_indices) == 0:
+        # No target area found, fall back to probability
+        selected_idx = top_k_indices[0]
+        selected_text = tokenizer.decode([selected_idx], skip_special_tokens=True)
+        selection_metrics["fallback_reason"] = "empty_target_mask"
+        return selected_idx.unsqueeze(0), selected_text, selection_metrics
+    
+    target_embeddings = image_embeddings[target_indices]  # Shape: [n_target_patches, embed_dim]
+    target_center_embedding = target_embeddings.mean(dim=0)  # Average target embedding
+    
+    # Optional: Analyze semantic content of target area (for debugging/insights)
+    target_semantics = None
+    # try:
+    #     target_semantics = analyze_target_area_semantics(
+    #         target_embeddings, model, tokenizer, top_k=5, temperature=1.0
+    #     )
+    # except Exception as e:
+    #     print(f"Warning: Could not analyze target area semantics: {e}")
+    
+    # Get the token embedding layer from the model
+    if hasattr(model, 'get_input_embeddings'):
+        token_embedding_layer = model.get_input_embeddings()
+    elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+        token_embedding_layer = model.model.embed_tokens
+    else:
+        # Fallback to using the provided text_embedding for all candidates
+        print("Warning: Could not find token embedding layer, using fallback method")
+        token_embedding_layer = None
+    
+    for i, (prob, token_idx) in enumerate(zip(top_k_probs, top_k_indices)):
+        token_text = tokenizer.decode([token_idx], skip_special_tokens=True)
+        
+        # Get the actual embedding for this specific token
+        if token_embedding_layer is not None:
+            candidate_token_embedding = token_embedding_layer(token_idx.unsqueeze(0)).squeeze(0)
+        else:
+            # Fallback to using the provided text_embedding
+            candidate_token_embedding = text_embedding
+        
+        # Calculate cosine similarity between token embedding and target area
+        similarity = torch.cosine_similarity(
+            candidate_token_embedding.unsqueeze(0), 
+            target_center_embedding.unsqueeze(0), 
+            dim=1
+        ).item()
+        
+        # Combine probability and similarity scores
+        prob_score = prob.item()
+        combined_score = (similarity_weight * similarity) + (probability_weight * prob_score)
+        
+        candidate_scores.append({
+            "token_idx": token_idx.item(),
+            "token_text": token_text,
+            "probability": prob_score,
+            "similarity": similarity,
+            "combined_score": combined_score,
+            "rank": i
+        })
+        
+        # Store metrics
+        selection_metrics["candidates"].append(token_text)
+        selection_metrics["similarity_scores"].append(similarity)
+        selection_metrics["probability_scores"].append(prob_score)
+        selection_metrics["combined_scores"].append(combined_score)
+    
+    # Select token with highest combined score
+    best_candidate = max(candidate_scores, key=lambda x: x["combined_score"])
+    selected_token_idx = torch.tensor([best_candidate["token_idx"]], device=logits.device)
+    selected_text = best_candidate["token_text"]
+    
+    # Find the index of selected candidate in the original top-k list
+    selection_metrics["selected_index"] = next(
+        i for i, cand in enumerate(candidate_scores) 
+        if cand["token_idx"] == best_candidate["token_idx"]
+    )
+    selection_metrics["selected_candidate"] = best_candidate
+    selection_metrics["target_embeddings_count"] = len(target_indices)
+    selection_metrics["target_area_semantics"] = target_semantics
+    
+    return selected_token_idx, selected_text, selection_metrics
+
+
+def decode_embeddings_to_text(
+    embeddings: torch.Tensor,
+    model: "PreTrainedModel",
+    tokenizer: "PreTrainedTokenizer",
+    top_k: int = 5,
+    temperature: float = 1.0
+) -> List[Dict[str, Any]]:
+    """
+    Decode embeddings to the most semantically similar text tokens using output embeddings.
+    
+    This function takes image patch embeddings or any other embeddings and finds
+    the vocabulary tokens that are most semantically similar to them, helping to
+    understand what concepts the embeddings represent.
+    
+    Args:
+        embeddings: Tensor of shape [embed_dim] or [n_embeddings, embed_dim]
+        model: The language model to extract output embeddings from
+        tokenizer: Tokenizer for decoding tokens
+        top_k: Number of top similar tokens to return
+        temperature: Temperature for similarity scoring (higher = more diverse)
+        
+    Returns:
+        List of dictionaries containing token information and similarity scores
+        
+    Example:
+        >>> target_embeddings = image_embeddings[target_indices]
+        >>> semantic_info = decode_embeddings_to_text(target_embeddings, model, tokenizer)
+        >>> print(f"Target area represents: {semantic_info[0]['top_tokens'][0]['token_text']}")
+    """
+    # Ensure embeddings is 2D
+    if embeddings.dim() == 1:
+        embeddings = embeddings.unsqueeze(0)  # Shape: [1, embed_dim]
+    
+    # Get the output embedding layer (lm_head) from the model
+    if hasattr(model, 'get_output_embeddings'):
+        output_embedding_layer = model.get_output_embeddings()
+    elif hasattr(model, 'lm_head'):
+        output_embedding_layer = model.lm_head
+    else:
+        raise ValueError("Could not find output embedding layer in the model")
+    
+    # Get output embedding weights
+    # Shape: [vocab_size, embed_dim]
+    output_weights = output_embedding_layer.weight
+    
+    # Calculate similarities for each input embedding
+    results = []
+    for i, embedding in enumerate(embeddings):
+        # Calculate cosine similarity between the embedding and all output token embeddings
+        # embedding: [embed_dim], output_weights: [vocab_size, embed_dim]
+        similarities = torch.nn.functional.cosine_similarity(
+            embedding.unsqueeze(0),  # Shape: [1, embed_dim]
+            output_weights,          # Shape: [vocab_size, embed_dim]
+            dim=1
+        )  # Shape: [vocab_size]
+        
+        # Apply temperature scaling
+        if temperature != 1.0:
+            similarities = similarities / temperature
+        
+        # Handle NaNs and get top-k most similar tokens
+        similarities = torch.nan_to_num(similarities, nan=-float('inf'))
+        top_k_similarities, top_k_indices = torch.topk(similarities, top_k)
+        
+        # Decode tokens and create result
+        embedding_result = {
+            "embedding_index": i,
+            "top_tokens": []
+        }
+        
+        for j, (sim_score, token_idx) in enumerate(zip(top_k_similarities, top_k_indices)):
+            try:
+                token_text = tokenizer.decode([token_idx.item()], skip_special_tokens=True)
+                # Clean up the token text
+                token_text = token_text.strip()
+                if not token_text:
+                    token_text = f"<token_{token_idx.item()}>"
+            except Exception:
+                token_text = f"<token_{token_idx.item()}>"
+            
+            embedding_result["top_tokens"].append({
+                "rank": j + 1,
+                "token_id": token_idx.item(),
+                "token_text": token_text,
+                "similarity_score": sim_score.item(),
+                "raw_token": tokenizer.convert_ids_to_tokens([token_idx.item()])[0] if hasattr(tokenizer, 'convert_ids_to_tokens') else token_text
+            })
+        
+        results.append(embedding_result)
+    
+    return results
+
+
+def analyze_target_area_semantics(
+    target_embeddings: torch.Tensor,
+    model: "PreTrainedModel",
+    tokenizer: "PreTrainedTokenizer",
+    top_k: int = 10,
+    temperature: float = 1.0
+) -> Dict[str, Any]:
+    """
+    Analyze the semantic content of target area embeddings.
+    
+    Args:
+        target_embeddings: Tensor of shape [n_target_patches, embed_dim]
+        model: The language model
+        tokenizer: Tokenizer for decoding
+        top_k: Number of top tokens to analyze
+        temperature: Temperature for similarity scoring
+        
+    Returns:
+        Dictionary containing semantic analysis results
+    """
+    # Calculate the mean embedding of the target area
+    target_center_embedding = target_embeddings.mean(dim=0)  # Shape: [embed_dim]
+    
+    # Decode the center embedding to text
+    center_results = decode_embeddings_to_text(
+        target_center_embedding, model, tokenizer, top_k, temperature
+    )
+    
+    # Also decode a few individual patch embeddings for diversity analysis
+    num_patches_to_analyze = min(3, target_embeddings.shape[0])
+    individual_patch_results = []
+    
+    if num_patches_to_analyze > 1:
+        # Select patches: first, middle, and last
+        patch_indices = [0, target_embeddings.shape[0] // 2, target_embeddings.shape[0] - 1]
+        patch_indices = list(set(patch_indices))  # Remove duplicates
+        patch_indices = patch_indices[:num_patches_to_analyze]
+        
+        for idx in patch_indices:
+            patch_embedding = target_embeddings[idx]
+            patch_results = decode_embeddings_to_text(
+                patch_embedding, model, tokenizer, top_k // 2, temperature
+            )
+            individual_patch_results.append({
+                "patch_index": idx,
+                "results": patch_results[0]  # Only one embedding per patch
+            })
+    
+    # Extract common themes from the top tokens
+    all_tokens = [token["token_text"] for token in center_results[0]["top_tokens"]]
+    for patch_result in individual_patch_results:
+        all_tokens.extend([token["token_text"] for token in patch_result["results"]["top_tokens"]])
+    
+    # Simple analysis of token types
+    semantic_categories = {
+        "objects": [],
+        "actions": [],
+        "descriptors": [],
+        "spatial": [],
+        "other": []
+    }
+    
+    # Basic categorization (this could be enhanced with more sophisticated NLP)
+    for token in set(all_tokens):  # Remove duplicates
+        token_lower = token.lower().strip()
+        if not token_lower or len(token_lower) < 2:
+            continue
+            
+        # Simple heuristic categorization
+        if any(word in token_lower for word in ['look', 'see', 'watch', 'gaze', 'stare', 'glance']):
+            semantic_categories["actions"].append(token)
+        elif any(word in token_lower for word in ['left', 'right', 'up', 'down', 'above', 'below', 'center']):
+            semantic_categories["spatial"].append(token)
+        elif any(word in token_lower for word in ['big', 'small', 'red', 'blue', 'bright', 'dark', 'large']):
+            semantic_categories["descriptors"].append(token)
+        elif len(token_lower) > 2 and token_lower.isalpha():
+            semantic_categories["objects"].append(token)
+        else:
+            semantic_categories["other"].append(token)
+    
+    return {
+        "target_area_center": center_results[0],
+        "individual_patches": individual_patch_results,
+        "semantic_analysis": {
+            "categories": semantic_categories,
+            "most_likely_concept": center_results[0]["top_tokens"][0]["token_text"] if center_results[0]["top_tokens"] else "unknown",
+            "confidence_score": center_results[0]["top_tokens"][0]["similarity_score"] if center_results[0]["top_tokens"] else 0.0,
+            "diversity_score": len(set(all_tokens)) / len(all_tokens) if all_tokens else 0.0
+        },
+        "summary": {
+            "num_target_patches": target_embeddings.shape[0],
+            "embedding_dim": target_embeddings.shape[1],
+            "top_concepts": [token["token_text"] for token in center_results[0]["top_tokens"][:5]]
+        }
+    }
+
+
+def generate_next_token_with_gaze_guidance(
+    model_inputs: Dict[str, Any],
+    model: "PreTrainedModel", 
+    tokenizer: "PreTrainedTokenizer",
+    gen_config: Dict[str, Any],
+    confidence_tracker: "ConfidenceMetrics",
+    repetitivity_tracker: "RepetitivityMetrics", 
+    candidate_evaluator: "TopKCandidateEvaluator",
+    step_num: int,
+    image_embeddings: Optional[torch.Tensor] = None,
+    target_mask: Optional[np.ndarray] = None,
+    use_gaze_guidance: bool = True,
+    guidance_config: Optional[Dict[str, Any]] = None
+) -> Tuple[torch.Tensor, str, Any, Dict[str, Any]]:
+    """
+    Enhanced token generation with gaze-based guidance.
+    
+    Args:
+        model_inputs: Dictionary of inputs to the model
+        model: The language model
+        tokenizer: The tokenizer
+        gen_config: Generation configuration
+        confidence_tracker: Metrics tracker for confidence
+        repetitivity_tracker: Metrics tracker for repetitivity
+        candidate_evaluator: Top-k candidate evaluator
+        step_num: Current generation step number
+        image_embeddings: Image patch embeddings for similarity calculation
+        target_mask: Binary mask indicating target gaze area
+        use_gaze_guidance: Whether to use gaze guidance
+        guidance_config: Configuration for guidance behavior
+        
+    Returns:
+        Tuple of (next_token_id, token_text, model_outputs, evaluation_metrics)
+    """
+    # Default guidance configuration
+    default_guidance_config = {
+        "top_k": 10,
+        "similarity_weight": 0.7,
+        "probability_weight": 0.3,
+        "enable_after_step": 0,  # Start guidance immediately
+        "enable_after_keyword": "looking"  # Enable guidance after seeing "looking"
+    }
+    guidance_config = {**default_guidance_config, **(guidance_config or {})}
+    
+    # Generate model outputs
+    outputs = model(**model_inputs)
+    logits = outputs.logits[0, -1, :]  # Get logits for the last token
+    
+    # Extract current text embedding if available
+    text_embedding = None
+    if outputs.hidden_states and len(outputs.hidden_states) > 0:
+        text_embedding = outputs.hidden_states[-1].squeeze(0)[-1]  # Last token of last layer
+    
+    # Determine if we should use gaze guidance
+    should_use_guidance = (
+        use_gaze_guidance and 
+        step_num >= guidance_config["enable_after_step"] and
+        image_embeddings is not None and
+        text_embedding is not None and
+        target_mask is not None
+    )
+    
+    # Check if we've seen the trigger keyword
+    if guidance_config.get("enable_after_keyword"):
+        # This would need to be tracked externally, for now assume it's always enabled
+        pass
+    
+    selection_metrics = {}
+    
+    if should_use_guidance:
+        # Use gaze-guided selection
+        next_token_id, token_text, selection_metrics = select_token_by_gaze_correlation(
+            logits=logits,
+            text_embedding=text_embedding,
+            image_embeddings=image_embeddings,
+            target_mask=target_mask,
+            tokenizer=tokenizer,
+            model=model,
+            top_k=guidance_config["top_k"],
+            similarity_weight=guidance_config["similarity_weight"],
+            probability_weight=guidance_config["probability_weight"]
+        )
+        selection_metrics["guidance_used"] = True
+    else:
+        # Fall back to standard probability-based selection
+        probs = torch.softmax(logits, dim=-1)
+        next_token_id = torch.multinomial(probs, 1) if gen_config.get("do_sample", False) else logits.argmax(dim=-1, keepdim=True)
+        token_text = tokenizer.decode(next_token_id, skip_special_tokens=True)
+        selection_metrics = {
+            "guidance_used": False,
+            "fallback_reason": "guidance_disabled_or_missing_data"
+        }
+    
+    # Update evaluation metrics
+    evaluation_metrics = {}
+    if outputs.logits is not None:
+        logits = outputs.logits[0, -1, :]
+        probs = torch.softmax(logits, dim=-1)
+        
+        # Compute confidence metrics first
+        confidence_metrics = confidence_tracker.compute_confidence_metrics(logits)
+        
+        # Evaluate top-k candidates
+        candidate_eval = candidate_evaluator.evaluate_candidates(logits, step_num)
+        
+        # Update trackers with proper method calls
+        confidence_tracker.update_history(step_num, confidence_metrics)
+        repetitivity_tracker.add_token(next_token_id.item(), token_text)
+        
+        # Compute repetitivity metrics
+        repetitivity_metrics = repetitivity_tracker.compute_diversity_metrics()
+        recent_repetitions = repetitivity_tracker.get_recent_repetitions()
+        
+        evaluation_metrics = {
+            "step": step_num,
+            "selected_token": {
+                "id": next_token_id.item(),
+                "text": token_text
+            },
+            "confidence": confidence_metrics,
+            "repetitivity": repetitivity_metrics,
+            "recent_repetitions": recent_repetitions,
+            "top_k_analysis": candidate_eval,
+            "selection_metrics": selection_metrics
+        }
+    
+    return next_token_id, token_text, outputs, evaluation_metrics
 
 # Model Loading and Setup
 def load_model_and_setup(
@@ -512,12 +965,18 @@ def _prepare_inputs(
     print(f"Mask shape: {mask.shape}")
 
 
-    # Process image
-    image_tensor = process_images([image], image_processor, model.config)
-    if isinstance(image_tensor, list):
-        image_tensor = [img.to(model.device, dtype=torch.float16) for img in image_tensor]
+    # Process image: get tensor of shape [1, C, H, W]
+    processed = process_images([image], image_processor, model.config)
+    if isinstance(processed, list):
+        # Take first element if list returned
+        image_tensor = processed[0]
     else:
-        image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+        image_tensor = processed
+    # Ensure batch dimension
+    if image_tensor.ndim == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    # Move to device and cast to float16
+    image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
     # Get attention indices from mask
     atten_indices, target_mask = get_attention_indices_from_mask(mask, image.size, model.config)
@@ -543,7 +1002,8 @@ def _prepare_inputs(
         IMAGE_TOKEN_INDEX, return_tensors="pt"
     ).unsqueeze(0).to(model.device)
 
-    image_sizes = [image.size]
+    # Prepare image sizes as [height, width] for model
+    image_sizes = [[image.size[1], image.size[0]]]
     # tokenizer.decode(input_ids.cpu().numpy()[0][-11:-9])
     return image, masks, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids
 
@@ -791,6 +1251,7 @@ def print_summary(generation_summary, quality_analysis, final_text: str, generat
 
     # Print Attention Correlation
     attention_correlation = generation_summary.get('average_attention_correlation', 0)
+    person_correlation = generation_summary.get('person_mask_correlation', 0)
     if attention_correlation:
         print("" + "="*50)
         print("ATTENTION CORRELATION METRICS")
@@ -799,6 +1260,8 @@ def print_summary(generation_summary, quality_analysis, final_text: str, generat
         print(f"  - On-Target Attention Mean: {attention_correlation.get('target_attention_mean', 0):.4f}")
         print(f"  - Off-Target Attention Mean: {attention_correlation.get('off_target_attention_mean', 0):.4f}")
         print(f"  - Focus Ratio: {attention_correlation.get('attention_focus_ratio', 0):.2f}x")
+        print(f"  - Person Mask Attention Mean: {person_correlation.get('target_attention_mean', 0):.4f}")
+        print(f"  - Person Focus Ratio: {person_correlation.get('attention_focus_ratio', 0):.2f}x")
 
 # Summary and analysis of all bias sweep results
 
@@ -854,7 +1317,9 @@ def analyze_bias_sweep_results(all_results: Dict[float, Dict[str, Any]], base_ou
         
         # Use existing overall quality score from quality_analysis
         overall_quality_score = quality_analysis.get("overall_quality_score", 0.0)
-        
+        if correlation_score == 0.0:
+            continue  # Skip if correlation score is zero (no correlation with target mask)
+
         performance_summary.append({
             'bias_strength': bias_val,
             'overall_quality_score': overall_quality_score,
@@ -891,6 +1356,9 @@ def analyze_bias_sweep_results(all_results: Dict[float, Dict[str, Any]], base_ou
                 f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
                 f"{result['generated_text'][:30]:<30}")
     
+    if len(performance_summary) == 0:
+        print("No valid results found with non-zero correlation scores.")
+        return {}
     # Best bias strength recommendation
     best_result = performance_summary[0]
     print(f"\n🏆 RECOMMENDED BIAS STRENGTH: {best_result['bias_strength']:.2f}")
@@ -999,6 +1467,39 @@ def save_image_results(
     path.parent.mkdir(parents=True, exist_ok=True)
     save_results_to_json(results, path)
     return path
+
+    
+def log_generation_step(step: int,
+                        token_text: str,
+                        evaluation_metrics: Dict[str, Any],
+                        next_token_id: torch.Tensor,
+                        eos_token_id: int,
+                        conf_threshold: float = 0.8,
+                        top_n: int = 3) -> bool:
+    """
+    Logs confidence, entropy and top-k alternatives.
+    Returns True if the generated token is EOS (so the caller should break).
+    """
+    conf_score = evaluation_metrics["confidence"].get("confidence_score", 0)
+    entropy = evaluation_metrics["confidence"].get("entropy", 0)
+    print(f"Step {step}: '{token_text}' | Confidence: {conf_score:.3f} | Entropy: {entropy:.3f}")
+
+    candidates = evaluation_metrics.get("top_k_analysis", {}).get("candidates", [])
+    if conf_score < conf_threshold and len(candidates) >= top_n:
+        print("  Top alternatives:")
+        for idx, cand in enumerate(candidates[:top_n], start=1):
+            print(f"    {idx}. '{cand['token_text']}' (p={cand['probability']:.3f})")
+
+    if next_token_id.item() == eos_token_id:
+        print("EOS token generated. Stopping.")
+        return True
+    if token_text.lower() == ".":
+        print("Empty token generated. Stopping.")
+        return True
+
+    return False
+
+
 def summarize_batch_results(
     all_image_results: Dict[str, Any]
 ) -> Dict[str, Any]:
