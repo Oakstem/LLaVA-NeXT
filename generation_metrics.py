@@ -94,7 +94,7 @@ class RepetitivityMetrics:
     
     def add_token(self, token_id: int, token_text: str) -> None:
         """Add a new token to the history."""
-        self.token_history.append({"id": token_id, "text": token_text})
+        self.token_history.append({"id": token_id, "text": token_text.lower().strip()})
         self._update_ngram_counts()
     
     def _update_ngram_counts(self) -> None:

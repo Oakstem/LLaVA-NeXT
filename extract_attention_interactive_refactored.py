@@ -122,8 +122,22 @@ def run_generation_with_attention(
 
     output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir = _setup_output_directories(output_dir)
 
-    image, input_masks, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids = \
-        _prepare_inputs(image_path, mask_path, prompt, image_processor, tokenizer, model)
+    (
+        image,
+        input_masks,
+        image_tensor,
+        image_sizes,
+        atten_indices,
+        person_mask_indices,
+        input_ids,
+    ) = _prepare_inputs(
+        image_path,
+        mask_path,
+        prompt,
+        image_processor,
+        tokenizer,
+        model,
+    )
     
     boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
     num_patches, grid_size, image_token_start_index_in_llm, image_token_end_index_in_llm = _determine_image_patch_info(model, input_ids)
@@ -220,10 +234,6 @@ def run_generation_with_attention(
                 # move to target attention mask boost (instead of gaze source)
                 apply_only_target_mask = True
 
-            # Call the logging function and break if EOS
-            if log_generation_step(i, token_text, evaluation_metrics, next_token_id, eos_token_id):
-                break
-
             generated_ids.append(next_token_id.item())
 
             if outputs.hidden_states:
@@ -255,6 +265,10 @@ def run_generation_with_attention(
                 # threshold_value=0.3
                 )
 
+            # Call the logging function and break if EOS
+            if log_generation_step(i, token_text, evaluation_metrics, next_token_id, eos_token_id):
+                break
+            
             processed_img, attention_map = _extract_and_process_attention(
                 outputs, next_token_id, token_text, i, num_patches, grid_size, image_token_start_index_in_llm,
                 image, attn_config, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir
@@ -279,7 +293,7 @@ def run_generation_with_attention(
                     'mask_type': 'person_source',
                     **person_attention_correlation
                 })
-
+            # Calculate target mask correlation after switching to target mask
             if all_attention_maps and len(atten_indices) > 0 and apply_only_target_mask and similarity_map is not None \
             and token_text.lower().strip() not in ['at', 'looking', 'is', 'a', 'an']:
                 attention_correlation = calculate_attention_correlation_from_similarity(
@@ -664,8 +678,8 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000032.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__00000032_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000004.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000004_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
@@ -686,7 +700,7 @@ if __name__ == '__main__':
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
-    parser.add_argument('--bias_max', type=float, default=8., help="Maximum bias strength for the sweep.")
+    parser.add_argument('--bias_max', type=float, default=8.5, help="Maximum bias strength for the sweep.")
     parser.add_argument('--bias_steps', type=int, default=4, help="Number of steps in the bias sweep.")
     
     # --- Gaze Guidance Arguments ---
