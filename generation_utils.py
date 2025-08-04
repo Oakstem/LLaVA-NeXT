@@ -28,6 +28,8 @@ from llava.utils import disable_torch_init
 from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres
 import traceback
 
+from llava.model.llava_arch import unpad_image
+
 # Import our enhanced generation metrics
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
@@ -428,7 +430,7 @@ def generate_next_token_with_gaze_guidance(
         pass
     
     selection_metrics = {}
-    
+    should_use_guidance = False
     if should_use_guidance:
         # Use gaze-guided selection
         next_token_id, token_text, selection_metrics = select_token_by_gaze_correlation(
@@ -580,7 +582,132 @@ def load_mask_from_file(mask_path: Union[str, Path]) -> np.ndarray:
 
     return mask
 
-def get_attention_indices_from_mask(mask: np.ndarray, image_size: Tuple[int, int], model_config) -> List[int]:
+
+def calculate_coordinate_mapping(original_img_shape, patch_boxes, patched_final_dim, patched_resized_before_pad_dim, vision_tower):
+    """
+    Calculate coordinate mapping from tokens to pixels.
+
+    Args:
+        original_img_shape: Original PIL image shape or object with .width and .height
+        patch_boxes: List of patch boxes
+        patched_final_dim: Final dimension after patching (width, height)
+        patched_resized_before_pad_dim: Image size before padding (width, height)
+        vision_tower: Vision tower for getting patch size
+
+    AnyRes Processing:
+    1. The image is encoded with ViT to 14-sized patches resulting in a 27x27 grid for every patch
+    2. All patches are concatenated first on every axis, x and y resulting in (N*27)x(M*27) grid for an NxM patch grid
+    3. For every line, an additional newline patch is added to the end of the line resulting with (width*27)x((height*27)+1) grid
+    4. Flatten the grid to a single dimension, resulting in (width*height*27*27 + width*27) tokens
+    5. The base image patches are added to the start of the sequence, resulting in 729+tokens in total
+    """
+    patch_size = vision_tower.config.patch_size if hasattr(vision_tower.config, 'patch_size') else 14
+    nb_height_patches = patched_final_dim[1] // 384
+    nb_width_patches = patched_final_dim[0] // 384
+    nb_height_tokens = nb_height_patches * (384 // patch_size)
+    nb_width_tokens = nb_width_patches * (384 // patch_size) + 1 # +1 for the newline patch
+    
+    patched_img_scale_x = original_img_shape[0] / patched_resized_before_pad_dim[0]
+    patched_img_scale_y = original_img_shape[1] / patched_resized_before_pad_dim[1]
+
+    dummy_img = np.zeros((nb_height_tokens, nb_width_tokens, 3), dtype=np.uint8)
+    unpadded = unpad_image(np.transpose(dummy_img, (2, 0, 1)), original_img_shape)
+    nb_height_tokens, nb_width_tokens = unpadded.shape[1], unpadded.shape[2]
+    # Calculate the number of patches per side
+    token_patch_boxes = []
+    for box in patch_boxes:
+        token_box = [val // patch_size for val in box]
+        # since every anyres patch is 384x384 which is 27x27 tokens, we need to round to 27 multiples
+        token_box[0] = (token_box[0] // 27) * 27
+        token_box[1] = (token_box[1] // 27) * 27
+        token_box[2] = (token_box[2] // 27) * 27
+        token_box[3] = (token_box[3] // 27) * 27
+        token_patch_boxes.append(token_box)
+
+    # now lets build a matrix with the all the patches in token size, where every cell is the coordinate of the center pixel before tokenization
+    coordinate_mat = np.ones((nb_height_tokens, nb_width_tokens, 2), dtype=int)*(-1)
+    for token_box, patch_box in zip(token_patch_boxes, patch_boxes):
+        token2pixel_ratio = patch_box[-1] / token_box[-1]
+        token_inds_in_box_x = np.arange(token_box[0], token_box[2])
+        token_inds_in_box_y = np.arange(token_box[1], token_box[3])
+        for token_idx_y in token_inds_in_box_y:
+            for token_idx_x in token_inds_in_box_x:
+                # Calculate the center pixel of the token box
+                pixel_x_min = int(token_idx_x * token2pixel_ratio)
+                pixel_y_min = int(token_idx_y * token2pixel_ratio)
+
+                # Map to the coordinate matrix
+                coordinate_mat[token_idx_y, token_idx_x] = (pixel_x_min, pixel_y_min)
+
+    # Flatten to make it the same shape as the token sequence
+    coordinate_mat_flat = coordinate_mat.reshape(-1, 2)
+    # scale back to origina image size before resizing
+    coordinate_mat_flat[:, 0] = np.round(coordinate_mat_flat[:, 0] * patched_img_scale_x).astype(int)
+    coordinate_mat_flat[:, 1] = np.round(coordinate_mat_flat[:, 1] * patched_img_scale_y).astype(int)
+    # Clip the coordinate values since the image might be padded, -1 means no image coordinate (since these tokens added as placeholders for every end of line)
+    coordinate_mat_flat[:, 0] = np.clip(coordinate_mat_flat[:, 0], -1, original_img_shape[0] - 1)
+    coordinate_mat_flat[:, 1] = np.clip(coordinate_mat_flat[:, 1], -1, original_img_shape[1] - 1)
+
+    # Insert additional patch at the start of the sequence as placeholder for the base image
+    base_image_patch = np.ones([(384 // patch_size) * (384 // patch_size), 2], dtype=int)*(-1)
+    coordinate_mat_flat = np.insert(coordinate_mat_flat, 0, base_image_patch, axis=0)
+
+    # lets also do an inverse mapping to get the token index from pixel coordinates
+    pixel_to_token_indices = {}
+    for token_idx, (x, y) in enumerate(coordinate_mat_flat):
+        # skip if indices are -1
+        if x == -1 or y == -1:
+            continue
+        # if (x, y) not in pixel_to_token_indices:
+        #     pixel_to_token_indices[(x, y)] = token_idx
+
+        # Calculate all covered pixel coordinates for this token
+        patch_size_scaled = np.round(patch_size*patched_img_scale_x).astype(int)
+        # todo: instead of patch_radius, use the actual (scaled) patch size in pixels
+        covered_coords = []
+        covered_x_indices = np.arange(x, x + patch_size_scaled)
+        covered_y_indices = np.arange(y, y + patch_size_scaled)
+        # remove indices that are out of bounds
+        covered_x_indices = covered_x_indices[(covered_x_indices >= 0) & (covered_x_indices < original_img_shape[0])]
+        covered_y_indices = covered_y_indices[(covered_y_indices >= 0) & (covered_y_indices < original_img_shape[1])]
+        # create all combinations of covered coordinates without a for loop
+        covered_coords = np.array(np.meshgrid(covered_x_indices, covered_y_indices)).T
+        covered_coords = covered_coords.reshape(-1, 2)
+
+        # Insert all valid coordinates into the dict
+        for coord in covered_coords:
+            coord = tuple(coord)
+            # Append the token index to the list for this coordinate
+            pixel_to_token_indices[coord] = token_idx
+
+
+    # Calculate coverage statistics
+    total_image_pixels = original_img_shape[0] * original_img_shape[1]
+    covered_mask = np.zeros((original_img_shape[1], original_img_shape[0]), dtype=bool)
+    for coord in pixel_to_token_indices.keys():
+        covered_mask[coord[1], coord[0]] = True
+    covered_pixels = np.sum(covered_mask)
+    coverage_percentage = (covered_pixels / total_image_pixels) * 100
+
+    print(f"Image coverage statistics:")
+    print(f"  Total image pixels: {total_image_pixels:,}")
+    print(f"  Covered pixels: {covered_pixels:,}")
+    print(f"  Coverage percentage: {coverage_percentage:.2f}%")
+    
+
+    return coordinate_mat_flat, pixel_to_token_indices
+
+def get_attention_indices_from_mask(
+    mask: np.ndarray, 
+    image_size: Tuple[int, int], 
+    model_config: Any,
+    original_img_shape: Tuple[int, int],
+    patched_final_dim: Tuple[int, int],
+    patch_boxes: List[List[int]],
+    patched_resized_before_pad_dim: Tuple[int, int],
+    vision_tower: Any,
+    apply_for_anyres_patches: bool = True
+) -> Tuple[List[int], np.ndarray]:
     """Convert mask pixels to token indices."""
     mask_coords = np.argwhere(mask)
     print(f"Mask coordinates shape: {mask_coords.shape}")
@@ -592,6 +719,27 @@ def get_attention_indices_from_mask(mask: np.ndarray, image_size: Tuple[int, int
         add_user_prompt_tokens= False,
         user_prompt_range=[1849, 1860]
     )
+    if apply_for_anyres_patches:
+        anyres_token2pixel_map = calculate_coordinate_mapping(
+            original_img_shape,
+            patch_boxes,
+            patched_final_dim,
+            patched_resized_before_pad_dim,
+            vision_tower
+        )
+
+        # add additional patch tokens form anyres structure to attention indices
+        add_tokens = []
+        for coord in mask_coords:
+            pixel_coord = tuple(coord)
+            if pixel_coord in anyres_token2pixel_map[1]:
+                token_idx = anyres_token2pixel_map[1][pixel_coord]
+                if token_idx not in atten_indices:
+                    add_tokens.append(token_idx)
+
+        # Add additional tokens to the attention indices
+        atten_indices.extend(add_tokens)
+        atten_indices = sorted(set(atten_indices))
 
     return atten_indices, resized_mask
 
@@ -966,7 +1114,7 @@ def _prepare_inputs(
 
 
     # Process image: get tensor of shape [1, C, H, W]
-    processed = process_images([image], image_processor, model.config)
+    processed, patched_resized_before_pad_dim, patched_final_dim, patch_boxes = process_images([image], image_processor, model.config)
     if isinstance(processed, list):
         # Take first element if list returned
         image_tensor = processed[0]
@@ -979,9 +1127,29 @@ def _prepare_inputs(
     image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
     # Get attention indices from mask
-    atten_indices, target_mask = get_attention_indices_from_mask(mask, image.size, model.config)
+    atten_indices, target_mask = get_attention_indices_from_mask(
+        mask=mask,
+        image_size=image.size,
+        model_config=model.config,
+        original_img_shape=image.size,
+        patched_final_dim=patched_final_dim,
+        patch_boxes=patch_boxes,
+        patched_resized_before_pad_dim=patched_resized_before_pad_dim,
+        vision_tower=model.get_vision_tower() if hasattr(model, 'get_vision_tower') else None,
+        apply_for_anyres_patches=False
+    )
     if person_mask is not None:
-        person_mask_indices, person_mask = get_attention_indices_from_mask(person_mask, image.size, model.config)
+        person_mask_indices, person_mask = get_attention_indices_from_mask(
+            mask=person_mask,
+            image_size=image.size,
+            model_config=model.config,
+            original_img_shape=image.size,
+            patched_final_dim=patched_final_dim,
+            patch_boxes=patch_boxes,
+            patched_resized_before_pad_dim=patched_resized_before_pad_dim,
+            vision_tower=model.get_vision_tower() if hasattr(model, 'get_vision_tower') else None,
+            apply_for_anyres_patches=False
+        )
     print(f"Initial attention indices: {len(atten_indices)} tokens")
     masks = {'target_mask': target_mask, 'person_mask': person_mask}        # masks in [model's] input image resolution 
     # Prepare conversation
@@ -1002,8 +1170,8 @@ def _prepare_inputs(
         IMAGE_TOKEN_INDEX, return_tensors="pt"
     ).unsqueeze(0).to(model.device)
 
-    # Prepare image sizes as [height, width] for model
-    image_sizes = [[image.size[1], image.size[0]]]
+    # Prepare image sizes as [width, height] for model
+    image_sizes = [[image.size[0], image.size[1]]]
     # tokenizer.decode(input_ids.cpu().numpy()[0][-11:-9])
     return image, masks, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids
 
@@ -1319,7 +1487,8 @@ def analyze_bias_sweep_results(all_results: Dict[float, Dict[str, Any]], base_ou
         overall_quality_score = quality_analysis.get("overall_quality_score", 0.0)
         if correlation_score == 0.0:
             continue  # Skip if correlation score is zero (no correlation with target mask)
-
+        if 'looking' not in generated_text.lower():
+            continue    # Skip if generated text does not contain 'looking'
         performance_summary.append({
             'bias_strength': bias_val,
             'overall_quality_score': overall_quality_score,

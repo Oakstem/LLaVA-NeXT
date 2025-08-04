@@ -185,7 +185,9 @@ def resize_and_pad_image(image, target_resolution):
     paste_y = (target_height - new_height) // 2
     new_image.paste(resized_image, (paste_x, paste_y))
 
-    return new_image
+    padded_width, padded_height = new_image.size
+
+    return new_image, (new_width, new_height), (padded_width, padded_height)
 
 
 def divide_to_patches(image, patch_size):
@@ -200,14 +202,16 @@ def divide_to_patches(image, patch_size):
         list: A list of PIL.Image.Image objects representing the patches.
     """
     patches = []
+    boxes = []
     width, height = image.size
     for i in range(0, height, patch_size):
         for j in range(0, width, patch_size):
             box = (j, i, j + patch_size, i + patch_size)
             patch = image.crop(box)
             patches.append(patch)
+            boxes.append(box)
 
-    return patches
+    return patches, boxes
 
 
 def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
@@ -273,9 +277,9 @@ def process_anyres_image(image, processor, grid_pinpoints):
     else:
         possible_resolutions = ast.literal_eval(grid_pinpoints)
     best_resolution = select_best_resolution(image.size, possible_resolutions)
-    image_padded = resize_and_pad_image(image, best_resolution)
+    image_padded, patched_resized_before_pad_dim, patched_final_dim = resize_and_pad_image(image, best_resolution)
 
-    patches = divide_to_patches(image_padded, processor.crop_size["height"])
+    patches, boxes = divide_to_patches(image_padded, processor.crop_size["height"])
 
     # FIXME: this seems to be a bug that it resizes instead of pad.
     # but to keep it consistent with previous, i will keep it as it is
@@ -290,7 +294,9 @@ def process_anyres_image(image, processor, grid_pinpoints):
 
     image_patches = [image_original_resize] + patches
     image_patches = [processor.preprocess(image_patch, return_tensors="pt")["pixel_values"][0] for image_patch in image_patches]
-    return torch.stack(image_patches, dim=0)
+    # insert the original image box at 0 index
+    # boxes = [(0, 0, image_original_resize.width, image_original_resize.height)] + boxes
+    return torch.stack(image_patches, dim=0), patched_resized_before_pad_dim, patched_final_dim, boxes
 
 
 def load_image_from_base64(image):
@@ -314,13 +320,14 @@ def expand2square(pil_img, background_color):
 def process_images(images, image_processor, model_cfg):
     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
     new_images = []
+    patch_boxes = []
     if image_aspect_ratio == "highres":
         for image in images:
             image = process_highres_image(image, image_processor, model_cfg.image_grid_pinpoints)
             new_images.append(image)
     elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
         for image in images:
-            image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
+            image, patched_resized_before_pad_dim, patched_final_dim, patch_boxes = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
             new_images.append(image)
     elif image_aspect_ratio == "crop_split":
         for image in images:
@@ -335,7 +342,7 @@ def process_images(images, image_processor, model_cfg):
         return image_processor.preprocess(images, return_tensors="pt")["pixel_values"]
     if all(x.shape == new_images[0].shape for x in new_images):
         new_images = torch.stack(new_images, dim=0)
-    return new_images
+    return new_images, patched_resized_before_pad_dim, patched_final_dim, patch_boxes
 
 
 def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):

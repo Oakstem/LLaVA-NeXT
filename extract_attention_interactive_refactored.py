@@ -101,7 +101,7 @@ def run_generation_with_attention(
 ) -> Dict[str, Any]:
     """
     Run generation with attention extraction and optional gaze guidance.
-    
+
     Args:
         use_gaze_guidance: Enable gaze-guided token selection based on similarity to target area
         guidance_config: Configuration for gaze guidance behavior
@@ -122,9 +122,23 @@ def run_generation_with_attention(
 
     output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir = _setup_output_directories(output_dir)
 
-    image, input_masks, image_tensor, image_sizes, atten_indices, person_mask_indices, input_ids = \
-        _prepare_inputs(image_path, mask_path, prompt, image_processor, tokenizer, model)
-    
+    (
+        image,
+        input_masks,
+        image_tensor,
+        image_sizes,
+        atten_indices,
+        person_mask_indices,
+        input_ids,
+    ) = _prepare_inputs(
+        image_path,
+        mask_path,
+        prompt,
+        image_processor,
+        tokenizer,
+        model,
+    )
+
     boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
     num_patches, grid_size, image_token_start_index_in_llm, image_token_end_index_in_llm = _determine_image_patch_info(model, input_ids)
 
@@ -220,9 +234,6 @@ def run_generation_with_attention(
                 # move to target attention mask boost (instead of gaze source)
                 apply_only_target_mask = True
 
-            # Call the logging function and break if EOS
-            if log_generation_step(i, token_text, evaluation_metrics, next_token_id, eos_token_id):
-                break
 
             generated_ids.append(next_token_id.item())
 
@@ -255,6 +266,10 @@ def run_generation_with_attention(
                 # threshold_value=0.3
                 )
 
+            # Call the logging function and break if EOS
+            if log_generation_step(i, token_text, evaluation_metrics, next_token_id, eos_token_id):
+                break
+
             processed_img, attention_map = _extract_and_process_attention(
                 outputs, next_token_id, token_text, i, num_patches, grid_size, image_token_start_index_in_llm,
                 image, attn_config, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir
@@ -283,7 +298,7 @@ def run_generation_with_attention(
             if all_attention_maps and len(atten_indices) > 0 and apply_only_target_mask and similarity_map is not None \
             and token_text.lower().strip() not in ['at', 'looking', 'is', 'a', 'an']:
                 attention_correlation = calculate_attention_correlation_from_similarity(
-                    text_to_image_similarity_matrix=similarity_map, 
+                    text_to_image_similarity_matrix=similarity_map,
                     attention_mask=input_masks.get('target_mask', None),
                 )
                 all_correlation_metrics.append({
@@ -293,7 +308,7 @@ def run_generation_with_attention(
                     'mask_type': 'target',
                     **attention_correlation
                 })
-            
+
             if break_after_first_step:
                 print("Breaking after the first step as requested.")
                 break
@@ -343,29 +358,29 @@ def run_generation_with_attention(
 def load_previous_batch_results(results_dir: Union[str, Path]) -> Dict[str, Any]:
     """
     Load the most recent batch summary file to determine completed images.
-    
+
     Args:
         results_dir: Path to the directory containing previous batch results
-        
+
     Returns:
         Dictionary of completed image results from the batch summary file
     """
     results_dir = Path(results_dir)
-    
+
     if not results_dir.exists():
         print(f"Results directory {results_dir} does not exist.")
         return {}
-    
+
     # Look for batch summary results file
     batch_files = list(results_dir.glob("batch_bias_sweep_results_*.json"))
     if not batch_files:
         print(f"No batch summary files found in {results_dir}")
         return {}
-    
+
     # Use the most recent batch file
     latest_batch_file = max(batch_files, key=lambda p: p.stat().st_mtime)
     print(f"Loading completed results from: {latest_batch_file}")
-    
+
     try:
         with open(latest_batch_file, 'r') as f:
             completed_results = json.load(f)
@@ -379,46 +394,46 @@ def load_previous_batch_results(results_dir: Union[str, Path]) -> Dict[str, Any]
 def validate_resume_directory(resume_dir: Union[str, Path]) -> bool:
     """
     Validate that the resume directory exists and contains valid batch results.
-    
+
     Args:
         resume_dir: Path to the directory to validate
-        
+
     Returns:
         True if the directory is valid for resuming, False otherwise
     """
     resume_dir = Path(resume_dir)
-    
+
     if not resume_dir.exists():
         print(f"ERROR: Resume directory does not exist: {resume_dir}")
         return False
-    
+
     if not resume_dir.is_dir():
         print(f"ERROR: Resume path is not a directory: {resume_dir}")
         return False
-    
+
     # Check for any subdirectories (image results) or batch summary files
     has_subdirs = any(item.is_dir() and not item.name.startswith('.') for item in resume_dir.iterdir())
     has_batch_files = any(resume_dir.glob("batch_bias_sweep_results_*.json"))
-    
+
     if not has_subdirs and not has_batch_files:
         print(f"ERROR: Resume directory appears empty or invalid: {resume_dir}")
         return False
-    
+
     print(f"Resume directory validation passed: {resume_dir}")
     return True
 
 
 def get_remaining_images(
-    person_desc_data: Dict[str, str], 
+    person_desc_data: Dict[str, str],
     completed_results: Dict[str, Any]
 ) -> Dict[str, str]:
     """
     Determine which images still need to be processed.
-    
+
     Args:
         person_desc_data: Dictionary of all images to process
         completed_results: Dictionary of already completed results
-        
+
     Returns:
         Dictionary of remaining images to process
     """
@@ -432,7 +447,7 @@ def get_remaining_images(
         #     if not result_entry.get('bias_sweep_results') or not result_entry.get('performance_summary'):
         #         print(f"Results for {image_key} appear incomplete, will reprocess")
         #         remaining[image_key] = subject_description
-    
+
     print(f"Found {len(remaining)} images remaining to process out of {len(person_desc_data)} total")
     return remaining
 
@@ -450,7 +465,7 @@ def process_batch_from_json(
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process multiple images from JSON file, performing bias sweeps for each image.
-    
+
     Args:
         bias_range: Array of bias strengths to sweep. Defaults to np.linspace(1.0, 4.0, 4)
         resume_from_dir: Optional path to previous run directory to resume from
@@ -465,10 +480,10 @@ def process_batch_from_json(
         else:
             print(f"Attempting to resume from previous run: {resume_from_dir}")
             all_image_results = load_previous_batch_results(resume_from_dir)
-    
+
     # Prepare description data and directories
     person_desc_data = prepare_person_desc_data(json_path, filter_keys, limit_items)
-    
+
     # Determine which images still need processing
     if resume_from_dir and all_image_results:
         person_desc_data = get_remaining_images(person_desc_data, all_image_results)
@@ -487,7 +502,7 @@ def process_batch_from_json(
     total_images = len(prepare_person_desc_data(json_path, filter_keys, limit_items))
     completed_count = len(all_image_results)
     remaining_count = len(person_desc_data)
-    
+
     if resume_from_dir:
         print(f"RESUME STATUS: {completed_count}/{total_images} images completed, {remaining_count} remaining")
     else:
@@ -568,7 +583,7 @@ def run_bias_sweep_experiment(
     """
     all_results = {}
     base_output_dir = base_experiment_config.get("output_dir", "attention_output/bias_sweep")
-    
+
     # initial run to get hidden state embeddings
     print(f"Running initial generation to get hidden state embeddings for bias sweep...")
     init_bias = 0.0
@@ -664,15 +679,15 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000032.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__00000032_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000033.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000033_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
-    # parser.add_argument('--prompt', type=str, default="The _ (describe the person) is looking at _ (describe the person or object). Repeat the sentence.", help="Input prompt.")
-    parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
-    " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object  or person]. Repeat the sentence.' " \
-    "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
+    parser.add_argument('--prompt', type=str, default="Describe the _ person", help="Input prompt.")
+    # parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
+    # " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object  or person]. Repeat the sentence.' " \
+    # "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
     # --- Batch Processing Arguments ---
@@ -688,13 +703,13 @@ if __name__ == '__main__':
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
     parser.add_argument('--bias_max', type=float, default=8., help="Maximum bias strength for the sweep.")
     parser.add_argument('--bias_steps', type=int, default=4, help="Number of steps in the bias sweep.")
-    
+
     # --- Gaze Guidance Arguments ---
     parser.add_argument('--use_gaze_guidance', action='store_true', help="Enable gaze-guided token selection.")
     parser.add_argument('--guidance_top_k', type=int, default=10, help="Number of top-k candidates to consider for guidance.")
     parser.add_argument('--similarity_weight', type=float, default=0.7, help="Weight for similarity score in guided selection.")
     parser.add_argument('--probability_weight', type=float, default=0.3, help="Weight for probability score in guided selection.")
-    
+
     # --- Help and Usage ---
     parser.add_argument('--show_resume_examples', action='store_true', help="Show usage examples for resume functionality and exit.")
     # --- Beam Search Arguments ---
@@ -704,7 +719,7 @@ if __name__ == '__main__':
     parser.add_argument('--early_stopping', action='store_true', help="Enable early stopping in beam search.")
 
     args = parser.parse_args()
-    
+
     # Show resume examples if requested
     if args.show_resume_examples:
         print_resume_usage_examples()
@@ -736,7 +751,7 @@ if __name__ == '__main__':
         "layer_idx": args.attn_layer_ind,
         "save_tensors": False
     }
-    
+
     # New guidance configuration
     guidance_config = {
         "top_k": args.guidance_top_k,
