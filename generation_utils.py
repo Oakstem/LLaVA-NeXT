@@ -43,7 +43,7 @@ def select_token_by_gaze_correlation(
     logits: torch.Tensor,
     text_embedding: torch.Tensor,
     image_embeddings: torch.Tensor,
-    target_mask: Optional[np.ndarray],
+    mask: Optional[np.ndarray],
     tokenizer: "PreTrainedTokenizer",
     model: "PreTrainedModel",
     top_k: int = 10,
@@ -57,7 +57,7 @@ def select_token_by_gaze_correlation(
         logits: Model output logits for next token prediction
         text_embedding: Current text token embedding (not used in updated version)
         image_embeddings: Image patch embeddings
-        target_mask: Binary mask indicating target gaze area
+        mask: Binary mask indicating target or source gaze area
         tokenizer: Tokenizer for decoding candidate tokens
         model: The language model to extract token embeddings from
         top_k: Number of top probability candidates to consider
@@ -82,19 +82,19 @@ def select_token_by_gaze_correlation(
     }
     
     # If no target mask provided, fall back to probability-based selection
-    if target_mask is None or image_embeddings is None:
+    if mask is None or image_embeddings is None:
         selected_idx = top_k_indices[0]
         selected_text = tokenizer.decode([selected_idx], skip_special_tokens=True)
         selection_metrics["fallback_reason"] = "no_mask_or_embeddings"
         return selected_idx.unsqueeze(0), selected_text, selection_metrics
     
     # Get target area embeddings
-    target_indices = np.where(target_mask.flatten() > 0)[0]
+    target_indices = np.where(mask.flatten() > 0)[0]
     if len(target_indices) == 0:
         # No target area found, fall back to probability
         selected_idx = top_k_indices[0]
         selected_text = tokenizer.decode([selected_idx], skip_special_tokens=True)
-        selection_metrics["fallback_reason"] = "empty_target_mask"
+        selection_metrics["fallback_reason"] = "empty_mask"
         return selected_idx.unsqueeze(0), selected_text, selection_metrics
     
     target_embeddings = image_embeddings[target_indices]  # Shape: [n_target_patches, embed_dim]
@@ -373,7 +373,8 @@ def generate_next_token_with_gaze_guidance(
     step_num: int,
     image_embeddings: Optional[torch.Tensor] = None,
     target_mask: Optional[np.ndarray] = None,
-    use_gaze_guidance: bool = True,
+    source_mask: Optional[np.ndarray] = None,
+    apply_only_target_mask: bool = True,
     guidance_config: Optional[Dict[str, Any]] = None
 ) -> Tuple[torch.Tensor, str, Any, Dict[str, Any]]:
     """
@@ -390,7 +391,7 @@ def generate_next_token_with_gaze_guidance(
         step_num: Current generation step number
         image_embeddings: Image patch embeddings for similarity calculation
         target_mask: Binary mask indicating target gaze area
-        use_gaze_guidance: Whether to use gaze guidance
+        apply_only_target_mask: Whether to apply the target mask only
         guidance_config: Configuration for guidance behavior
         
     Returns:
@@ -417,7 +418,7 @@ def generate_next_token_with_gaze_guidance(
     
     # Determine if we should use gaze guidance
     should_use_guidance = (
-        use_gaze_guidance and 
+        apply_only_target_mask and 
         step_num >= guidance_config["enable_after_step"] and
         image_embeddings is not None and
         text_embedding is not None and
@@ -430,14 +431,15 @@ def generate_next_token_with_gaze_guidance(
         pass
     
     selection_metrics = {}
-    should_use_guidance = False
+    should_use_guidance = True
     if should_use_guidance:
         # Use gaze-guided selection
+        selected_mask = target_mask if not apply_only_target_mask else source_mask
         next_token_id, token_text, selection_metrics = select_token_by_gaze_correlation(
             logits=logits,
             text_embedding=text_embedding,
             image_embeddings=image_embeddings,
-            target_mask=target_mask,
+            mask=selected_mask,
             tokenizer=tokenizer,
             model=model,
             top_k=guidance_config["top_k"],

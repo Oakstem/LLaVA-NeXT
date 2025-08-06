@@ -97,6 +97,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         ids_to_attend_pixels = []
         original_input_ids = input_ids # Save before potential modification
         # original_attention_mask = attention_mask # Keep a reference if needed
+        final_ids_to_attend = kwargs.get("boost_positions" , None)
 
         if inputs_embeds is None:
             if images is not None and image_sizes is not None:
@@ -112,15 +113,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         modalities=modalities,
                         image_sizes=image_sizes
                     )
-                # todo: this is a temporary hardcoded index, fix it later
-                # if kwargs.get("base_image_token_inds", None) is not None:
-                #     base_image_embedding = inputs_embeds[:, kwargs["base_image_token_inds"][0]:kwargs["base_image_token_inds"][1], :]
-                #     attn_mask_indices = kwargs.get("resized_mask", np.array([])).flatten()
-                #     attn_mask_indices = np.where(attn_mask_indices > 0)[0]
-                #     if len(attn_mask_indices) > 0:
-                #         # Use the first mask index to get the target mask embedding
-                #         target_mask_embedding = base_image_embedding[:, attn_mask_indices, :].mean(dim=1)[0]
-                #         inputs_embeds[:, -8, :] = target_mask_embedding
+
                 if kwargs.get("target_mask_embedding", None) is not None:
                     mask_embedding = kwargs["target_mask_embedding"]
                     input_masks = kwargs.get("input_masks", {})
@@ -131,17 +124,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     if len(target_attn_mask_indices) > 0:
                         # Use the first mask index to get the person (source) mask embedding
                         person_mask_embedding = mask_embedding[person_attn_mask_indices, :].mean(dim=0)
-                        # inputs_embeds[:, -8, :] = person_mask_embedding     # this is hardcoded for the prompt "... the _ is looking at ..."
-                        # inputs_embeds[:, -10, :] = person_mask_embedding
+                        # only for testing:
+                        # person_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
                         inputs_embeds[:, self.tokens_indexing['insert_embd'][0], :] = person_mask_embedding
-
+                        final_ids_to_attend['gaze_source'] += [int(self.tokens_indexing['insert_embd'][0].cpu().numpy())]  # Add source position to ids_to_attend
                     if len(person_attn_mask_indices) > 0 and len(self.tokens_indexing['insert_embd']) > 1:
                         # Use the second mask index to get the target mask embedding
                         target_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
                         # inputs_embeds[:, -6, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _
                         inputs_embeds[:, self.tokens_indexing['insert_embd'][1], :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _"
-
-                    # inputs_embeds[:, -8, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _ which is"
 
             else:
                 # Unpack 6 values when images are not present (e.g., subsequent generation steps)
@@ -156,12 +147,22 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     images=images,
                     modalities=modalities,
                     image_sizes=image_sizes
-                )
+                )   
 
-        final_ids_to_attend = kwargs.get("boost_positions" , None)
+            # if kwargs.get("target_tokens", 0) == 2:
+            #     if kwargs.get("target_mask_embedding", None) is not None:
+            #         mask_embedding = kwargs["target_mask_embedding"]
+            #         input_masks = kwargs.get("input_masks", {})
+            #         target_attn_mask_indices = input_masks['target_mask'].flatten()
+            #         person_attn_mask_indices = input_masks['person_mask'].flatten() 
+            #         target_attn_mask_indices = np.where(target_attn_mask_indices > 0)[0]
+            #         person_attn_mask_indices = np.where(person_attn_mask_indices > 0)[0]
+            #         target_mask_embedding = mask_embedding[person_attn_mask_indices, :].mean(dim=0)
+            #         inputs_embeds = target_mask_embedding.unsqueeze(0).expand(1, -1, -1)
+            #         input_ids = None
 
         # if inputs_embeds is not None:   # todo: uncomment once done testing, commenting out to get custom mask during generation too
-        if inputs_embeds is None:
+        if inputs_embeds is None: # or kwargs.get("target_tokens", 0) == 2:
             input_embeds_shape = torch.Size([1, past_key_values[0][0].shape[2]+1, 1])
             input_device = past_key_values[0][0].device
             input_dtype = past_key_values[0][0].dtype
@@ -212,6 +213,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # It's assumed that if images were processed, prepare_inputs_labels_for_multimodal
         # would have set up a suitable (e.g., causal) attention_mask for inputs_embeds.
         # If inputs_embeds was passed directly, then the passed attention_mask is used.
+        # if kwargs.get("target_tokens", 0) == 2:
+        #     tokens_to_take = 1
+        #     attention_mask = attention_mask[:, :, -tokens_to_take:, :]      # reduce only to the last query token
+        #     if source_attention_mask is not None:
+        #         source_attention_mask = source_attention_mask[:, :, -tokens_to_take:, :]
 
         if dpo_forward:
             outputs = self.model(

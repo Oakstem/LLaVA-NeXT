@@ -800,8 +800,16 @@ class Qwen2DecoderLayer(nn.Module):
         if kwargs.get('tokens_indexing', None) is not None and kwargs.get('tokens_indexing', None).get('insert_embd', None) is not None:    # and kwargs.get('tokens_indexing', None)['insert_embd'][0] >= 2:
             abs_indexing = True
             tokens_indexing = kwargs.get('tokens_indexing', None)
-            gaze_target_query_positions = [tokens_indexing['insert_embd'][3:]]
-            gaze_source_query_positions = [tokens_indexing['insert_embd'][:3]]
+            gaze_source_query_positions = [tokens_indexing['insert_embd'][0]]
+            if len(tokens_indexing['insert_embd']) > 1:
+                gaze_target_query_positions = [tokens_indexing['insert_embd'][1]]
+                if len(tokens_indexing['insert_embd'][1].size()) < 1:
+                    gaze_target_query_positions = [gaze_target_query_positions]
+                    gaze_source_query_positions = [gaze_source_query_positions]
+            else:
+                # no second '_' was found in the prompt, so we assume no gaze target boost positions
+                gaze_target_boost_positions = None
+                gaze_source_query_positions = [gaze_source_query_positions]
         else:
             abs_indexing = False
             gaze_target_query_positions = kwargs.get('query_indices', None).get('gaze_target', None)
@@ -809,7 +817,7 @@ class Qwen2DecoderLayer(nn.Module):
         attention_bias_positions_gaze_target = self._create_bias_positions_attend_to(gaze_target_boost_positions, gaze_target_query_positions, q_len, abs_indexing) if gaze_target_boost_positions is not None else None
         attention_bias_positions_gaze_source = self._create_bias_positions_attend_to(gaze_source_boost_positions, gaze_source_query_positions, q_len, abs_indexing) if gaze_source_boost_positions is not None else None
         # Create or modify attention mask to include positional bias
-        if attention_bias_positions_gaze_target is not None:
+        if attention_bias_positions_gaze_target is not None or attention_bias_positions_gaze_source is not None:
             kv_seq_len = q_len
             # attention_mask = self._add_positional_bias_optimized(
             #     attention_mask,
@@ -823,8 +831,8 @@ class Qwen2DecoderLayer(nn.Module):
             source_attention_mask = kwargs.get("source_attention_mask", None)
             if source_attention_mask is not None:
                 source_attention_mask = attention_mask
-            target_bias_mat = self._add_positional_bias(attention_mask, attention_bias_positions_gaze_target, bsz, q_len, kv_seq_len, position_ids)
-            source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids)
+            target_bias_mat = self._add_positional_bias(attention_mask, attention_bias_positions_gaze_target, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_target is not None else None
+            source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_source is not None else None
             if kwargs.get("apply_only_target_mask", False):
                 combined_bias = target_bias_mat
                 # get all indices where target bias is 0 (not masked), without the source indices
@@ -832,7 +840,8 @@ class Qwen2DecoderLayer(nn.Module):
             else:
                 combined_bias = source_bias_mat
                 # get all indices where either target or source bias is 0 (not masked & not boosted)
-                zero_inds = torch.where(torch.logical_or(attention_mask >= 0, source_attention_mask >= 0))
+                # zero_inds = torch.where(torch.logical_or(attention_mask >= 0, source_attention_mask >= 0))
+                zero_inds = torch.where(source_attention_mask >= 0)
                 # zero_inds = torch.where(source_attention_mask >= 0))
             # using bitwise-or with parentheses
             nonzero_inds = torch.where(combined_bias >= self.bias_strength)
@@ -1317,6 +1326,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     past_key_values_length,
                     sliding_window=self.config.sliding_window,
                 )
+                kwargs["source_attention_mask"] = source_attention_mask
         
         hidden_states = inputs_embeds
 

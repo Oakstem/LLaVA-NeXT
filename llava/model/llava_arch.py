@@ -552,7 +552,8 @@ class LlavaMetaForCausalLM(ABC):
             # Add ±1 indices to the special token positions
             expanded_inds = []
             for idx in special_tokens_inds:
-                expanded_inds.extend([idx - 1, idx, idx + 1])
+                # expanded_inds.extend([idx - 1, idx, idx + 1])
+                expanded_inds.append(idx)
             special_tokens_inds = torch.tensor(expanded_inds, device=special_tokens_inds.device)
             # Remove duplicates and keep within bounds
             special_tokens_inds = torch.unique(special_tokens_inds)

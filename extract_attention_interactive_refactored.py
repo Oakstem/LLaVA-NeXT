@@ -140,6 +140,8 @@ def run_generation_with_attention(
     )
 
     boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
+    #todo: remove:
+    # boost_positions = {'gaze_source': atten_indices, 'gaze_target': person_mask_indices}
     num_patches, grid_size, image_token_start_index_in_llm, image_token_end_index_in_llm = _determine_image_patch_info(model, input_ids)
 
     print("Starting generation with attention extraction and advanced evaluation...")
@@ -157,6 +159,7 @@ def run_generation_with_attention(
 
     if isinstance(eos_token_id, list):
         eos_token_id = eos_token_id[0]
+    target_tokens = 0
     image_embeddings = None
     first_step_hidden_state = None # To store the first step's hidden state for later output
     all_correlation_metrics = []
@@ -215,6 +218,7 @@ def run_generation_with_attention(
                 "base_image_token_inds": [image_token_start_index_in_llm, image_token_start_index_in_llm + num_patches],
                 "input_masks": input_masks,
                 'apply_only_target_mask': apply_only_target_mask,
+                "target_tokens": target_tokens,
             }
             if i == 0:
                 model_inputs.update({"images": image_tensor, "image_sizes": image_sizes, "modalities": ["image"]})
@@ -225,10 +229,14 @@ def run_generation_with_attention(
                 confidence_tracker, repetitivity_tracker, candidate_evaluator, i,
                 image_embeddings=image_embeddings,
                 target_mask=input_masks.get('target_mask', None) if apply_only_target_mask else None,
-                use_gaze_guidance=apply_only_target_mask,
+                source_mask=input_masks.get('person_mask', None) if not apply_only_target_mask else None,
+                apply_only_target_mask=apply_only_target_mask,
                 guidance_config=guidance_config
             )
             all_step_metrics.append(evaluation_metrics)
+
+            if apply_only_target_mask:
+                target_tokens += 1
 
             if 'looking' in token_text.lower():
                 # move to target attention mask boost (instead of gaze source)
@@ -679,15 +687,15 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000033.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000033_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000032.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000032_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
-    parser.add_argument('--prompt', type=str, default="Describe the _ person", help="Input prompt.")
-    # parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
-    # " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object  or person]. Repeat the sentence.' " \
-    # "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
+    # parser.add_argument('--prompt', type=str, default="Describe the _ (object)", help="Input prompt.")
+    parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
+    " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object  or person]. Repeat the sentence.' " \
+    "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
     # --- Batch Processing Arguments ---
@@ -701,7 +709,7 @@ if __name__ == '__main__':
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
-    parser.add_argument('--bias_max', type=float, default=8., help="Maximum bias strength for the sweep.")
+    parser.add_argument('--bias_max', type=float, default=9., help="Maximum bias strength for the sweep.")
     parser.add_argument('--bias_steps', type=int, default=4, help="Number of steps in the bias sweep.")
 
     # --- Gaze Guidance Arguments ---
