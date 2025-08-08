@@ -520,7 +520,7 @@ def analyze_generation_quality(summary: Dict[str, Any]) -> Dict[str, Any]:
     
     # Repetition penalty (-2 to 0 points)
     rep_penalty_2gram = summary["diversity_metrics"].get("repetition_penalty_2gram", 0)
-    repetition_factor = -min(2.0, rep_penalty_2gram * 6)  # Penalty for repetition
+    repetition_factor = -min(3.0, rep_penalty_2gram * 6)  # Penalty for repetition
     quality_score += repetition_factor
     quality_factors["repetition"] = repetition_factor
     

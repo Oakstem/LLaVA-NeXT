@@ -37,8 +37,32 @@ from generation_metrics import (
     analyze_generation_quality, calculate_attention_correlation_from_similarity
 )
 
-# Gaze-Guided Token Selection Functions
+def normalize_embedding(embedding: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Normalize an embedding vector to unit length (L2 norm).
+    
+    Args:
+        embedding: Tensor of shape [dim] or [batch, dim]
+        eps: Small value to avoid division by zero
+    
+    Returns:
+        Normalized embedding tensor of the same shape
+    """
+    norm = embedding.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
+    return embedding / norm
 
+def cross_cosine_similarity(vectors: torch.Tensor) -> torch.Tensor:
+    """
+    Compute pairwise cosine similarity between all vectors in a [N, D] tensor.
+    Returns a [N, N] similarity matrix.
+    """
+    # Normalize each vector to unit length
+    vectors_norm = torch.nn.functional.normalize(vectors, p=2, dim=1)
+    # Compute cosine similarity matrix
+    similarity_matrix = torch.matmul(vectors_norm, vectors_norm.T)
+    return similarity_matrix
+
+# Gaze-Guided Token Selection Functions
 def select_token_by_gaze_correlation(
     logits: torch.Tensor,
     text_embedding: torch.Tensor,
@@ -98,26 +122,17 @@ def select_token_by_gaze_correlation(
         return selected_idx.unsqueeze(0), selected_text, selection_metrics
     
     target_embeddings = image_embeddings[target_indices]  # Shape: [n_target_patches, embed_dim]
-    target_center_embedding = target_embeddings.mean(dim=0)  # Average target embedding
+    target_center_embedding = target_embeddings.mean(dim=0)
     
+    token_embedding_layer = model.get_model().embed_tokens
+
+    # Lets convert target embeddings to the same embeddings space as the given model output
+    target_token_ids = torch.argmax(model.get_output_embeddings()(target_embeddings), dim=-1)
+    target_texts = [tokenizer.decode([idx], skip_special_tokens=True) for idx in target_token_ids]
+    target_converted_embeddings = token_embedding_layer(target_token_ids)  # Shape: [n_target_patches, embed_dim]
+
     # Optional: Analyze semantic content of target area (for debugging/insights)
     target_semantics = None
-    # try:
-    #     target_semantics = analyze_target_area_semantics(
-    #         target_embeddings, model, tokenizer, top_k=5, temperature=1.0
-    #     )
-    # except Exception as e:
-    #     print(f"Warning: Could not analyze target area semantics: {e}")
-    
-    # Get the token embedding layer from the model
-    if hasattr(model, 'get_input_embeddings'):
-        token_embedding_layer = model.get_input_embeddings()
-    elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-        token_embedding_layer = model.model.embed_tokens
-    else:
-        # Fallback to using the provided text_embedding for all candidates
-        print("Warning: Could not find token embedding layer, using fallback method")
-        token_embedding_layer = None
     
     for i, (prob, token_idx) in enumerate(zip(top_k_probs, top_k_indices)):
         token_text = tokenizer.decode([token_idx], skip_special_tokens=True)
@@ -132,9 +147,9 @@ def select_token_by_gaze_correlation(
         # Calculate cosine similarity between token embedding and target area
         similarity = torch.cosine_similarity(
             candidate_token_embedding.unsqueeze(0), 
-            target_center_embedding.unsqueeze(0), 
+            target_converted_embeddings, 
             dim=1
-        ).item()
+        ).mean().item()
         
         # Combine probability and similarity scores
         prob_score = prob.item()
@@ -434,7 +449,7 @@ def generate_next_token_with_gaze_guidance(
     should_use_guidance = True
     if should_use_guidance:
         # Use gaze-guided selection
-        selected_mask = target_mask if not apply_only_target_mask else source_mask
+        selected_mask = target_mask if apply_only_target_mask else source_mask
         next_token_id, token_text, selection_metrics = select_token_by_gaze_correlation(
             logits=logits,
             text_embedding=text_embedding,
