@@ -799,6 +799,8 @@ class Qwen2DecoderLayer(nn.Module):
         gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
         if kwargs.get('tokens_indexing', None) is not None and kwargs.get('tokens_indexing', None).get('insert_embd', None) is not None:    # and kwargs.get('tokens_indexing', None)['insert_embd'][0] >= 2:
             abs_indexing = True
+            gaze_source_boost_positions = gaze_source_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
+            # gaze_target_boost_positions = gaze_target_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
             tokens_indexing = kwargs.get('tokens_indexing', None)
             gaze_source_query_positions = [tokens_indexing['insert_embd'][0]]
             if len(tokens_indexing['insert_embd']) > 1:
