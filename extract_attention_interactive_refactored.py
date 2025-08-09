@@ -1,11 +1,12 @@
 import os
 import sys
 import json
+import argparse
+import pandas as pd
 from datetime import datetime
 from pathlib import Path
 import copy
 from typing import Dict, List, Optional, Any, Tuple, Union
-...  # removed traceback import
 
 import torch
 import numpy as np
@@ -47,6 +48,13 @@ from generation_utils import (
     # New gaze guidance functions
     select_token_by_gaze_correlation,
     generate_next_token_with_gaze_guidance,
+    # Dataset annotation functions
+    find_annotations_path,
+    load_image_files_from_annotations,
+    filter_and_limit_files,
+    build_stem_index,
+    map_person_desc_to_paths,
+    get_image_files,
 )
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
@@ -76,6 +84,7 @@ Maybe, we can try using the image embeddings after the projections
 
 todo: during the end of sweep, we need to find the best bias strength with the highest score
 """
+
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -255,6 +264,7 @@ def run_generation_with_attention(
                     first_step_all_layers = outputs.hidden_states
                     image_embeddings = last_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
                     set_layer_hidden_state = outputs.hidden_states[26].squeeze(0)
+                    set_layer_hidden_state = outputs.hidden_states[-1].squeeze(0)       # test only, remove once done
                     set_layer_image_embeddings = set_layer_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
                     # set_layer_last_token_embedding = set_layer_hidden_state[-1]
 
@@ -265,9 +275,11 @@ def run_generation_with_attention(
                 # if apply_only_target_mask:
                     # if token_text.lower().strip() not in ['at', 'looking', 'is', 'a', 'an']:
                 sim_path = similarity_output_dir / f"similarity_{i:03d}_{safe_token_text}.png"
+                tmp_image_embeddings_converted = model.get_model().embed_tokens(torch.argmax(model.get_output_embeddings()(set_layer_image_embeddings), dim=-1))
+                tmp_text_embedding_converted = model.get_model().embed_tokens(next_token_id).squeeze(0)
                 similarity_map = visualize_embedding_similarity(
-                    text_token_embedding=text_embedding,
-                    image_token_embeddings=set_layer_image_embeddings,
+                    text_token_embedding=tmp_text_embedding_converted,
+                    image_token_embeddings=tmp_image_embeddings_converted,
                     original_image=image,
                 grid_size=grid_size,
                 output_path=sim_path,
@@ -461,22 +473,33 @@ def get_remaining_images(
 
 
 def process_batch_from_json(
-    json_path: Union[str, Path], base_image_dir: Union[str, Path], base_mask_dir: Union[str, Path],
-    base_output_dir: Union[str, Path], model, tokenizer, image_processor,
+    base_image_dir: Union[str, Path],
+    base_mask_dir: Union[str, Path],
+    base_output_dir: Union[str, Path],
+    model,
+    tokenizer,
+    image_processor,
     mask_filename_template: str = "gaze__{}_masks.npy",
     prompt_template: str = "Complete the sentence. The {} is looking at",
-    generation_config: Optional[Dict] = None, attention_config: Optional[Dict] = None,
-    limit_items: Optional[int] = None, filter_keys: Optional[List[str]] = None,
+    generation_config: Optional[Dict] = None,
+    attention_config: Optional[Dict] = None,
+    limit_items: Optional[int] = None,
+    filter_keys: Optional[List[str]] = None,
     bias_range: Optional[np.ndarray] = None,
     resume_from_dir: Optional[Union[str, Path]] = None,
-    use_person_descriptions: bool = False
+    use_person_descriptions: bool = False,
+    json_path: Optional[Union[str, Path]] = None
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Process multiple images from JSON file, performing bias sweeps for each image.
+    Process multiple images, performing bias sweeps for each image.
 
-    Args:
-        bias_range: Array of bias strengths to sweep. Defaults to np.linspace(1.0, 4.0, 4)
-        resume_from_dir: Optional path to previous run directory to resume from
+    Notes:
+        - If use_person_descriptions is True and json_path is provided, descriptions are
+          loaded via prepare_person_desc_data(json_path, ...).
+        - Otherwise, images are discovered by scanning base_image_dir (recursively) and
+          descriptions are left empty.
+        - json_path is optional and only used when use_person_descriptions is True.
+        - By default, person descriptions are not used.
     """
     # Handle resume functionality
     all_image_results: Dict[str, Any] = {}
@@ -489,10 +512,36 @@ def process_batch_from_json(
             print(f"Attempting to resume from previous run: {resume_from_dir}")
             all_image_results = load_previous_batch_results(resume_from_dir)
 
-    # Prepare description data and directories
-    person_desc_data = prepare_person_desc_data(json_path, filter_keys, limit_items)
+    # Prepare entries (either from JSON or by scanning image directory)
+    person_desc_data: Dict[str, str] = {}
+    image_paths_map: Dict[str, Path] = {}
 
-    # Determine which images still need processing
+    base_image_dir = Path(fix_wsl_paths(str(base_image_dir)))
+    base_mask_dir = Path(fix_wsl_paths(str(base_mask_dir)))
+    base_output_dir = Path(fix_wsl_paths(str(base_output_dir)))
+    bias_vals = bias_range if bias_range is not None else default_bias_range()
+
+    if use_person_descriptions and json_path:
+        # Use JSON-provided mapping (image_key -> description)
+        person_desc_data = prepare_person_desc_data(json_path, filter_keys, limit_items)
+        # Resolve image paths by matching stems or substrings from annotations
+        image_paths_map = map_person_desc_to_paths(person_desc_data, base_image_dir)
+    else:
+        # Load images using annotations (no directory scanning)
+        image_files: List[Path] = get_image_files(base_image_dir, filter_keys, limit_items)
+        # Map key -> empty description, and track path
+        # Create dataframe from image files and empty descriptions
+        files_df = pd.DataFrame({
+            'image_file': image_files,
+            'description': [""] * len(image_files)
+        })
+
+        # set the index as the first column (image_file)
+        files_df.set_index('image_file', inplace=True)
+        person_desc_data = files_df['description'].to_dict()
+
+    # Determine which images still need processing (if resuming)
+    full_entries_before_resume = dict(person_desc_data)  # for total count
     if resume_from_dir and all_image_results:
         person_desc_data = get_remaining_images(person_desc_data, all_image_results)
         if not person_desc_data:
@@ -501,49 +550,55 @@ def process_batch_from_json(
             final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
             print(f"Final results saved to: {final_path}")
             return all_image_results
-    bias_vals = bias_range if bias_range is not None else default_bias_range()
-    base_image_dir = fix_wsl_paths(str(base_image_dir))
-    base_mask_dir = fix_wsl_paths(str(base_mask_dir))
-    base_output_dir = Path(fix_wsl_paths(str(base_output_dir)))
 
     # Report resume status
-    total_images = len(prepare_person_desc_data(json_path, filter_keys, limit_items))
+    total_images = len(full_entries_before_resume)
     completed_count = len(all_image_results)
     remaining_count = len(person_desc_data)
-
     if resume_from_dir:
         print(f"RESUME STATUS: {completed_count}/{total_images} images completed, {remaining_count} remaining")
     else:
         print(f"BATCH PROCESSING: {remaining_count} images to process")
 
+    final_path = None
+
     # Iterate through each remaining image entry
     for idx, (image_key, subject_description) in enumerate(person_desc_data.items(), start=1):
-        if use_person_descriptions:
-            subject_description = person_desc_data[image_key]
+        if use_person_descriptions and json_path:
+            subject_description = full_entries_before_resume.get(image_key, "")
             prompt = build_prompt_with_subject_description(subject_description, prompt_template)
+            img_path = image_paths_map.get(image_key)
         else:
             prompt = prompt_template
-            subject_description = ''
+            subject_description = ""
+            img_path = Path(image_key)
+            image_key = img_path.stem  # Use stem as key
         current_index = completed_count + idx
         print(f"{'='*80}\nProcessing {current_index}/{total_images}: {image_key} (remaining: {idx}/{remaining_count})\n{'='*80}")
-        image_path, mask_path = prepare_batch_paths(
-            image_key, base_image_dir, base_mask_dir, mask_filename_template
-        )
-        if image_path is None or mask_path is None:
-            print(f"Skipping {image_key} due to missing image or mask.")
+        
+        if img_path is None or not img_path.exists():
+            print(f"Skipping {image_key}: image not found in scanned paths.")
             continue
+        mask_path = base_mask_dir / mask_filename_template.format(img_path.stem)
+
+        if not mask_path.exists():
+            print(f"Skipping {image_key}: mask not found at {mask_path}")
+            continue
+
         output_dir = base_output_dir / image_key
 
         # Run bias sweep experiment
         print(f"Running bias sweep for {image_key} with range {bias_vals}")
         base_config = create_experiment_config(
-            image_path, mask_path, prompt, output_dir,
+            str(img_path), str(mask_path), prompt, output_dir,
             generation_config, attention_config
         )
         bias_sweep_results = run_bias_sweep_experiment(
             base_experiment_config=base_config,
-            model=model, tokenizer=tokenizer,
-            image_processor=image_processor, bias_range=bias_vals,
+            model=model,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            bias_range=bias_vals,
             save_summary=False
         )
 
@@ -569,10 +624,14 @@ def process_batch_from_json(
         saved_path = save_image_results(result_entry, output_dir)
         print(f"Results for {image_key} saved to: {saved_path}")
 
-        # Final summary and saving of all results
+        # Update and save batch summary after each image
         summary_results = summarize_batch_results(all_image_results)
         final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
-    print(f"\nBATCH BIAS SWEEP PROCESSING COMPLETE. Final results saved to: {final_path}")
+
+    if final_path is not None:
+        print(f"\nBATCH BIAS SWEEP PROCESSING COMPLETE. Final results saved to: {final_path}")
+    else:
+        print("\nBATCH BIAS SWEEP PROCESSING COMPLETE. No images were processed.")
     return all_image_results
 
 def run_bias_sweep_experiment(
@@ -673,8 +732,6 @@ def print_resume_usage_examples():
 
 
 if __name__ == '__main__':
-    import argparse
-
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
     parser.add_argument('--mode', type=str, default='batch', choices=['single', 'batch', 'sweep'],
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
@@ -687,8 +744,8 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000033.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000033_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000056.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000056_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
@@ -699,7 +756,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
     # --- Batch Processing Arguments ---
-    parser.add_argument('--json_path', type=str, default=r"D:\Projects\data\gazefollow\train_results.json", help="Path to the JSON file with image descriptions for batch processing.")
+    parser.add_argument('--json_path', type=str, default=None, help="Path to the JSON file with image descriptions for batch processing.")
     parser.add_argument('--base_image_dir', type=str, default=r"D:\Projects\data\gazefollow\train", help="Base directory for images in batch mode.")
     parser.add_argument('--base_mask_dir', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks", help="Base directory for masks in batch mode.")
     parser.add_argument('--limit_items', type=int, default=None, help="Limit the number of items to process in batch mode.")
@@ -709,7 +766,7 @@ if __name__ == '__main__':
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
-    parser.add_argument('--bias_max', type=float, default=9., help="Maximum bias strength for the sweep.")
+    parser.add_argument('--bias_max', type=float, default=8., help="Maximum bias strength for the sweep.")
     parser.add_argument('--bias_steps', type=int, default=4, help="Number of steps in the bias sweep.")
 
     # --- Gaze Guidance Arguments ---

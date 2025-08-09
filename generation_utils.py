@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from io import BytesIO
 import requests
+import pandas as pd
 
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
@@ -959,8 +960,15 @@ def visualize_embedding_similarity(
     
     # Find top-k similarity values and their positions
     flat_map = similarity_map.flatten()
-    topk_indices = np.argpartition(flat_map, -top_k)[-top_k:]  # Get indices of top-k values
-    topk_positions = [(idx // grid_size, idx % grid_size) for idx in topk_indices]
+    # Get indices of top-k values
+    topk_indices = np.argpartition(flat_map, -top_k)[-top_k:]
+
+    # Also add all indices with similarity above a threshold
+    sim_threshold = 0.95  # Hardcoded threshold
+    high_sim_indices = np.where(flat_map > sim_threshold)[0]
+    # Combine and deduplicate
+    all_indices = np.unique(np.concatenate([topk_indices, high_sim_indices]))
+    topk_positions = [(idx // grid_size, idx % grid_size) for idx in all_indices]
     
     # Create a mask for top-k regions with area around them
     topk_mask = np.zeros_like(similarity_map)
@@ -1707,3 +1715,110 @@ def summarize_batch_results(
             "processing_timestamp": entry.get("processing_timestamp"),
         }
     return summary_results
+
+
+# Dataset handling helper functions
+def find_annotations_path(base_image_dir: Path) -> Optional[Path]:
+    """Return the expected annotations file path if it exists, else None."""
+    is_train = "train" in str(base_image_dir).lower()
+    ann_name = "train_annotations_release.txt" if is_train else "test_annotations_release.txt"
+    ann_path = base_image_dir.parent / ann_name
+    return ann_path if ann_path.exists() else None
+
+
+def load_image_files_from_annotations(ann_path: Path, dataset_root: Path) -> List[Path]:
+    """Load image file paths from the first column of the annotations file.
+    Builds paths by simple string concatenation: str(dataset_root) + '/' + rel_path.
+    Does not resolve or check file existence.
+    """
+    df = pd.read_csv(str(ann_path), sep="\t", header=None, engine="python")
+    # Split the single text column by comma into columns; we will use the first column
+    df = df[0].astype(str).str.split(",", expand=True)
+    rel_paths = df.iloc[:, 0].astype(str)
+
+    files = (str(dataset_root) + '/' + rel_paths).tolist()
+
+    # Keep stable ordering (no existence checks, no resolve)
+    return sorted(files)
+
+
+def filter_and_limit_files(
+    image_files: List[Path],
+    filter_keys: Optional[List[str]],
+    limit_items: Optional[int],
+) -> List[Path]:
+    """Filter by provided keys and limit the number of files."""
+    if filter_keys:
+        image_files = [
+            p for p in image_files
+            if any(k in p.stem or k in str(p) for k in filter_keys)
+        ]
+    if limit_items is not None:
+        image_files = image_files[: max(0, int(limit_items))]
+    return image_files
+
+
+def build_stem_index(image_files: List[Path]) -> Dict[str, Path]:
+    """Index files by their stem. Last one wins for duplicates."""
+    idx: Dict[str, Path] = {}
+    for p in sorted(image_files):
+        idx[p.stem] = p
+    return idx
+
+
+def map_person_desc_to_paths(
+    person_desc_data: Dict[str, str],
+    base_image_dir: Path,
+) -> Dict[str, Path]:
+    """Resolve image keys to file paths using annotations only (no directory scanning).
+    Matches keys to stems first, then substring match over annotation-listed files.
+    """
+    ann_path = find_annotations_path(base_image_dir)
+    if not ann_path:
+        print(f"WARNING: No annotations file found near {base_image_dir}. Cannot resolve JSON keys to images.")
+        return {}
+
+    files = load_image_files_from_annotations(ann_path, base_image_dir.parent)
+    if not files:
+        print("WARNING: No images resolved from annotations (first column). Cannot map JSON keys to images.")
+        return {}
+
+    # Build stem index from annotation-listed files
+    stem_index: Dict[str, Path] = {}
+    for p in sorted(files):
+        stem_index[p.stem] = p
+
+    image_paths_map: Dict[str, Path] = {}
+    for image_key in person_desc_data.keys():
+        if image_key in stem_index:
+            image_paths_map[image_key] = stem_index[image_key]
+        else:
+            # Restrict substring search to annotation-provided files
+            candidates = [p for p in files if image_key in str(p)]
+            if candidates:
+                image_paths_map[image_key] = candidates[0]
+            else:
+                print(f"WARNING: Could not locate image for key '{image_key}' using annotations in {base_image_dir}")
+    return image_paths_map
+
+
+def get_image_files(
+    base_image_dir: Path,
+    filter_keys: Optional[List[str]],
+    limit_items: Optional[int],
+) -> List[Path]:
+    """Load images from annotations only. Does not scan directories.
+    Always returns a list of Path objects (possibly empty).
+    """
+    ann_path = find_annotations_path(base_image_dir)
+    if not ann_path:
+        print(f"WARNING: No annotations file found near {base_image_dir}. Not scanning directories.")
+        return []
+
+    print(f"Using annotations file: {ann_path}")
+    image_files = load_image_files_from_annotations(ann_path, base_image_dir.parent)
+    if not image_files:
+        print("WARNING: No images resolved from annotations (first column). Not scanning directories.")
+        return []
+
+    return filter_and_limit_files(image_files, filter_keys, limit_items)
