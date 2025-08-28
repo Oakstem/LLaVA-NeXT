@@ -174,47 +174,6 @@ def run_generation_with_attention(
     all_correlation_metrics = []
     person_mask_correlation_metrics = []  # Track person mask correlations before target switch
     apply_only_target_mask = False
-    # Beam search integration
-    use_beam_search = beam_search_config.get("use_beam_search", False) if beam_search_config else False
-    num_beams = beam_search_config.get("num_beams", 2) if use_beam_search and beam_search_config else 1
-    if use_beam_search and num_beams > 1:
-        from beam_search import generate_with_beam_search_and_gaze_guidance
-        # prepare initial inputs for beam search (first step includes image tensors)
-        initial_inputs = {
-            "input_ids": input_ids,
-            "past_key_values": None,
-            "use_cache": True,
-            "output_attentions": True,
-            "output_hidden_states": False,
-            "atten_ids": None,
-            "boost_positions": boost_positions,
-            "bias_strength": bias_strength,
-            "query_indices": attn_config.get("query_indices", None),
-            "target_mask_embedding": prev_run_last_hidden_state,
-            "base_image_token_inds": [image_token_start_index_in_llm, image_token_start_index_in_llm + num_patches],
-            "input_masks": input_masks,
-            "apply_only_target_mask": False,
-            "images": image_tensor,
-            "image_sizes": image_sizes,
-            "modalities": ["image"],
-        }
-        sequences, texts, metrics = generate_with_beam_search_and_gaze_guidance(
-            initial_inputs, model, tokenizer, gen_config,
-            confidence_tracker, repetitivity_tracker, candidate_evaluator,
-            image_embeddings=None, target_mask=None,
-            use_gaze_guidance=use_gaze_guidance, guidance_config=guidance_config,
-            num_beams=num_beams,
-            max_new_tokens=gen_config.get("max_new_tokens", 50),
-            length_penalty=(beam_search_config or {}).get("length_penalty", 1.0),
-            early_stopping=(beam_search_config or {}).get("early_stopping", True)
-        )
-        # return beam search results
-        return {
-            "beam_sequences": sequences,
-            "beam_texts": texts,
-            "beam_metrics": metrics,
-            "best_text": texts[0] if texts else "",
-        }
 
     for i in range(max_new_tokens):
         with torch.inference_mode():
@@ -744,8 +703,8 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000056.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000056_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\dagta\gazefollow\train\00000001/00001719.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00001719_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
@@ -766,8 +725,8 @@ if __name__ == '__main__':
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
-    parser.add_argument('--bias_max', type=float, default=8., help="Maximum bias strength for the sweep.")
-    parser.add_argument('--bias_steps', type=int, default=4, help="Number of steps in the bias sweep.")
+    parser.add_argument('--bias_max', type=float, default=6., help="Maximum bias strength for the sweep.")
+    parser.add_argument('--bias_steps', type=int, default=3, help="Number of steps in the bias sweep.")
 
     # --- Gaze Guidance Arguments ---
     parser.add_argument('--use_gaze_guidance', action='store_true', help="Enable gaze-guided token selection.")

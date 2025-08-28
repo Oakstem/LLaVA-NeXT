@@ -1,3 +1,4 @@
+#%%
 import os
 import cv2
 import json
@@ -6,13 +7,20 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
+import sys
+from pathlib import Path
+
+# Add parent directory to path to import docs module
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 from docs.research_utils import fix_wsl_paths
+import time
 
 
-# annot_path = r"D:\Projects\data\gazefollow\test_annotations_release.txt"
-annot_path = r"D:\Projects\data\gazefollow\train_annotations_release.txt"
+annot_path = r"D:\Projects\data\gazefollow\test_annotations_release.txt"
+# annot_path = r"D:\Projects\data\gazefollow\train_annotations_release.txt"
 base_data_dir_path = r"D:\Projects\data\gazefollow"
 llava_results_dir = r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\20250503_001255_You_are_an_expert_vision_assis"
+llava_results_dir = r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\201741_full\20250506_201741_Describe_the_image_and_where_e"
 llava_results_dir = Path(fix_wsl_paths(llava_results_dir))
 base_data_dir_path = Path(fix_wsl_paths(base_data_dir_path))
 annot_path = fix_wsl_paths(annot_path)
@@ -59,6 +67,48 @@ def filter_gaze_points(points, threshold_factor=1.5):
 
     return filtered_mean, filtered_points
 
+def calculate_angular_distance(pred_gaze, gt_gaze, eye_pos):
+    """
+    Calculate the angular distance between predicted and ground truth gaze points.
+    
+    Args:
+        pred_gaze: numpy array [x, y] - predicted gaze point in normalized coordinates [0, 1]
+        gt_gaze: numpy array [x, y] - ground truth gaze point in normalized coordinates [0, 1]  
+        eye_pos: numpy array [x, y] - eye position in normalized coordinates [0, 1]
+    
+    Returns:
+        float: angular distance in degrees
+    """
+    # Convert to numpy arrays if not already
+    pred_gaze = np.array(pred_gaze)
+    gt_gaze = np.array(gt_gaze)
+    eye_pos = np.array(eye_pos)
+    
+    # Calculate vectors from eye to gaze points
+    pred_vector = pred_gaze - eye_pos
+    gt_vector = gt_gaze - eye_pos
+    
+    # Calculate magnitudes
+    pred_magnitude = np.linalg.norm(pred_vector)
+    gt_magnitude = np.linalg.norm(gt_vector)
+    
+    # Handle edge case where eye position equals gaze position
+    if pred_magnitude == 0 or gt_magnitude == 0:
+        return 0.0
+    
+    # Normalize vectors
+    pred_unit = pred_vector / pred_magnitude
+    gt_unit = gt_vector / gt_magnitude
+    
+    # Calculate dot product and clip to avoid numerical errors
+    dot_product = np.clip(np.dot(pred_unit, gt_unit), -1.0, 1.0)
+    
+    # Calculate angular distance in radians, then convert to degrees
+    angular_distance_rad = np.arccos(dot_product)
+    angular_distance_deg = np.degrees(angular_distance_rad)
+    
+    return angular_distance_deg
+
 #%% read the annotations
 df = pd.read_csv(annot_path, sep="\t", header=None)
 # split the columns with ',' delimeter
@@ -102,6 +152,9 @@ compact_df = df.groupby('image_path').agg({
     'body_bbox_height': 'mean',
 }).reset_index()
 
+# lets add an image key column
+compact_df['image_key'] = compact_df['image_path'].apply(lambda x: Path(x).stem)
+
 #%% For every row in the compact_df, we need to find the corresponding image in the llava_results_dir
 # and load the gaze points
 
@@ -124,13 +177,43 @@ compact_df = df.groupby('image_path').agg({
 #     llava_results = json.load(f)
 
 # get the gaze points
-gaze_points = llava_results['gaze_points']
+# gaze_points = llava_results['gaze_points']
 #%%
-llava_persons_segment = list(llava_results_dir.rglob("*all_segmentation_results.json"))
-llava_gaze_points = list(llava_results_dir.rglob("*gaze*attn_map_smooth_centers.pt"))
+manual_mode = False
+def iter_gaze_point_files(base_dir):
+    """Generator that yields gaze point files one at a time."""
+    for root, _, files in os.walk(base_dir):
+        for file in files:
+            if 'gaze' in file and file.endswith('attn_map_smooth_centers.pt'):
+                yield Path(root) / file
+
+# Define iterator function for person segmentation files
+def iter_person_files(base_dir):
+    """Generator that yields person segmentation files one at a time."""
+    for root, _, files in os.walk(base_dir):
+        for file in files:
+            if file.endswith('all_segmentation_results.json'):
+                yield Path(root) / file
+
+if manual_mode:
+    # Start timing
+    start_time = time.time()
+    
+    # Start collecting paths
+    llava_gaze_points = list(llava_results_dir.glob("**/**/**/**/*gaze*attn_map_smooth_centers.pt"))
+    llava_persons_segment = list(llava_results_dir.glob("**/**/**/all_segmentation_results.json"))
+
+    # End timing and print results
+    end_time = time.time()
+    print(f"Time to collect paths: {end_time - start_time:.4f} seconds")
+    print(f"Found {len(llava_persons_segment)} person segmentation files and {len(llava_gaze_points)} gaze point files")
+else:
+    llava_gaze_points = iter_gaze_point_files(llava_results_dir)
+    llava_persons_segment = iter_person_files(llava_results_dir)
 
 #%% lets load all the gaze points and aggregate them by image id
 gaze_points_dd = {}
+ind = 0
 for gaze_points_path in tqdm(llava_gaze_points):
     # gaze_points_path = llava_gaze_points[0]
     gaze_filename = gaze_points_path.stem
@@ -144,6 +227,9 @@ for gaze_points_path in tqdm(llava_gaze_points):
     if image_name not in gaze_points_dd:
         gaze_points_dd[image_name] = {}
     gaze_points_dd[image_name][person_id] = gaze_point
+    # if len(gaze_points_dd.keys()) > 10:
+    #     break
+        
 
 #%% lets apply our median + mean filtering to extract a single center point for each person
 gaze_points_dd_extra = gaze_points_dd.copy()
@@ -162,9 +248,12 @@ for image_name, gaze_points in tqdm(gaze_points_dd_extra.items()):
 #%% lets go over the persons and load their bboxes
 person_bboxes = {}
 for ind, row in enumerate(tqdm(llava_persons_segment)):
-    image_id = row.parts[7].split('_')[0]
+    image_id = row.stem.split('_')[0]
     person_data = json.load(open(row))
     person_bboxes[image_id] = {}
+    if image_id == '00000001':
+        p = 1
+
     # rename person_1 to 1
     person_keys = list(person_data.keys())
     for key in person_keys:
@@ -172,29 +261,42 @@ for ind, row in enumerate(tqdm(llava_persons_segment)):
         person_data[new_key] = person_data.pop(key)
 
     # lets load a segmentation mask to extract the original image dimensions (since gt is in relational coordinates)
-    imgs = list(Path(row.parent).rglob("*.jpg"))
-    if len(imgs) == 0:
-        print(f"no segmentation images found for {row}")
-        continue
-
+    # imgs = list(Path(row.parent).rglob("*.jpg"))
+    # if len(imgs) == 0:
+    #     print(f"no segmentation images found for {row}")
+    #     continue
+    
     # load the image
-    img_path = imgs[0]
-    img = cv2.imread(str(img_path))
+    image_path = Path(base_data_dir_path) / Path(compact_df[compact_df['image_key'] == image_id]['image_path'].values[0])
+    img = cv2.imread(str(image_path))
     # get the image dimensions
     h, w, _ = img.shape
     person_data['image_shape'] = (h, w)
     person_bboxes[image_id] = person_data
 
+    # if ind > 10:
+    #     break
+
+
 #%% Now lets go over the GT dataframe and add the resulted gaze points for each frame
-def bbox_intersect(bbox1, bbox2):
-    # Calculate the intersection area
+def bbox_iou(bbox1, bbox2):
+    """
+    Calculate the Intersection over Union (IoU) of two bounding boxes.
+    Each bbox is [x1, y1, x2, y2].
+    """
     x1 = max(bbox1[0], bbox2[0])
     y1 = max(bbox1[1], bbox2[1])
     x2 = min(bbox1[2], bbox2[2])
     y2 = min(bbox1[3], bbox2[3])
-    intersection_area = max(0, x2 - x1) * max(0, y2 - y1)
 
-    return intersection_area
+    intersection_area = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = max(0, bbox1[2] - bbox1[0]) * max(0, bbox1[3] - bbox1[1])
+    area2 = max(0, bbox2[2] - bbox2[0]) * max(0, bbox2[3] - bbox2[1])
+    union_area = area1 + area2 - intersection_area
+
+    if union_area == 0:
+        return 0.0
+    return intersection_area / union_area
 
 def find_matching_person(llava_person_result, gt_person_bbox):
     all_intersects = []
@@ -205,25 +307,31 @@ def find_matching_person(llava_person_result, gt_person_bbox):
         # get the bbox
         person_bbox = person_data['person']['boxes'][0]
         # calculate the iou
-        intersect = bbox_intersect(gt_person_bbox, person_bbox)
+        iou = bbox_iou(gt_person_bbox, person_bbox)
         # if the iou is greater than 0.5, we have a match
-        if intersect > 0:
-            all_intersects.append([intersect, person_id])
+        if iou > 0:
+            all_intersects.append([iou, person_id])
     if len(all_intersects) == 0:
         print(f"no intersecting persons found for {image_id}")
-        return matched_person_id
+        return matched_person_id, 0.
     all_intersects = np.array(all_intersects)
     try:
         matched_person_id = all_intersects[np.argmax(all_intersects[:,0])][1]
+        matched_iou = all_intersects[np.argmax(all_intersects[:,0])][0]
     except ValueError:
-        return all_intersects
-    return matched_person_id
+        return all_intersects, 0.
+    return matched_person_id, matched_iou
 
 # lets add additional columns to the compact_df
 compact_df['llava_matched_person_id'] = None
 compact_df['llava_person_bbox'] = None
 compact_df['llava_gaze_points'] = None
 compact_df['gaze_error'] = None
+compact_df['angular_gaze_error'] = None
+compact_df['llava_person_bb_iou'] = None
+
+# reset index
+compact_df.reset_index(inplace=True)
 
 for ind, row in tqdm(compact_df.iterrows()):
     image_path = row['image_path']
@@ -236,11 +344,12 @@ for ind, row in tqdm(compact_df.iterrows()):
     h, w = llava_person_result['image_shape']
     gt_person_bbox = [w*row['body_bbox_x'], h*row['body_bbox_y'],
                       w*(row['body_bbox_x']+row['body_bbox_width']), h*(row['body_bbox_y']+row['body_bbox_height'])]
-    llava_matched_person_id = find_matching_person(llava_person_result, gt_person_bbox)
+    llava_matched_person_id, llava_person_bb_iou = find_matching_person(llava_person_result, gt_person_bbox)
     if llava_matched_person_id is None:
         print(f"no matched person found for {image_id}")
         continue
     row['llava_matched_person_id'] = llava_matched_person_id
+    row['llava_person_bb_iou'] = llava_person_bb_iou
     # row['llava_person_bbox'] = llava_person_result.get(llava_matched_person_id, {}).get('person')['boxes'][0]
     # row['llava_gaze_points'] =
     llava_person_bbox = llava_person_result.get(llava_matched_person_id, {}).get('person')['boxes'][0]
@@ -250,21 +359,28 @@ for ind, row in tqdm(compact_df.iterrows()):
         continue
     row['llava_gaze_points'] = llava_gaze_point['mean_point']
     row['llava_person_bbox'] = llava_person_bbox
-    # calculate the distance between the gt gaze point and the llava gaze point
+    # calculate the distance between the gt gaze point and the llava gaze point (normalized)
     gt_gaze_point = np.array([row['gaze_x'], row['gaze_y']])
     llava_gaze_point = np.array(row['llava_gaze_points']) / np.array([w, h])        # predicted coordinates are in [x, y]
-    # calculate the distance
+    # calculate the euclidean distance
     distance = np.linalg.norm(gt_gaze_point - llava_gaze_point)
     row['gaze_error'] = distance
+    
+    # calculate the angular distance
+    eye_pos = np.array([row['eye_x'], row['eye_y']])  # eye position in normalized coordinates
+    angular_distance = calculate_angular_distance(llava_gaze_point, gt_gaze_point, eye_pos)
+    row['angular_gaze_error'] = angular_distance
+    
     # set the df with the new row
     compact_df.iloc[ind] = row
 
 # print the average gaze error
-print(f"average gaze error: {compact_df['gaze_error'].mean()}")
+print(f"average euclidean gaze error: {compact_df['gaze_error'].mean():.4f}")
+print(f"average angular gaze error: {compact_df['angular_gaze_error'].mean():.4f} degrees")
 #%% Save the results to a csv file
 output_path = llava_results_dir / "gaze_follow_results.csv"
 compact_df.to_csv(output_path, index=False)
 print(f"saved the results to {output_path}")
 #%%
-points_path = fix_wsl_paths(r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\20250503_001255_You_are_an_expert_vision_assis\00000001_attn\layer_23\each_person_attn_maps\person_1\gaze_target_1_attn_map_smooth_centers.pt")
-gaze_points = torch.load(points_path)
+# points_path = fix_wsl_paths(r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\20250503_001255_You_are_an_expert_vision_assis\00000001_attn\layer_23\each_person_attn_maps\person_1\gaze_target_1_attn_map_smooth_centers.pt")
+# gaze_points = torch.load(points_path)

@@ -964,7 +964,7 @@ def visualize_embedding_similarity(
     topk_indices = np.argpartition(flat_map, -top_k)[-top_k:]
 
     # Also add all indices with similarity above a threshold
-    sim_threshold = 0.95  # Hardcoded threshold
+    sim_threshold = 0.1  # Hardcoded threshold
     high_sim_indices = np.where(flat_map > sim_threshold)[0]
     # Combine and deduplicate
     all_indices = np.unique(np.concatenate([topk_indices, high_sim_indices]))

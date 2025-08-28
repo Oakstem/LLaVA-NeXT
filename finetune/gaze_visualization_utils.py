@@ -2,6 +2,8 @@ import cv2
 import pandas as pd
 from pathlib import Path
 import numpy as np # Retained for pd.isna checks if target_row values could be np.nan
+import ast
+import json
 from gazefollow.gazefollow_utils import prepare_gaze_follow_dataset
 from docs.research_utils import fix_wsl_paths
 
@@ -137,3 +139,373 @@ if __name__ == '__main__':
                                  (0.736, 0.204, 0.952, 0.808)]
 
     visualize_gaze_entry(image_full_key, df, Path(data_base_dir), additional_bboxes=example_additional_bboxes)
+
+
+def visualize_gaze_results_comparison(csv_path: str, output_dir: str = None, max_images: int = None):
+    """
+    Visualize GazeFollowing results comparing ground truth and predictions with overlays.
+    
+    Args:
+        csv_path: Path to the results CSV file
+        output_dir: Directory to save visualization images (default: creates gaze_results_visualization)
+        max_images: Maximum number of images to process (default: all)
+    """
+    # UI Parameters - easy to modify for styling
+    TEXT_BOX_WIDTH = 250
+    TEXT_BOX_HEIGHT = 85
+    TEXT_BOX_X = 10
+    TEXT_BOX_Y = 5
+    TEXT_START_X = 15
+    TEXT_START_Y = 25
+    TEXT_LINE_SPACING = 15
+    FONT_SCALE = 0.5
+    FONT_THICKNESS = 1
+    LEGEND_FONT_SCALE = 0.4
+    
+    # Fix WSL path
+    csv_path = fix_wsl_paths(csv_path)
+    
+    # Load the results CSV
+    df = pd.read_csv(csv_path)
+    print(f"Loaded {len(df)} records from {csv_path}")
+    
+    # Create output directory
+    if output_dir is None:
+        output_dir = Path(csv_path).parent / 'gaze_results_visualization'
+    else:
+        output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Process images
+    processed_count = 0
+    for idx, row in df.iterrows():
+        if max_images and processed_count >= max_images:
+            break
+            
+        # Skip if no image path
+        if pd.isna(row['image_path']):
+            continue
+            
+        # Construct image path (assuming base path structure)
+        image_path = Path(row['image_path'])
+        
+        # Try different base paths to find the image
+        possible_bases = [
+            "/mnt/d/Projects/data/gazefollow",
+            "/mnt/d/Projects/LLaVA-NeXT/gazefollow",
+            Path(csv_path).parent.parent.parent.parent / "data" / "gazefollow"
+        ]
+        
+        full_image_path = None
+        for base in possible_bases:
+            candidate_path = Path(base) / image_path
+            if candidate_path.exists():
+                full_image_path = candidate_path
+                break
+        
+        if full_image_path is None:
+            print(f"Image not found: {image_path}")
+            continue
+            
+        # Load image
+        img = cv2.imread(str(full_image_path))
+        if img is None:
+            print(f"Failed to load image: {full_image_path}")
+            continue
+            
+        h, w, _ = img.shape
+        
+        # Create visualization overlay
+        overlay = img.copy()
+        
+        # --- Ground Truth Visualization (Green) ---
+        # GT Body bbox
+        if not pd.isna(row['body_bbox_x']) and not pd.isna(row['body_bbox_y']):
+            gt_x1 = int(row['body_bbox_x'] * w)
+            gt_y1 = int(row['body_bbox_y'] * h)
+            gt_x2 = int((row['body_bbox_x'] + row['body_bbox_width']) * w)
+            gt_y2 = int((row['body_bbox_y'] + row['body_bbox_height']) * h)
+            cv2.rectangle(overlay, (gt_x1, gt_y1), (gt_x2, gt_y2), (0, 255, 0), 3)  # Green
+            cv2.putText(overlay, "GT", (gt_x1, gt_y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # GT Eye position (small circle)
+        if not pd.isna(row['eye_x']) and not pd.isna(row['eye_y']):
+            gt_eye_x = int(row['eye_x'] * w)
+            gt_eye_y = int(row['eye_y'] * h)
+            cv2.circle(overlay, (gt_eye_x, gt_eye_y), 5, (0, 255, 0), -1)  # Green dot
+        
+        # GT Gaze target (larger circle)
+        if not pd.isna(row['gaze_x']) and not pd.isna(row['gaze_y']):
+            gt_gaze_x = int(row['gaze_x'] * w)
+            gt_gaze_y = int(row['gaze_y'] * h)
+            cv2.circle(overlay, (gt_gaze_x, gt_gaze_y), 15, (0, 255, 0), 3)  # Green circle
+            cv2.putText(overlay, "GT Gaze", (gt_gaze_x+20, gt_gaze_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # --- Prediction Visualization (Red) ---
+        # Predicted person bbox
+        if not pd.isna(row['llava_person_bbox']):
+            try:
+                # Parse the bbox string (could be list format)
+                bbox_str = str(row['llava_person_bbox']).strip()
+                if bbox_str.startswith('[') and bbox_str.endswith(']'):
+                    pred_bbox = ast.literal_eval(bbox_str)
+                    if len(pred_bbox) == 4:
+                        pred_x1, pred_y1, pred_x2, pred_y2 = pred_bbox
+                        cv2.rectangle(overlay, (pred_x1, pred_y1), (pred_x2, pred_y2), (0, 0, 255), 3)  # Red
+                        cv2.putText(overlay, "PRED", (pred_x1, pred_y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            except:
+                pass
+        
+        # Predicted gaze points
+        if not pd.isna(row['llava_gaze_points']):
+            try:
+                # Parse the gaze points string (numpy array format)
+                gaze_str = str(row['llava_gaze_points']).strip()
+                if gaze_str.startswith('[') and gaze_str.endswith(']'):
+                    # Remove brackets and clean up the string
+                    content = gaze_str[1:-1].strip()
+                    # Split by whitespace and filter out empty strings
+                    parts = [x for x in content.split() if x]
+                    if len(parts) >= 2:
+                        pred_gaze_x = int(float(parts[0]))
+                        pred_gaze_y = int(float(parts[1]))
+                        cv2.circle(overlay, (pred_gaze_x, pred_gaze_y), 15, (0, 0, 255), 3)  # Red circle
+                        cv2.putText(overlay, "PRED Gaze", (pred_gaze_x+20, pred_gaze_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                elif ' ' in gaze_str:
+                    # Handle space-separated format
+                    parts = gaze_str.split()
+                    if len(parts) >= 2:
+                        pred_gaze_x = int(float(parts[0]))
+                        pred_gaze_y = int(float(parts[1]))
+                        cv2.circle(overlay, (pred_gaze_x, pred_gaze_y), 15, (0, 0, 255), 3)  # Red circle
+                        cv2.putText(overlay, "PRED Gaze", (pred_gaze_x+20, pred_gaze_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            except Exception as e:
+                print(f"Error parsing gaze points for {row['image_key']}: {e}")
+        
+        # --- Error Information (Top-left corner) ---
+        y_offset = TEXT_START_Y
+        
+        # Background rectangle for text
+        text_bg_color = (0, 0, 0)  # Black background
+        cv2.rectangle(overlay, (TEXT_BOX_X, TEXT_BOX_Y), (TEXT_BOX_X + TEXT_BOX_WIDTH, TEXT_BOX_Y + TEXT_BOX_HEIGHT), text_bg_color, -1)
+        
+        # Image key
+        cv2.putText(overlay, f"Image: {row['image_key']}", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+        y_offset += TEXT_LINE_SPACING
+        
+        # Gaze error
+        if not pd.isna(row['gaze_error']):
+            cv2.putText(overlay, f"Gaze Error: {row['gaze_error']:.4f}", (TEXT_START_X, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+        else:
+            cv2.putText(overlay, "Gaze Error: N/A", (TEXT_START_X, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+        y_offset += TEXT_LINE_SPACING
+        
+        # Angular gaze error
+        if not pd.isna(row['angular_gaze_error']):
+            cv2.putText(overlay, f"Angular Error: {row['angular_gaze_error']:.2f}", (TEXT_START_X, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+        else:
+            cv2.putText(overlay, "Angular Error: N/A", (TEXT_START_X, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+        y_offset += TEXT_LINE_SPACING
+        
+        # Legend
+        cv2.putText(overlay, "GT=Green, PRED=Red", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, LEGEND_FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+        
+        # Save the visualization
+        output_filename = f"{row['image_key']}_gaze_comparison.jpg"
+        output_path = output_dir / output_filename
+        cv2.imwrite(str(output_path), overlay)
+        
+        processed_count += 1
+        if processed_count % 10 == 0:
+            print(f"Processed {processed_count} images...")
+    
+    print(f"Visualization complete! Processed {processed_count} images.")
+    print(f"Results saved to: {output_dir}")
+
+
+def visualize_single_gaze_result(csv_path, output_dir, image_key=None, row_index=None):
+    """
+    Visualize a single gaze result by image key or row index
+    
+    Args:
+        csv_path: Path to the gaze results CSV file
+        output_dir: Directory to save visualization
+        image_key: Image key to visualize (e.g., '00000001')
+        row_index: Row index to visualize (0-based)
+    """
+    import pandas as pd
+    import cv2
+    import os
+    import ast
+    
+    # UI Parameters - same as main function for consistency
+    TEXT_BOX_WIDTH = 250
+    TEXT_BOX_HEIGHT = 85
+    TEXT_BOX_X = 10
+    TEXT_BOX_Y = 5
+    TEXT_START_X = 15
+    TEXT_START_Y = 25
+    TEXT_LINE_SPACING = 15
+    FONT_SCALE = 0.5
+    FONT_THICKNESS = 1
+    LEGEND_FONT_SCALE = 0.4
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load CSV
+    df = pd.read_csv(csv_path)
+    print(f"Loaded {len(df)} records from {csv_path}")
+    
+    # Select the row
+    if image_key is not None:
+        row_mask = df['image_key'] == image_key
+        if not row_mask.any():
+            print(f"Image key '{image_key}' not found in dataset")
+            return
+        row = df[row_mask].iloc[0]
+        row_idx = df[row_mask].index[0]
+    elif row_index is not None:
+        if row_index < 0 or row_index >= len(df):
+            print(f"Row index {row_index} out of range (0-{len(df)-1})")
+            return
+        row = df.iloc[row_index]
+        row_idx = row_index
+    else:
+        print("Please specify either image_key or row_index")
+        return
+    
+    # Process the single row
+    image_path = row['image_path']
+    
+    # Try to load image from various possible paths
+    possible_paths = [
+        image_path,
+        os.path.join('/mnt/d/Projects/data/gazefollow', image_path),
+        os.path.join('/mnt/d/Projects/data/gazefollow/train', image_path),
+        os.path.join('/mnt/d/Projects/data/gazefollow/test', image_path),
+    ]
+    
+    img = None
+    for full_image_path in possible_paths:
+        if os.path.exists(full_image_path):
+            img = cv2.imread(full_image_path)
+            if img is not None:
+                break
+    
+    if img is None:
+        print(f"Failed to load image: {image_path}")
+        return
+        
+    h, w, _ = img.shape
+    
+    # Create visualization overlay
+    overlay = img.copy()
+    
+    # --- Ground Truth Visualization (Green) ---
+    # GT Body bbox
+    if not pd.isna(row['body_bbox_x']) and not pd.isna(row['body_bbox_y']):
+        gt_x1 = int(row['body_bbox_x'] * w)
+        gt_y1 = int(row['body_bbox_y'] * h)
+        gt_x2 = int((row['body_bbox_x'] + row['body_bbox_width']) * w)
+        gt_y2 = int((row['body_bbox_y'] + row['body_bbox_height']) * h)
+        cv2.rectangle(overlay, (gt_x1, gt_y1), (gt_x2, gt_y2), (0, 255, 0), 3)  # Green
+        cv2.putText(overlay, "GT", (gt_x1, gt_y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    
+    # GT Eye position (small circle)
+    if not pd.isna(row['eye_x']) and not pd.isna(row['eye_y']):
+        gt_eye_x = int(row['eye_x'] * w)
+        gt_eye_y = int(row['eye_y'] * h)
+        cv2.circle(overlay, (gt_eye_x, gt_eye_y), 5, (0, 255, 0), -1)  # Green dot
+    
+    # GT Gaze target (larger circle)
+    if not pd.isna(row['gaze_x']) and not pd.isna(row['gaze_y']):
+        gt_gaze_x = int(row['gaze_x'] * w)
+        gt_gaze_y = int(row['gaze_y'] * h)
+        cv2.circle(overlay, (gt_gaze_x, gt_gaze_y), 15, (0, 255, 0), 3)  # Green circle
+        cv2.putText(overlay, "GT Gaze", (gt_gaze_x+20, gt_gaze_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
+    # --- Prediction Visualization (Red) ---
+    # Predicted person bbox
+    if not pd.isna(row['llava_person_bbox']):
+        try:
+            # Parse the bbox string (could be list format)
+            bbox_str = str(row['llava_person_bbox']).strip()
+            if bbox_str.startswith('[') and bbox_str.endswith(']'):
+                pred_bbox = ast.literal_eval(bbox_str)
+                if len(pred_bbox) == 4:
+                    pred_x1, pred_y1, pred_x2, pred_y2 = pred_bbox
+                    cv2.rectangle(overlay, (pred_x1, pred_y1), (pred_x2, pred_y2), (0, 0, 255), 3)  # Red
+                    cv2.putText(overlay, "PRED", (pred_x1, pred_y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        except:
+            pass
+    
+    # Predicted gaze points
+    if not pd.isna(row['llava_gaze_points']):
+        try:
+            # Parse the gaze points string (numpy array format)
+            gaze_str = str(row['llava_gaze_points']).strip()
+            if gaze_str.startswith('[') and gaze_str.endswith(']'):
+                # Remove brackets and clean up the string
+                content = gaze_str[1:-1].strip()
+                # Split by whitespace and filter out empty strings
+                parts = [x for x in content.split() if x]
+                if len(parts) >= 2:
+                    pred_gaze_x = int(float(parts[0]))
+                    pred_gaze_y = int(float(parts[1]))
+                    cv2.circle(overlay, (pred_gaze_x, pred_gaze_y), 15, (0, 0, 255), 3)  # Red circle
+                    cv2.putText(overlay, "PRED Gaze", (pred_gaze_x+20, pred_gaze_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        except Exception as e:
+            print(f"Error parsing gaze points for {row['image_key']}: {e}")
+    
+    # --- Error Information (Top-left corner) ---
+    y_offset = TEXT_START_Y
+    
+    # Background rectangle for text
+    text_bg_color = (0, 0, 0)  # Black background
+    cv2.rectangle(overlay, (TEXT_BOX_X, TEXT_BOX_Y), (TEXT_BOX_X + TEXT_BOX_WIDTH, TEXT_BOX_Y + TEXT_BOX_HEIGHT), text_bg_color, -1)
+    
+    # Image key
+    cv2.putText(overlay, f"Image: {row['image_key']}", (TEXT_START_X, y_offset), 
+               cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+    y_offset += TEXT_LINE_SPACING
+    
+    # Gaze error
+    if not pd.isna(row['gaze_error']):
+        cv2.putText(overlay, f"Gaze Error: {row['gaze_error']:.4f}", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+    else:
+        cv2.putText(overlay, "Gaze Error: N/A", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+    y_offset += TEXT_LINE_SPACING
+    
+    # Angular gaze error
+    if not pd.isna(row['angular_gaze_error']):
+        cv2.putText(overlay, f"Angular Error: {row['angular_gaze_error']:.2f}", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+    else:
+        cv2.putText(overlay, "Angular Error: N/A", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+    y_offset += TEXT_LINE_SPACING
+    
+    # Person ID
+    if not pd.isna(row['llava_matched_person_id']):
+        cv2.putText(overlay, f"Person ID: {int(row['llava_matched_person_id'])}", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+    else:
+        cv2.putText(overlay, "Person ID: N/A", (TEXT_START_X, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), FONT_THICKNESS)
+    
+    # Save the image
+    output_filename = f"{row['image_key']}_gaze_comparison.jpg"
+    output_path = os.path.join(output_dir, output_filename)
+    cv2.imwrite(output_path, overlay)
+    
+    print(f"Visualization saved: {output_path}")
+    return output_path

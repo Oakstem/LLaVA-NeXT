@@ -71,11 +71,15 @@ playground/*.json
 mlx_configs/
 data_processing/
 # demo/
-/llava_attention_maps/
-/llava_attention_sweep/
+llava_attention_maps
+llava_attention_sweep
 # all png files
 *.png
 *.pt
 *.json
 *.jpg
 *.csv
+*.pth
+attention_output
+*.npy
+*.zip

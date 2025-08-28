@@ -520,7 +520,7 @@ def analyze_generation_quality(summary: Dict[str, Any]) -> Dict[str, Any]:
     
     # Repetition penalty (-2 to 0 points)
     rep_penalty_2gram = summary["diversity_metrics"].get("repetition_penalty_2gram", 0)
-    repetition_factor = -min(3.0, rep_penalty_2gram * 6)  # Penalty for repetition
+    repetition_factor = -min(4.0, rep_penalty_2gram * 8)  # Penalty for repetition
     quality_score += repetition_factor
     quality_factors["repetition"] = repetition_factor
     
@@ -569,7 +569,7 @@ def calculate_attention_correlation_from_similarity(
     text_to_image_similarity_matrix: Optional[np.ndarray] = None,
     attention_mask: Optional[np.ndarray] = None,
     attention_map: Optional[np.ndarray] = None,
-    threshold: float = 0.5
+    threshold: float = 0.2
 ) -> Dict[str, float]:
     """
     Calculates the correlation between a similarity matrix/attention map and a given binary mask.
@@ -593,6 +593,10 @@ def calculate_attention_correlation_from_similarity(
             "coverage": 0.0
         }
     
+    from scipy.ndimage import uniform_filter
+    x=3
+    text_to_image_similarity_matrix = uniform_filter(text_to_image_similarity_matrix.astype(np.float32), size=x, mode='reflect')
+
     # Use similarity matrix if available, otherwise use attention map
     if text_to_image_similarity_matrix is not None and text_to_image_similarity_matrix.size > 0:
         correlation_source = text_to_image_similarity_matrix
@@ -609,22 +613,23 @@ def calculate_attention_correlation_from_similarity(
             "correlation": 0.0,
             "coverage": 0.0
         }
-    
+
+
     # Ensure same shape
-    if correlation_source.shape != attention_mask.shape:
-        # Resize correlation_source to match mask shape if needed
-        try:
-            from scipy.ndimage import zoom
-            scale_factors = [mask_dim / corr_dim for mask_dim, corr_dim in 
-                            zip(attention_mask.shape, correlation_source.shape)]
-            correlation_source = zoom(correlation_source, scale_factors, order=1)
-        except ImportError:
-            # Fallback: simple interpolation using numpy
-            from scipy import ndimage
-            correlation_source = ndimage.zoom(correlation_source, 
-                                            [attention_mask.shape[0] / correlation_source.shape[0],
-                                             attention_mask.shape[1] / correlation_source.shape[1]], 
-                                            order=1)
+    # if correlation_source.shape != attention_mask.shape:
+    #     # Resize correlation_source to match mask shape if needed
+    #     try:
+    #         from scipy.ndimage import zoom
+    #         scale_factors = [mask_dim / corr_dim for mask_dim, corr_dim in 
+    #                         zip(attention_mask.shape, correlation_source.shape)]
+    #         correlation_source = zoom(correlation_source, scale_factors, order=1)
+    #     except ImportError:
+    #         # Fallback: simple interpolation using numpy
+    #         from scipy import ndimage
+    #         correlation_source = ndimage.zoom(correlation_source, 
+    #                                         [attention_mask.shape[0] / correlation_source.shape[0],
+    #                                          attention_mask.shape[1] / correlation_source.shape[1]], 
+    #                                         order=1)
 
     flat_correlation = correlation_source.flatten()
     flat_mask = attention_mask.astype(bool).flatten()
