@@ -214,9 +214,9 @@ def main():
         # check if mask exists for this image
         if args.gazefollow_dataset:
             mask_path = args.masks_dir / f"gaze__{Path(image_path).stem}_masks.npy"
-            if not mask_path.exists():
-                print(f"Warning: Mask file {mask_path} does not exist. Skipping image {image_path}")
-                continue
+            # if not mask_path.exists():
+            #     print(f"Warning: Mask file {mask_path} does not exist. Skipping image {image_path}")
+            #     continue
         # Calculate ETA if more than one image has been processed
         if img_idx > 0:
             time_per_image = time_elapsed / img_idx
@@ -250,10 +250,6 @@ def main():
             original_stdout = sys.stdout
             original_stderr = sys.stderr
 
-            # with open(log_file_path, 'w') as log_file:
-            #     sys.stdout = log_file
-            #     sys.stderr = log_file
-
             # Process the current layer
             results = process_image_and_prompt(
                         str(image_path),
@@ -269,9 +265,23 @@ def main():
                         min_avg_attention=args.min_avg_attn,
                         show_highest_attn_blob=args.show_highest_attn_blob,
                         dilate_kernel_size=args.dilate_highest_blob,
-                        return_masked_tokens=True)
+                        return_masked_tokens=False,
+                        visualize_attn_overlays=False)
             print(f"Resulted masked tokens: {results}")
             print(f"Layer {layer_idx} processing completed successfully.")
+
+            # Save the generated text results to the layer-specific directory
+            results_log_path = layer_output_dir / f"generated_text_layer_{layer_idx:02d}.txt"
+            try:
+                with open(results_log_path, 'w', encoding='utf-8') as log_file:
+                    log_file.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    log_file.write(f"Image: {image_path}\n")
+                    log_file.write(f"Layer: {layer_idx}\n")
+                    log_file.write(f"Prompt: {args.prompt}\n")
+                    log_file.write(f"Generated Text: {results}\n")
+                print(f"Generated text saved to: {results_log_path}")
+            except Exception as e:
+                print(f"Error writing to results log file: {e}")
 
             # Add result to dictionary for JSON export
             image_key = str('/'.join(rel_path.parts[-3:]))  # Use image file name as key
@@ -289,6 +299,7 @@ def main():
     total_time = time.time() - start_time
     print(f"\n{'-'*80}")
     print(f"All {len(image_paths)} images processed in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
+    print(f"Generated text results saved in individual layer directories")
     print("--- Attention sweep finished ---")
 
 if __name__ == "__main__":

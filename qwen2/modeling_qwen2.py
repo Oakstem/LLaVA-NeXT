@@ -795,74 +795,75 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_size = hidden_states.size()
         bsz, q_len = hidden_size[0], hidden_size[1]
-        gaze_target_boost_positions = kwargs.get('boost_positions', None).get('gaze_target', None)
-        gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
-        if kwargs.get('tokens_indexing', None) is not None and kwargs.get('tokens_indexing', None).get('insert_embd', None) is not None:    # and kwargs.get('tokens_indexing', None)['insert_embd'][0] >= 2:
-            abs_indexing = True
-            gaze_source_boost_positions = gaze_source_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
-            # gaze_target_boost_positions = gaze_target_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
-            tokens_indexing = kwargs.get('tokens_indexing', None)
-            gaze_source_query_positions = [tokens_indexing['insert_embd'][0]]
-            if len(tokens_indexing['insert_embd']) > 1:
-                gaze_target_query_positions = [tokens_indexing['insert_embd'][1]]
-                if len(tokens_indexing['insert_embd'][1].size()) < 1:
-                    gaze_target_query_positions = [gaze_target_query_positions]
+        if kwargs.get("boost_positions", None) is not None:
+            gaze_target_boost_positions = kwargs.get('boost_positions', None).get('gaze_target', None)
+            gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
+            if kwargs.get('tokens_indexing', None) is not None and kwargs.get('tokens_indexing', None).get('insert_embd', None) is not None:    # and kwargs.get('tokens_indexing', None)['insert_embd'][0] >= 2:
+                abs_indexing = True
+                gaze_source_boost_positions = gaze_source_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
+                # gaze_target_boost_positions = gaze_target_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
+                tokens_indexing = kwargs.get('tokens_indexing', None)
+                gaze_source_query_positions = [tokens_indexing['insert_embd'][0]]
+                if len(tokens_indexing['insert_embd']) > 1:
+                    gaze_target_query_positions = [tokens_indexing['insert_embd'][1]]
+                    if len(tokens_indexing['insert_embd'][1].size()) < 1:
+                        gaze_target_query_positions = [gaze_target_query_positions]
+                        gaze_source_query_positions = [gaze_source_query_positions]
+                else:
+                    # no second '_' was found in the prompt, so we assume no gaze target boost positions
+                    gaze_target_boost_positions = None
                     gaze_source_query_positions = [gaze_source_query_positions]
             else:
-                # no second '_' was found in the prompt, so we assume no gaze target boost positions
-                gaze_target_boost_positions = None
-                gaze_source_query_positions = [gaze_source_query_positions]
-        else:
-            abs_indexing = False
-            gaze_target_query_positions = kwargs.get('query_indices', None).get('gaze_target', None)
-            gaze_source_query_positions = kwargs.get('query_indices', None).get('gaze_source', None)
-        attention_bias_positions_gaze_target = self._create_bias_positions_attend_to(gaze_target_boost_positions, gaze_target_query_positions, q_len, abs_indexing) if gaze_target_boost_positions is not None else None
-        attention_bias_positions_gaze_source = self._create_bias_positions_attend_to(gaze_source_boost_positions, gaze_source_query_positions, q_len, abs_indexing) if gaze_source_boost_positions is not None else None
-        # Create or modify attention mask to include positional bias
-        if attention_bias_positions_gaze_target is not None or attention_bias_positions_gaze_source is not None:
-            kv_seq_len = q_len
-            # attention_mask = self._add_positional_bias_optimized(
-            #     attention_mask,
-            #     attention_bias_positions,
-            #     0.3,
-            #     bsz,
-            #     q_len,
-            #     kv_seq_len,
-            #     position_ids
-            # )
-            source_attention_mask = kwargs.get("source_attention_mask", None)
-            if source_attention_mask is not None:
-                source_attention_mask = attention_mask
-            target_bias_mat = self._add_positional_bias(attention_mask, attention_bias_positions_gaze_target, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_target is not None else None
-            source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_source is not None else None
-            if kwargs.get("apply_only_target_mask", False):
-                combined_bias = target_bias_mat
-                # get all indices where target bias is 0 (not masked), without the source indices
-                zero_inds = torch.where(source_attention_mask >= 0)
-            else:
-                combined_bias = source_bias_mat
-                # get all indices where either target or source bias is 0 (not masked & not boosted)
-                # zero_inds = torch.where(torch.logical_or(attention_mask >= 0, source_attention_mask >= 0))
-                zero_inds = torch.where(source_attention_mask >= 0)
-                # zero_inds = torch.where(source_attention_mask >= 0))
-            # using bitwise-or with parentheses
-            nonzero_inds = torch.where(combined_bias >= self.bias_strength)
-            
-            combined_mask_attention_mask = torch.ones_like(attention_mask, device=attention_mask.device, dtype=attention_mask.dtype) * attention_mask.min()
-            # nonzero_inds = torch.where(torch.logical_or(target_bias_mat >= self.bias_strength, source_bias_mat >= self.bias_strength))
-            combined_mask_attention_mask[zero_inds] = 0.0
-            combined_mask_attention_mask[nonzero_inds] = self.bias_strength
-            attention_mask = combined_mask_attention_mask
-            self._attn_mask_ind += 1
-            # if self._attn_mask_ind == 1:
-            #     # save the attention mask to csv file
-            #     np.c_[np.where(attention_mask.cpu().numpy().squeeze() >=0)].tofile(f"attention_mask_{self._attn_mask_ind}.csv", sep=",")
-            #     print(f"Attention mask saved to attention_mask_{self._attn_mask_ind}.csv")
+                abs_indexing = False
+                gaze_target_query_positions = kwargs.get('query_indices', None).get('gaze_target', None)
+                gaze_source_query_positions = kwargs.get('query_indices', None).get('gaze_source', None)
+            attention_bias_positions_gaze_target = self._create_bias_positions_attend_to(gaze_target_boost_positions, gaze_target_query_positions, q_len, abs_indexing) if gaze_target_boost_positions is not None else None
+            attention_bias_positions_gaze_source = self._create_bias_positions_attend_to(gaze_source_boost_positions, gaze_source_query_positions, q_len, abs_indexing) if gaze_source_boost_positions is not None else None
+            # Create or modify attention mask to include positional bias
+            if attention_bias_positions_gaze_target is not None or attention_bias_positions_gaze_source is not None:
+                kv_seq_len = q_len
+                # attention_mask = self._add_positional_bias_optimized(
+                #     attention_mask,
+                #     attention_bias_positions,
+                #     0.3,
+                #     bsz,
+                #     q_len,
+                #     kv_seq_len,
+                #     position_ids
+                # )
+                source_attention_mask = kwargs.get("source_attention_mask", None)
+                if source_attention_mask is not None:
+                    source_attention_mask = attention_mask
+                target_bias_mat = self._add_positional_bias(attention_mask, attention_bias_positions_gaze_target, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_target is not None else None
+                source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_source is not None else None
+                if kwargs.get("apply_only_target_mask", False):
+                    combined_bias = target_bias_mat
+                    # get all indices where target bias is 0 (not masked), without the source indices
+                    zero_inds = torch.where(source_attention_mask >= 0)
+                else:
+                    combined_bias = source_bias_mat
+                    # get all indices where either target or source bias is 0 (not masked & not boosted)
+                    # zero_inds = torch.where(torch.logical_or(attention_mask >= 0, source_attention_mask >= 0))
+                    zero_inds = torch.where(source_attention_mask >= 0)
+                    # zero_inds = torch.where(source_attention_mask >= 0))
+                # using bitwise-or with parentheses
+                nonzero_inds = torch.where(combined_bias >= self.bias_strength)
+                
+                combined_mask_attention_mask = torch.ones_like(attention_mask, device=attention_mask.device, dtype=attention_mask.dtype) * attention_mask.min()
+                # nonzero_inds = torch.where(torch.logical_or(target_bias_mat >= self.bias_strength, source_bias_mat >= self.bias_strength))
+                combined_mask_attention_mask[zero_inds] = 0.0
+                combined_mask_attention_mask[nonzero_inds] = self.bias_strength
+                attention_mask = combined_mask_attention_mask
+                self._attn_mask_ind += 1
+                # if self._attn_mask_ind == 1:
+                #     # save the attention mask to csv file
+                #     np.c_[np.where(attention_mask.cpu().numpy().squeeze() >=0)].tofile(f"attention_mask_{self._attn_mask_ind}.csv", sep=",")
+                #     print(f"Attention mask saved to attention_mask_{self._attn_mask_ind}.csv")
 
-            not_masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() >= 0)
-            masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() < 0)
-            ratio = masked_positions / (masked_positions + not_masked_positions)
-            # print(f"Attention mask ratio: {ratio:.2f} (masked: {masked_positions}, not masked: {not_masked_positions})")
+                not_masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() >= 0)
+                masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() < 0)
+                ratio = masked_positions / (masked_positions + not_masked_positions)
+                # print(f"Attention mask ratio: {ratio:.2f} (masked: {masked_positions}, not masked: {not_masked_positions})")
             
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(

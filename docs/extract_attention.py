@@ -431,7 +431,7 @@ def save_attention_visualizations(attention_map, image, token_id, token_text, st
                                  vis_raw_dir, vis_processed_dir, tensor_dir,
                                  attn_threshold, opening_kernel_size, min_blob_area,
                                  min_avg_attention, show_highest_blob, dilate_kernel_size,
-                                 visualize_overlays=True, create_collage_maps=None):
+                                 visualize_overlays=True, create_collage_maps=False):
     """Save attention visualizations and tensors."""
     # Skip if attention map is invalid
     if not isinstance(attention_map, np.ndarray) or attention_map.ndim != 2:
@@ -514,7 +514,7 @@ def process_image_and_prompt(
     show_highest_attn_blob: bool = False,
     dilate_kernel_size: int = 0,
     # Add collage parameters
-    create_collage: bool = True,
+    create_collage: bool = False,
     collage_grid_rows: int = 3,
     collage_grid_cols: int = 4,
     visualize_attn_overlays: bool = True,
@@ -529,7 +529,7 @@ def process_image_and_prompt(
 
     # Load and process image
     image = load_image(image_path)
-    image_tensor = process_images([image], image_processor, model.config) # Returns tensor directly
+    image_tensor, _, _, _ = process_images([image], image_processor, model.config) # Returns tensor directly
     if type(image_tensor) is list:
         image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
     else:
@@ -571,7 +571,7 @@ def process_image_and_prompt(
 
     # --- Manual Generation Loop for Attention Extraction ---
     print("Starting manual generation loop for attention extraction...")
-    max_new_tokens = 256 # Set max generation length
+    max_new_tokens = 128 # Set max generation length
     generated_ids = []
     all_attentions = [] # Store attentions from each step if needed later
     past_key_values = None
@@ -637,7 +637,11 @@ def process_image_and_prompt(
     # with open(mask_file, "rb") as f:
     #     import pickle
     #     mask = pickle.load(f)
-    mask = np.load(mask_file, allow_pickle=True).item()['masks'][0]
+    if Path(mask_file).exists():
+        mask = np.load(mask_file, allow_pickle=True).item()['masks'][0]
+    else:
+        print(f"Mask file not found at {mask_file}, using empty mask.")
+        mask = np.zeros((image.size[1], image.size[0]), dtype=np.float32)
     # lets extract the coordinates of each pixel in the mask
     mask_coords = np.argwhere(mask)
     print(f"Mask coordinates shape: {mask_coords.shape}")
@@ -712,7 +716,7 @@ def process_image_and_prompt(
             input_token_length = past_key_values[0][0].shape[2]
             atten_indices = atten_indices + [input_token_length-1]
             print(f"Total token length: {input_token_length}")
-            print(f"Current Attention indices: {atten_indices}")
+            # print(f"Current Attention indices: {atten_indices}")
 
     # After the generation loop, create collages from the collected maps
     if create_collage and collected_maps:
@@ -752,7 +756,8 @@ def process_image_and_prompt(
     print("-" * 30)
     print(f"Finished. Raw attention maps saved in: {vis_output_dir_raw}")
     print(f"Finished. Processed attention maps saved in: {vis_output_dir_processed}")
-    # --- End Manual Generation Loop ---
+    
+    return text_output
 
 
 def main() -> int:
