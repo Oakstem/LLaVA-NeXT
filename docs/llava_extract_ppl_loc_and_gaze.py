@@ -70,6 +70,7 @@ def main():
     parser.add_argument("--image-path", required=True, help="Path to the input image file or directory containing images.")
     parser.add_argument("--recursive", action="store_true", help="Recursively process images in subdirectories.")
     parser.add_argument("--image-extensions", default=".jpg,.jpeg,.png,.webp", help="Comma-separated list of image extensions to process (e.g., '.jpg,.png').")
+    parser.add_argument("--start-from", type=str, help="Image ID (stem name without extension) to start processing from, skipping all images that come before it in sorted order.")
 
     # Prompt options
     parser.add_argument("--prompt", default=None, help="Text prompt for the model.")
@@ -166,7 +167,23 @@ def main():
         print(f"Error: No image files found with extensions {image_extensions} in {args.image_path}")
         return
 
-    print(f"Found {len(image_paths)} image(s) to process")
+    # Filter images based on start_from argument
+    original_image_count = len(image_paths)
+    if args.start_from:
+        # Find the index of the image to start from
+        start_index = None
+        for i, image_path in enumerate(image_paths):
+            if Path(image_path).stem == args.start_from:
+                start_index = i
+                break
+        
+        if start_index is not None:
+            image_paths = image_paths[start_index:]
+            print(f"Starting from image '{args.start_from}' - skipping {start_index} image(s)")
+        else:
+            print(f"Warning: Image with ID '{args.start_from}' not found. Processing all images.")
+
+    print(f"Found {original_image_count} total image(s), processing {len(image_paths)} image(s)")
 
     # --- Create Timestamped Output Directory ---
     # Sanitize the prompt for use in the directory name
@@ -208,8 +225,11 @@ def main():
 
     # Process all images
     start_time = time.time()
+    skipped_count = original_image_count - len(image_paths)
+    
     for img_idx, image_path in enumerate(image_paths):
         # Progress reporting
+        current_image_id = Path(image_path).stem
         percent_complete = (img_idx / len(image_paths)) * 100
         time_elapsed = time.time() - start_time
         # check if mask exists for this image
@@ -223,9 +243,15 @@ def main():
             time_per_image = time_elapsed / img_idx
             eta_seconds = time_per_image * (len(image_paths) - img_idx)
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
-            progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} ({percent_complete:.1f}%) - ETA: {eta_str}"
+            if skipped_count > 0:
+                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%, skipped {skipped_count}) - ETA: {eta_str}"
+            else:
+                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%) - ETA: {eta_str}"
         else:
-            progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} ({percent_complete:.1f}%)"
+            if skipped_count > 0:
+                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%, skipped {skipped_count})"
+            else:
+                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%)"
 
         print(f"\n{'-'*80}")
         print(progress_msg)
@@ -299,7 +325,10 @@ def main():
 
     total_time = time.time() - start_time
     print(f"\n{'-'*80}")
-    print(f"All {len(image_paths)} images processed in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
+    if skipped_count > 0:
+        print(f"All {len(image_paths)} images processed (skipped {skipped_count}) in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
+    else:
+        print(f"All {len(image_paths)} images processed in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
     print(f"Generated text results saved in individual layer directories")
     print("--- Attention sweep finished ---")
 
