@@ -105,27 +105,27 @@ def main():
 
     # set default prompt if not provided
     if args.prompt is None:
-        args.prompt = ("You are an expert vision assistant. Step 1 – Caption Provide **one concise sentence** that broadly describes the entire scene. Begin the line with: Caption:"
-                       " Step 2 - Foreground people & gaze:"
-                       " 1. Detect every person in the foreground of the image."
-                       " 2. List them **left‑to‑right**. Number sequentially starting at 1. For each person output exactly **one line** in this format: Person {N}: {short description}, looking at {target description | “outside the frame” | “uncertain”}. "
-                       "Output format (no extra lines, no prose other than what is specified): "
-                       "Caption: {your one‑sentence scene description} Person 1: {short description}, looking at {short description} .\n"
-                       " Person 2: {short description}, looking at {short description} .\n"
-                       " Additional rules • Keep the phrase **“looking at”** unchanged. • {short description} = ≤ 6 words (e.g., “man in red jacket”). • If no foreground person is detected, write exactly: `No foreground people detected.` • If gaze cannot be determined, use “uncertain”."
-                       " Do **not** output your reasoning or any extra text.")
-        args.prompt = ("Caption: <one short sentence about the whole image>"
-                       "For each large‑enough person in the foreground, from left to right:"
-                       "Person <#>: <short description>, looking at <object description | outside of frame | uncertain>"
-                       "If no foreground people: No foreground people detected.")
-        args.prompt = ("Describe the image and where each person is looking in the following format:"
-                       "Caption: <one short sentence about the whole image>"
-                       "For each large‑enough person in the foreground, from left to right:"
-                       "Person <#>: <short description>, looking at <object | outside of frame | uncertain>"
-                       "If no foreground people: No foreground people detected."
-                       "Always use 'looking at' to describe gaze direction.")
-        args.prompt = ("Complete the sentence. The man is looking at")
-        args.prompt = ("Describe the image.")
+        args.prompt = ("You are an expert vision assistant. \
+        Step 1 – Caption • Provide one concise sentence that broadly describes the entire scene. • Begin the line with:  Caption: \
+        Step 2 – Foreground people & gaze \
+            1. Detect every person whose height ≥ 5 % of the image (foreground). \
+            2. List them left‑to‑right. Number sequentially starting at 1. \
+                For each person output exactly one line in this format: \
+                Person {N}: {short description}, looking at {target | “outside the frame” | “uncertain”} Output format (no extra lines, no prose other than what is specified): \
+                    ------------------------------------------------- Caption: {your one‑sentence scene description} Person 1: {short description}, looking at … Person 2: {short description}, looking at … … ------------------------------------------------- \
+                       Additional rules • Keep the phrase “looking at” unchanged. • {short description} = ≤ 6 words (e.g., “man in red jacket”). • If no foreground person is detected, write exactly: No foreground people detected. • If gaze cannot be determined, use “uncertain”. • Do not output your reasoning or any extra text")
+        # args.prompt = ("Caption: <one short sentence about the whole image>"
+        #                "For each large‑enough person in the foreground, from left to right:"
+        #                "Person <#>: <short description>, looking at <object description | outside of frame | uncertain>"
+        #                "If no foreground people: No foreground people detected.")
+        # args.prompt = ("Describe the image and where each person is looking in the following format:"
+        #                "Caption: <one short sentence about the whole image>"
+        #                "For each large‑enough person in the foreground, from left to right:"
+        #                "Person <#>: <short description>, looking at <object | outside of frame | uncertain>"
+        #                "If no foreground people: No foreground people detected."
+        #                "Always use 'looking at' to describe gaze direction.")
+        # args.prompt = ("Complete the sentence. The man is looking at")
+        # args.prompt = ("Describe the image.")
         # args.prompt = ("Complete the sentence. The man is wearing a")
         # args.prompt = ("Complete the sentence. This area in the image has")
 
@@ -153,7 +153,8 @@ def main():
         if args.image_path != original_image_path:
              print(f"Fixed image_path: {args.image_path}")
     # ---
-
+    args.masks_dir = Path(args.gazefollow_dataset) / "train_gaze_segmentations" / "masks"
+    args.masks_dir.mkdir(parents=True, exist_ok=True)
     # Parse image extensions
     image_extensions = [ext.strip() if ext.startswith('.') else f'.{ext.strip()}'
                         for ext in args.image_extensions.split(',')]

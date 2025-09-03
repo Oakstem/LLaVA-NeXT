@@ -56,16 +56,19 @@ def fix_wsl_paths(path: str) -> str:
 # Suppress warnings
 # warnings.filterwarnings("ignore")
 
-def setup_environment(hostname: str) -> None:
-    """Setup environment variables based on hostname."""
-    if 'psychology' in hostname:
-        cache_dir = "/home/new_storage/HuggingFace_cache"
-        os.environ.update({
-            "HF_HOME": cache_dir,
-            "TRANSFORMERS_CACHE": cache_dir,
-            "HF_DATASETS_CACHE": cache_dir,
-            "HF_TOKENIZERS_CACHE": cache_dir
-        })
+# def setup_environment(hostname: str) -> None:
+#     """Setup environment variables based on hostname."""
+#     if 'psychology' in hostname:
+#         cache_dir = "/home/new_storage/HuggingFace_cache"
+#     else:
+cache_dir = "/galitylab/students/alonmardi/.cache"
+os.environ.update({
+        "HF_HOME": cache_dir,
+        "TRANSFORMERS_CACHE": cache_dir,
+        "HF_DATASETS_CACHE": cache_dir,
+        "HF_TOKENIZERS_CACHE": cache_dir
+    })
+
 
 def get_hostname() -> str:
     """Get the current hostname."""
@@ -785,8 +788,8 @@ def main() -> int:
     args = parser.parse_args()
 
     # Setup environment (optional, based on docs/clip_eval.py)
-    # hostname = get_hostname()
-    # setup_environment(hostname)
+    hostname = get_hostname()
+    setup_environment(hostname)
 
     # Optional: Disable init for faster loading
     # disable_torch_init()
