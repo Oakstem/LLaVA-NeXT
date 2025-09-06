@@ -16,15 +16,15 @@ from docs.research_utils import fix_wsl_paths
 import time
 
 
-annot_path = r"D:\Projects\data\gazefollow\test_annotations_release.txt"
-# annot_path = r"D:\Projects\data\gazefollow\train_annotations_release.txt"
+# annot_path = r"D:\Projects\data\gazefollow\test_annotations_release.txt"
+annot_path = r"D:\Projects\data\gazefollow\train_annotations_release.txt"
 base_data_dir_path = r"D:\Projects\data\gazefollow"
 llava_results_dir = r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\20250503_001255_You_are_an_expert_vision_assis"
-llava_results_dir = r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\201741_full\20250506_201741_Describe_the_image_and_where_e"
+llava_results_dir = r"D:\Projects\data\gazefollow\results\valid_runs\20250902_015248_00000001_00030291"
 llava_results_dir = Path(fix_wsl_paths(llava_results_dir))
 base_data_dir_path = Path(fix_wsl_paths(base_data_dir_path))
 annot_path = fix_wsl_paths(annot_path)
-
+results_path = llava_results_dir.parent / f"{llava_results_dir.name}_results.csv"
 #%% useful functions
 def filter_gaze_points(points, threshold_factor=1.5):
     """
@@ -227,8 +227,8 @@ for gaze_points_path in tqdm(llava_gaze_points):
     if image_name not in gaze_points_dd:
         gaze_points_dd[image_name] = {}
     gaze_points_dd[image_name][person_id] = gaze_point
-    # if len(gaze_points_dd.keys()) > 10:
-    #     break
+    if len(gaze_points_dd.keys()) > 10:
+        break
         
 
 #%% lets apply our median + mean filtering to extract a single center point for each person
@@ -251,8 +251,6 @@ for ind, row in enumerate(tqdm(llava_persons_segment)):
     image_id = row.stem.split('_')[0]
     person_data = json.load(open(row))
     person_bboxes[image_id] = {}
-    if image_id == '00000001':
-        p = 1
 
     # rename person_1 to 1
     person_keys = list(person_data.keys())
@@ -274,8 +272,8 @@ for ind, row in enumerate(tqdm(llava_persons_segment)):
     person_data['image_shape'] = (h, w)
     person_bboxes[image_id] = person_data
 
-    # if ind > 10:
-    #     break
+    if ind > 10:
+        break
 
 
 #%% Now lets go over the GT dataframe and add the resulted gaze points for each frame
@@ -378,9 +376,9 @@ for ind, row in tqdm(compact_df.iterrows()):
 print(f"average euclidean gaze error: {compact_df['gaze_error'].mean():.4f}")
 print(f"average angular gaze error: {compact_df['angular_gaze_error'].mean():.4f} degrees")
 #%% Save the results to a csv file
-output_path = llava_results_dir / "gaze_follow_results.csv"
-compact_df.to_csv(output_path, index=False)
-print(f"saved the results to {output_path}")
+# output_path = llava_results_dir / "gaze_follow_results.csv"
+compact_df.to_csv(results_path, index=False)
+print(f"saved the results to {results_path}")
 #%%
 # points_path = fix_wsl_paths(r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\20250503_001255_You_are_an_expert_vision_assis\00000001_attn\layer_23\each_person_attn_maps\person_1\gaze_target_1_attn_map_smooth_centers.pt")
 # gaze_points = torch.load(points_path)

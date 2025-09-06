@@ -273,9 +273,12 @@ def visualize_attention_with_centers(img_path, attn_map, centers, save_path, thr
     for center in resized_centers:
         cv2.circle(overlayed_img, tuple(center), 10, (0, 255, 0), -1)
 
+    # resize the result to small image size
+    small_img = cv2.resize(overlayed_img, (100, 100))
+
     # Save the result
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(save_path, cv2.cvtColor(overlayed_img, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(save_path, cv2.cvtColor(small_img, cv2.COLOR_RGB2BGR))
 
     return resized_centers, overlayed_img
 
