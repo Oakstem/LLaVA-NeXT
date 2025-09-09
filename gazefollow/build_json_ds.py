@@ -45,11 +45,6 @@ gazefollowing_results_df.index = gazefollowing_results_df["image_path"].str.spli
 steered_results_df["source_description"] = steered_results_df["generated_prompt"].str.split("looking at").str[0]
 steered_results_df["target_description"] = steered_results_df["generated_prompt"].str.split("looking at").str[1]
 
-#%% Load the person description data jsons into the gazefollowing_results_df
-def get_desc_files_paths(image_id):
-    desc_file_path = Path(f"{image_id}_attn") / "layer_23" / "person_description_text_data.json"
-    yield desc_file_path
-
 #%% Load all the description files
 desc_data = {}
 def load_description_file(image_id, person_description_data_dir):
@@ -146,17 +141,18 @@ for image_id, row in tqdm(gazefollowing_results_df.iterrows(), total=len(gazefol
 
     # Periodic saving
     if ind % periodic_save_every == 0:
-        gazefollowing_results_df.to_csv(periodic_save_path, index=True)
+        gazefollowing_results_df.to_csv(periodic_save_path, index=False)
         print(f"Periodic save at iteration {ind} to {periodic_save_path}")
 
     # if ind >= 100:     # testing
     #     break   
-gazefollowing_results_df.to_csv(periodic_save_path, index=True)
+gazefollowing_results_df.to_csv(periodic_save_path, index=False)
 print(f"Final save to {periodic_save_path}")
 
 # %% Lets combine the dataframes, prefering the gazefollowing_results_df person descriptions if available
 # join on the index (image id)
 gazefollowing_results_df = pd.read_csv(periodic_save_path, index_col=0)
+gazefollowing_results_df.index = gazefollowing_results_df['image_path'].str.split("/").str[-1].str.split(".").str[0]
 steered_prefixed = steered_results_df[["source_description", "target_description"]].add_prefix("steered_")
 combined_df = gazefollowing_results_df.join(steered_prefixed)
 

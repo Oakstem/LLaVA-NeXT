@@ -12,6 +12,9 @@ import argparse
 from pathlib import Path
 from multiprocessing import cpu_count
 from typing import Dict, Any, Optional
+# change working directory
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from docs.research_utils import fix_wsl_paths
 
 # Add the current directory to the Python path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -293,7 +296,7 @@ Examples:
 def main() -> int:
     """Main launcher entry point."""
     args = parse_launcher_arguments()
-    
+    args.input_dir = fix_wsl_paths(args.input_dir) if args.input_dir else None
     # Handle utility options
     if args.system_info:
         print_system_info()
