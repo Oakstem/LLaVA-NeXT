@@ -267,7 +267,8 @@ def main() -> None:
         dataset_path = fix_wsl_paths(r"E:\moments\Moments_in_Time_Raw\training")
         output_dir = fix_wsl_paths(r"D:\Projects\Annotators\data\moments")
         filt_csv_path = fix_wsl_paths(r"D:\Projects\Annotators\data\moments\llava_3s_moments_results_people_facing.csv")
-        csv_path = fix_wsl_paths(output_dir / 'llava_3s_moments_results_primitives2_w_gt.csv')
+        csv_path = Path(output_dir) / 'llava_3s_moments_results_primitives2_w_gt.csv'
+        csv_path = fix_wsl_paths(str(csv_path))
 
     # Setup directories and load model
     output_dir = Path(output_dir)

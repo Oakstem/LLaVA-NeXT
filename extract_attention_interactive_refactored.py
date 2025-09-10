@@ -692,7 +692,7 @@ def print_resume_usage_examples():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
-    parser.add_argument('--mode', type=str, default='batch', choices=['single', 'batch', 'sweep'],
+    parser.add_argument('--mode', type=str, default='sweep', choices=['single', 'batch', 'sweep'],
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
 
     # --- Model Loading Arguments ---
@@ -703,14 +703,15 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\dagta\gazefollow\train\00000001/00001719.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00001719_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\Summer\selected_frames\11865.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\summer\gaze__11865_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
     # parser.add_argument('--prompt', type=str, default="Describe the _ (object)", help="Input prompt.")
     parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
-    " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object  or person]. Repeat the sentence.' " \
+                        "Caption • Provide one concise sentence that broadly describes the entire scene. • Begin the line with:  Caption: \n" \
+    " Second, describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object  or person]. Repeat the sentence.' " \
     "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 

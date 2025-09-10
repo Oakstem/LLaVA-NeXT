@@ -1450,7 +1450,9 @@ def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    parsed_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+    model_args, data_args, training_args = parsed_args[:3]
+    
 
     if training_args.verbose_logging:
         rank0_print(f"Inspecting experiment hyperparameters:\n")
