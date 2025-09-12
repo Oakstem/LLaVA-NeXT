@@ -46,6 +46,8 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
+from llava.model.builder import load_pretrained_model
+from typing import Dict, Optional, Sequence, List, Any
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -132,6 +134,7 @@ class DataArguments:
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
+    image_processor: Optional[Any] = field(default=None, metadata={"help": "Image processor for processing images"})
 
 
 @dataclass
@@ -164,6 +167,8 @@ class TrainingArguments(transformers.TrainingArguments):
     gradient_checkpointing: bool = field(default=True)
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    bf16: bool = field(default=False, metadata={"help": "Whether to use bf16 training."})
+    fp16: bool = field(default=True, metadata={"help": "Whether to use fp16 training."})
 
 
 # @dataclass
@@ -1061,6 +1066,8 @@ class LazySupervisedDataset(Dataset):
         image_folder = self.data_args.image_folder
         processor = self.data_args.image_processor
         # print(f"\n\nInspecting the image path, folder = {image_folder}, image={image_file}\n\n")
+        if not image_file.endswith(".jpg"):
+            image_file = image_file + ".jpg"
         try:
             image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
         except Exception as exn:
@@ -1450,7 +1457,9 @@ def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    parsed_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+    model_args, data_args, training_args = parsed_args[:3]
+    
 
     if training_args.verbose_logging:
         rank0_print(f"Inspecting experiment hyperparameters:\n")
@@ -1483,7 +1492,18 @@ def train(attn_implementation=None):
             )
         )
 
-    model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    # model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    pretrained = "lmms-lab/llava-onevision-qwen2-7b-ov-chat"
+    model_name = "llava_qwen"
+    device = "cuda"
+    device_map = "auto"
+    llava_model_args = {
+        "multimodal": True,
+        "torch_dtype": "bfloat16" if training_args.bf16 else "float16" if training_args.fp16 else "float32",
+        # "attn_implementation": "sdpa",
+    }
+    tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, **llava_model_args)  # Add any other thing you want to pass in llava_model_args
+
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
@@ -1521,33 +1541,33 @@ def train(attn_implementation=None):
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
+        # if training_args.bits == 16:
+        #     if training_args.bf16:
+        #         model.to(torch.bfloat16)
+        #     if training_args.fp16:
+        #         model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
-    elif "qwen" in model_args.model_name_or_path.lower():
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right")
-    elif (
-        "wizardlm-2" in model_args.model_name_or_path.lower()
-        or "vicuna" in model_args.model_name_or_path.lower()
-        or "llama" in model_args.model_name_or_path.lower()
-        or "yi" in model_args.model_name_or_path.lower()
-        or "nous-hermes" in model_args.model_name_or_path.lower()
-        and "wizard-2" in model_args.model_name_or_path.lower()
-    ):
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=False,
-        )
+    # if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
+    #     tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
+    # elif "qwen" in model_args.model_name_or_path.lower():
+    #     tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right")
+    # elif (
+    #     "wizardlm-2" in model_args.model_name_or_path.lower()
+    #     or "vicuna" in model_args.model_name_or_path.lower()
+    #     or "llama" in model_args.model_name_or_path.lower()
+    #     or "yi" in model_args.model_name_or_path.lower()
+    #     or "nous-hermes" in model_args.model_name_or_path.lower()
+    #     and "wizard-2" in model_args.model_name_or_path.lower()
+    # ):
+    #     tokenizer = transformers.AutoTokenizer.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         cache_dir=training_args.cache_dir,
+    #         model_max_length=training_args.model_max_length,
+    #         padding_side="right",
+    #         use_fast=False,
+    #     )
 
     rank0_print(f"Prompt version: {model_args.version}")
     if model_args.version == "v0":
@@ -1566,12 +1586,14 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
-
+    
+    model_args.vision_tower = True
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
-        vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        # vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16)
 
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
@@ -1674,7 +1696,7 @@ def train(attn_implementation=None):
         model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
-        model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+        # model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)        # todo: test if this really required
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

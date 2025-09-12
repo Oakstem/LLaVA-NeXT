@@ -1,4 +1,5 @@
 import os
+import inspect
 import torch
 import torch.nn as nn
 import datetime
@@ -246,11 +247,40 @@ class LLaVATrainer(Trainer):
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         rank0_print("Setting NCCL timeout to INF to avoid running errors.")
+    
+        grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
+        grad_acc_kwargs["sync_with_dataloader"] = False
+        gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs)
 
-        # create accelerator object
-        self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
-        )
+        accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+        rank0_print("Setting NCCL timeout to INF to avoid running errors.")
+
+        # Build accelerator parameters based on what's supported in this version
+        accelerator_params = {
+            "deepspeed_plugin": self.args.deepspeed_plugin,
+            "gradient_accumulation_plugin": gradient_accumulation_plugin,
+            "kwargs_handlers": [accelerator_kwargs]
+        }
+        
+        # Check which parameters are supported in this accelerate version
+        accelerator_signature = inspect.signature(Accelerator.__init__).parameters
+        
+        # Add parameters conditionally based on what's available
+        if "dispatch_batches" in accelerator_signature:
+            accelerator_params["dispatch_batches"] = getattr(self.args, "dispatch_batches", None)
+        
+        if "split_batches" in accelerator_signature:
+            accelerator_params["split_batches"] = getattr(self.args, "split_batches", False)
+        
+        # In newer versions, gradient_accumulation_steps is passed directly instead of through plugin
+        if "gradient_accumulation_steps" in accelerator_signature:
+            accelerator_params["gradient_accumulation_steps"] = self.args.gradient_accumulation_steps
+            # Remove the plugin if we're using the direct parameter
+            if "gradient_accumulation_plugin" in accelerator_params:
+                del accelerator_params["gradient_accumulation_plugin"]
+            
+            # Create accelerator object
+        self.accelerator = Accelerator(**accelerator_params)
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
 
@@ -461,6 +491,27 @@ class LLaVATrainer(Trainer):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+    def _move_model_to_device(self, model: nn.Module, device: torch.device) -> None:
+        """
+        Move model to device, handling meta tensors properly.
+        """
+        try:
+            # Check if any parameters are meta tensors
+            has_meta_params = any(param.is_meta for param in model.parameters())
+            
+            if has_meta_params:
+                # Use to_empty() for meta tensors
+                model = model.to_empty(device=device)
+            else:
+                # Use standard to() for regular tensors
+                model = model.to(device)
+        except (RuntimeError, NotImplementedError) as e:
+            if "meta tensor" in str(e).lower():
+                # Fallback to to_empty() if meta tensor error occurs
+                model = model.to_empty(device=device)
+            else:
+                raise e
 
 
 class LLaVADPOTrainer(DPOTrainer):
