@@ -447,10 +447,15 @@ def process_batch_from_json(
     bias_range: Optional[np.ndarray] = None,
     resume_from_dir: Optional[Union[str, Path]] = None,
     use_person_descriptions: bool = False,
-    json_path: Optional[Union[str, Path]] = None
+    json_path: Optional[Union[str, Path]] = None,
+    start_from: Optional[str] = None
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process multiple images, performing bias sweeps for each image.
+
+    Args:
+        start_from: Optional image ID (stem name without extension) to start processing from,
+                   skipping all images that come before it in sorted order.
 
     Notes:
         - If use_person_descriptions is True and json_path is provided, descriptions are
@@ -459,6 +464,7 @@ def process_batch_from_json(
           descriptions are left empty.
         - json_path is optional and only used when use_person_descriptions is True.
         - By default, person descriptions are not used.
+        - start_from filtering is applied after resume logic but before processing begins.
     """
     # Handle resume functionality
     all_image_results: Dict[str, Any] = {}
@@ -510,10 +516,41 @@ def process_batch_from_json(
             print(f"Final results saved to: {final_path}")
             return all_image_results
 
+    # Filter images based on start_from argument
+    original_image_count = len(person_desc_data)
+    if start_from:
+        # Convert to list to maintain order and find start index
+        image_keys = list(person_desc_data.keys())
+        start_index = None
+        
+        # Find the index of the image to start from
+        for i, image_key in enumerate(image_keys):
+            # Extract stem from the image key (handle both Path objects and strings)
+            if isinstance(image_key, Path):
+                image_stem = image_key.stem
+            else:
+                image_stem = Path(image_key).stem
+            
+            if image_stem == start_from:
+                start_index = i
+                break
+        
+        if start_index is not None:
+            # Keep only images from start_index onwards
+            filtered_keys = image_keys[start_index:]
+            person_desc_data = {key: person_desc_data[key] for key in filtered_keys}
+            print(f"Starting from image '{start_from}' - skipping {start_index} image(s)")
+        else:
+            print(f"Warning: Image with ID '{start_from}' not found. Processing all images.")
+
     # Report resume status
     total_images = len(full_entries_before_resume)
     completed_count = len(all_image_results)
     remaining_count = len(person_desc_data)
+    
+    if start_from:
+        print(f"START-FROM STATUS: Found {original_image_count} total image(s), processing {remaining_count} image(s) starting from '{start_from}'")
+    
     if resume_from_dir:
         print(f"RESUME STATUS: {completed_count}/{total_images} images completed, {remaining_count} remaining")
     else:
@@ -666,7 +703,7 @@ def run_bias_sweep_experiment(
 def print_resume_usage_examples():
     """Print usage examples for the resume functionality."""
     print("\n" + "="*80)
-    print("RESUME FUNCTIONALITY USAGE EXAMPLES:")
+    print("RESUME AND START-FROM FUNCTIONALITY USAGE EXAMPLES:")
     print("="*80)
     print("1. Resume a previous batch run:")
     print("   python extract_attention_interactive_refactored.py --mode batch \\")
@@ -675,12 +712,32 @@ def print_resume_usage_examples():
     print("          --base_image_dir /path/to/images \\")
     print("          --base_mask_dir /path/to/masks")
     print()
-    print("2. The script will automatically:")
+    print("2. Start processing from a specific image (useful for partial reprocessing):")
+    print("   python extract_attention_interactive_refactored.py --mode batch \\")
+    print("          --start_from image_12345 \\")
+    print("          --json_path /path/to/data.json \\")
+    print("          --base_image_dir /path/to/images \\")
+    print("          --base_mask_dir /path/to/masks")
+    print()
+    print("3. Combine resume and start-from (resume first, then apply start-from filter):")
+    print("   python extract_attention_interactive_refactored.py --mode batch \\")
+    print("          --resume_from_dir /path/to/previous/run/output \\")
+    print("          --start_from image_12345 \\")
+    print("          --json_path /path/to/data.json \\")
+    print("          --base_image_dir /path/to/images \\")
+    print("          --base_mask_dir /path/to/masks")
+    print()
+    print("4. Resume functionality will automatically:")
     print("   - Load the most recent batch_bias_sweep_results_*.json file")
     print("   - Determine which images were already processed")
     print("   - Continue processing only the remaining images")
     print()
-    print("3. Example directory structure for resuming:")
+    print("5. Start-from functionality will:")
+    print("   - Skip all images that come before the specified image ID in sorted order")
+    print("   - Use the image stem (filename without extension) for matching")
+    print("   - Work with both resume and fresh processing")
+    print()
+    print("6. Example directory structure for resuming:")
     print("   /previous/run/output/")
     print("   ├── batch_bias_sweep_results_20250714_123456.json  <- Resume from here")
     print("   ├── image1/")
@@ -692,7 +749,7 @@ def print_resume_usage_examples():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
-    parser.add_argument('--mode', type=str, default='sweep', choices=['single', 'batch', 'sweep'],
+    parser.add_argument('--mode', type=str, default='batch', choices=['single', 'batch', 'sweep'],
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
 
     # --- Model Loading Arguments ---
@@ -703,15 +760,14 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\Summer\selected_frames\11865.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\summer\gaze__11865_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000001.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000001_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
     # parser.add_argument('--prompt', type=str, default="Describe the _ (object)", help="Input prompt.")
     parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
-                        "Caption • Provide one concise sentence that broadly describes the entire scene. • Begin the line with:  Caption: \n" \
-    " Second, describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object  or person]. Repeat the sentence.' " \
+    " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \
     "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
@@ -723,6 +779,7 @@ if __name__ == '__main__':
     # parser.add_argument('--resume_from_dir', type=str, default=r"D:\Projects\LLaVA-NeXT\attention_output\refactored_experiment_20250714_000947", help="Path to previous run directory to resume batch processing from.")
     parser.add_argument('--resume_from_dir', default=False, help="Path to previous run directory to resume batch processing from.")
     parser.add_argument('--use_person_descriptions', action='store_true', help="Use person descriptions from JSON file in prompts.")
+    parser.add_argument('--start_from', type=str, default=None, help="Image ID (stem name without extension) to start processing from, skipping all images that come before it in sorted order.")
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
@@ -832,6 +889,7 @@ if __name__ == '__main__':
             resume_from_dir=args.resume_from_dir,
             prompt_template=args.prompt,
             use_person_descriptions=args.use_person_descriptions,
+            start_from=args.start_from,
         )
 
     elif args.mode == 'sweep':
