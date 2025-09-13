@@ -23,6 +23,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from generation_utils import (
+    enable_inference_optimizations,
     load_model_and_setup,
     fix_wsl_paths,
     _prepare_configs,
@@ -466,6 +467,10 @@ def process_batch_from_json(
         - By default, person descriptions are not used.
         - start_from filtering is applied after resume logic but before processing begins.
     """
+    # Generate unique run ID for this batch processing session
+    from datetime import datetime
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     # Handle resume functionality
     all_image_results: Dict[str, Any] = {}
     if resume_from_dir:
@@ -511,9 +516,9 @@ def process_batch_from_json(
         person_desc_data = get_remaining_images(person_desc_data, all_image_results)
         if not person_desc_data:
             print("All images already processed! Nothing to resume.")
-            summary_results = summarize_batch_results(all_image_results)
-            final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
-            print(f"Final results saved to: {final_path}")
+            # Don't save summary again if resuming and all processed, 
+            # as individual results were already appended during original processing
+            print("All processing already complete.")
             return all_image_results
 
     # Filter images based on start_from argument
@@ -617,12 +622,21 @@ def process_batch_from_json(
         all_image_results[image_key] = result_entry
 
         # Save individual image results
-        saved_path = save_image_results(result_entry, output_dir)
+        saved_path = save_image_results(result_entry, output_dir, append_mode=True, run_id=run_id)
         print(f"Results for {image_key} saved to: {saved_path}")
 
-        # Update and save batch summary after each image
-        summary_results = summarize_batch_results(all_image_results)
-        final_path = save_image_results(summary_results, base_output_dir, prefix="batch_bias_sweep_results")
+        # Append only the current image's summary to the batch file
+        current_image_summary = {
+            image_key: {
+                "prompt_used": result_entry.get("prompt_used"),
+                "generated_prompt": (result_entry["bias_sweep_results"][result_entry["best_bias_strength"]].get("generated_text") 
+                                   if result_entry["best_bias_strength"] and result_entry["best_bias_strength"] in result_entry.get("bias_sweep_results", {}) 
+                                   else None),
+                "best_bias_strength": result_entry.get("best_bias_strength"),
+                "processing_timestamp": result_entry.get("processing_timestamp"),
+            }
+        }
+        final_path = save_image_results(current_image_summary, base_output_dir, prefix="batch_bias_sweep_results", append_mode=True, run_id=run_id)
 
     if final_path is not None:
         print(f"\nBATCH BIAS SWEEP PROCESSING COMPLETE. Final results saved to: {final_path}")
@@ -748,6 +762,8 @@ def print_resume_usage_examples():
 
 
 if __name__ == '__main__':
+    enable_inference_optimizations()
+    
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
     parser.add_argument('--mode', type=str, default='batch', choices=['single', 'batch', 'sweep'],
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
@@ -769,7 +785,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
     " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \
     "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
-    parser.add_argument('--output_dir', type=str, default=f"attention_output/refactored_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
+    parser.add_argument('--output_dir', type=str, default=f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
     # --- Batch Processing Arguments ---
     parser.add_argument('--json_path', type=str, default=None, help="Path to the JSON file with image descriptions for batch processing.")
@@ -801,7 +817,7 @@ if __name__ == '__main__':
     parser.add_argument('--early_stopping', action='store_true', help="Enable early stopping in beam search.")
 
     args = parser.parse_args()
-
+    args.output_dir = Path(fix_wsl_paths(args.base_image_dir)).parent / 'results' / 'steered_generation' / Path(args.output_dir).name
     # Show resume examples if requested
     if args.show_resume_examples:
         print_resume_usage_examples()
