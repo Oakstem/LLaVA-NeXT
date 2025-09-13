@@ -40,7 +40,6 @@ chunyl_scripts
 # Demo
 serve_images/
 notebooks/
-logs
 scripts/dist_*
 logs/
 submissions/
@@ -71,3 +70,4 @@ playground/*.json
 mlx_configs/
 data_processing/
 # demo/
+training_outputs/

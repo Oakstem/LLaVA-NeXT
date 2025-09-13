@@ -13,28 +13,44 @@
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
-# Load necessary modules (adjust based on your cluster)
-module load cuda/11.8
-module load python/3.10
+# # Load necessary modules (adjust based on your cluster)
+# module load cuda/11.8
+# module load python/3.10
 
+echo "Activating virtual environment..."
+source /galitylab/students/alonmardi/llava/bin/activate
 # Activate virtual environment
-source ~/llava/bin/activate
+# source ~/llava/bin/activate
 
+# Verify activation
+which python
+python --version
+
+
+# Print machine IP address
+echo "Machine IP Address:"
+hostname -I
+
+# Verify GPU availability
+echo "GPU Information:"
+nvidia-smi
+
+export PYTHONPATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT:$PYTHONPATH"
 # Set environment variables and run training
-cd /mnt/d/Projects/LLaVA-NeXT && \
-export PYTHONPATH="${PYTHONPATH}:/mnt/d/Projects/LLaVA-NeXT" && \
-~/llava/bin/python llava/train/train.py \
+cd /galitylab/students/alonmardi/projects/LLaVA-NeXT && \
+python llava/train/train.py \
   --model_name_or_path "lmms-lab/llava-onevision-qwen2-7b-ov-chat" \
-  --data_path "/mnt/d/Projects/data/gazefollow/results/valid_runs/sgl_conversation_data.json" \
-  --output_dir "/mnt/d/Projects/LLaVA-NeXT/training_outputs" \
+  --data_path "/galitylab/students/alonmardi/projects/LLaVA-NeXT/datasets/sgl_conversation_data.json" \
+  --output_dir "/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs" \
   --lora_enable True \
   --lora_r 4 \
   --lora_alpha 16 \
   --lora_target_modules "lm_head" \
-  --num_train_epochs 1 \
+  --num_train_epochs 5 \
   --per_device_train_batch_size 1 \
   --save_steps 100 \
   --logging_steps 10 \
-  --image_folder "/mnt/d/Projects/data/gazefollow"
+  --image_folder "/galitylab/students/alonmardi/gazefollow" \
+  --bf16
 
 echo "Gazefollow training completed at $(date)"

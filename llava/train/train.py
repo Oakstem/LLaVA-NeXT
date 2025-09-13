@@ -167,8 +167,8 @@ class TrainingArguments(transformers.TrainingArguments):
     gradient_checkpointing: bool = field(default=True)
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
-    bf16: bool = field(default=False, metadata={"help": "Whether to use bf16 training."})
-    fp16: bool = field(default=True, metadata={"help": "Whether to use fp16 training."})
+    bf16: bool = field(default=True, metadata={"help": "Whether to use bf16 training."})
+    fp16: bool = field(default=False, metadata={"help": "Whether to use fp16 training."})
 
 
 # @dataclass
