@@ -38,6 +38,22 @@ from generation_metrics import (
     analyze_generation_quality, calculate_attention_correlation_from_similarity
 )
 
+def enable_inference_optimizations() -> None:
+    """Enable tf32 and other CUDA optimizations for faster inference"""
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping inference optimizations")
+        return
+    
+    # Enable tf32 for faster inference on Ampere GPUs
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    print("tf32 enabled for faster inference")
+    
+    # Additional inference optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+    print("CUDNN optimizations enabled for inference")
+
 def normalize_embedding(embedding: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     Normalize an embedding vector to unit length (L2 norm).
@@ -966,7 +982,7 @@ def visualize_embedding_similarity(
             torch.zeros(padding_size, device=similarity_scores.device)
         ])
     
-    similarity_map = similarity_scores.reshape(grid_size, grid_size).cpu().numpy()
+    similarity_map = similarity_scores.reshape(grid_size, grid_size).cpu().float().numpy()
     
     # Find top-k similarity values and their positions
     flat_map = similarity_map.flatten()
@@ -1079,6 +1095,43 @@ def save_results_to_json(results: Dict[str, Any], output_path: Union[str, Path])
 
     print(f"Saved results to {output_path}")
 
+
+def append_results_to_json(results: Dict[str, Any], output_path: Union[str, Path]) -> None:
+    """Append results to an existing JSON file or create a new one if it doesn't exist.
+    
+    The file will contain a JSON array where each element is a result entry.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Convert to JSON-serializable format
+    serializable_results = _make_json_serializable(results)
+    
+    # Read existing data if file exists
+    existing_data = []
+    if output_path.exists():
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content:
+                    existing_data = json.loads(content)
+                    if not isinstance(existing_data, list):
+                        # If existing file is not a list, wrap it in a list
+                        existing_data = [existing_data]
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not read existing file {output_path}: {e}")
+            print("Creating new file...")
+            existing_data = []
+    
+    # Append new results
+    existing_data.append(serializable_results)
+    
+    # Write back to file
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(existing_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"Appended results to {output_path} (entry #{len(existing_data)})")
+
 # Helper Functions for Generation Process
 
 def _prepare_configs(generation_config: Optional[Dict], attention_config: Optional[Dict]) -> Tuple[Dict, Dict]:
@@ -1100,7 +1153,7 @@ def _prepare_configs(generation_config: Optional[Dict], attention_config: Option
         "create_collage": True,
         "collage_grid_rows": 3,
         "collage_grid_cols": 4,
-        "visualize_attn_overlays": True,
+        "visualize_attn_overlays": False,
         "save_tensors": False
     }
 
@@ -1158,8 +1211,8 @@ def _prepare_inputs(
     # Ensure batch dimension
     if image_tensor.ndim == 3:
         image_tensor = image_tensor.unsqueeze(0)
-    # Move to device and cast to float16
-    image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+    # Move to device and cast to model's dtype
+    image_tensor = image_tensor.to(model.device, dtype=model.dtype)
 
     # Get attention indices from mask
     atten_indices, target_mask = get_attention_indices_from_mask(
@@ -1325,7 +1378,7 @@ def _extract_and_process_attention(
             torch.zeros(padding_size, device=token_attention_to_image.device)
         ])
 
-    attention_map = token_attention_to_image.reshape(grid_size, grid_size).cpu().numpy()
+    attention_map = token_attention_to_image.reshape(grid_size, grid_size).cpu().float().numpy()
     processed_img = None
 
     # Save visualizations
@@ -1662,14 +1715,36 @@ def create_experiment_config(
 def save_image_results(
     results: Dict[str, Any],
     output_dir: Union[str, Path],
-    prefix: str = "bias_sweep_results"
+    prefix: str = "bias_sweep_results",
+    append_mode: bool = False,
+    run_id: Optional[str] = None
 ) -> Path:
-    """Save individual image results to a timestamped JSON."""
+    """Save individual image results to a JSON file. 
+    
+    Args:
+        results: Results to save
+        output_dir: Directory to save results to
+        prefix: Prefix for the filename
+        append_mode: If True, append to existing file instead of creating new timestamped file
+        run_id: Optional run identifier. If not provided and append_mode is True, uses current timestamp
+    """
     output_dir = Path(output_dir)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = output_dir / f"{prefix}_{timestamp}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    save_results_to_json(results, path)
+    
+    if append_mode:
+        # Use single file per run for appending
+        if run_id is None:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = output_dir / f"{prefix}_{run_id}.json"
+        
+        # Append to existing JSON array or create new one
+        append_results_to_json(results, path)
+    else:
+        # Original behavior: create timestamped file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = output_dir / f"{prefix}_{timestamp}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_results_to_json(results, path)
+    
     return path
 
     

@@ -860,9 +860,10 @@ class Qwen2DecoderLayer(nn.Module):
                 #     np.c_[np.where(attention_mask.cpu().numpy().squeeze() >=0)].tofile(f"attention_mask_{self._attn_mask_ind}.csv", sep=",")
                 #     print(f"Attention mask saved to attention_mask_{self._attn_mask_ind}.csv")
 
-                not_masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() >= 0)
-                masked_positions = np.count_nonzero(attention_mask.cpu().numpy().squeeze() < 0)
-                ratio = masked_positions / (masked_positions + not_masked_positions)
+                # attention_mask_np = attention_mask.cpu().float().numpy().squeeze()
+                # not_masked_positions = np.count_nonzero(attention_mask_np >= 0)
+                # masked_positions = np.count_nonzero(attention_mask_np < 0)
+                # ratio = masked_positions / (masked_positions + not_masked_positions)
                 # print(f"Attention mask ratio: {ratio:.2f} (masked: {masked_positions}, not masked: {not_masked_positions})")
             
         # Self Attention
