@@ -118,7 +118,7 @@ def run_generation_with_attention(
     gen_config, attn_config = _prepare_configs(generation_config, attention_config)
     mask_path = fix_wsl_paths(str(mask_path))
     image_path = fix_wsl_paths(str(image_path))
-    mask_embedding_path = mask_path.replace("masks.npy", "_target_embeddings.pt")
+    # mask_embedding_path = mask_path.replace("masks.npy", "_target_embeddings.pt")
 
     # target_mask_embedding = torch.load(mask_embedding_path) if Path(mask_embedding_path).exists() else None
     # if target_mask_embedding is not None:
@@ -761,7 +761,7 @@ if __name__ == '__main__':
 
     # --- Single Experiment Arguments ---
     parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000001.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks\gaze__00000001_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks\gaze__00000001_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
@@ -774,7 +774,7 @@ if __name__ == '__main__':
     # --- Batch Processing Arguments ---
     parser.add_argument('--json_path', type=str, default=None, help="Path to the JSON file with image descriptions for batch processing.")
     parser.add_argument('--base_image_dir', type=str, default=r"D:\Projects\data\gazefollow\train", help="Base directory for images in batch mode.")
-    parser.add_argument('--base_mask_dir', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\masks", help="Base directory for masks in batch mode.")
+    parser.add_argument('--base_mask_dir', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks", help="Base directory for masks in batch mode.")
     parser.add_argument('--limit_items', type=int, default=None, help="Limit the number of items to process in batch mode.")
     # parser.add_argument('--resume_from_dir', type=str, default=r"D:\Projects\LLaVA-NeXT\attention_output\refactored_experiment_20250714_000947", help="Path to previous run directory to resume batch processing from.")
     parser.add_argument('--resume_from_dir', default=False, help="Path to previous run directory to resume batch processing from.")

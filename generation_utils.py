@@ -590,7 +590,11 @@ def load_mask_from_file(mask_path: Union[str, Path]) -> np.ndarray:
         # Handle pickled dict format
         mask_dict = mask_data.item()
         if 'static_masks' in mask_dict:
-            mask = mask_dict['static_masks'][0]  # Take first mask
+            if mask_dict['static_masks'].shape[1] == 2:
+                # new format with direct [x,y] indices
+                mask = mask_dict['static_masks']
+            else:
+                mask = mask_dict['static_masks'][0]  # Take first mask
         elif 'masks' in mask_dict:
             mask = mask_dict['masks'][0]
         else:
@@ -727,7 +731,13 @@ def get_attention_indices_from_mask(
     apply_for_anyres_patches: bool = True
 ) -> Tuple[List[int], np.ndarray]:
     """Convert mask pixels to token indices."""
-    mask_coords = np.argwhere(mask)
+    if mask.shape[1] == 2:
+        # new mask format, we get the coordinates directly, the <x, y> pairs
+        mask_coords = mask.reshape(-1, 2)
+        # flip x and y to row and column
+        mask_coords = mask_coords[:, [1, 0]]
+    else:
+        mask_coords = np.argwhere(mask)
     print(f"Mask coordinates shape: {mask_coords.shape}")
 
     # Get attention indices from pixel coordinates
