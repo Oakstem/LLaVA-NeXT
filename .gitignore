@@ -84,3 +84,5 @@ attention_output
 *.npy
 *.zip
 training_outputs/
+*.out
+*.err
