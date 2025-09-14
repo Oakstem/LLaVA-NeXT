@@ -571,6 +571,9 @@ def load_model_and_setup(
 # Helper Functions
 def fix_wsl_paths(path: str) -> str:
     """Convert Windows paths to WSL paths if necessary."""
+    if not isinstance(path, str):
+        path = str(path)
+        
     if path.startswith('/mnt/'):
         return path
     path = path.replace("\\", os.sep)

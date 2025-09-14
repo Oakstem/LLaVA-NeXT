@@ -359,6 +359,7 @@ def main():
                        help="Number of bias steps")
     
     args = parser.parse_args()
+    args.output_dir = Path(fix_wsl_paths(args.base_image_dir)).parent / 'results' / 'steered_generation' / Path(args.output_dir).name
     
     # Setup paths
     output_dir = Path(fix_wsl_paths(args.output_dir))
