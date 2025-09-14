@@ -927,6 +927,8 @@ class Qwen2DecoderLayer(nn.Module):
         if attention_mask is None:
             attention_mask = torch.zeros(bsz, 1, q_len, kv_seq_len, device=position_ids.device, dtype=torch.float32)
 
+        add_bias_mat = torch.zeros_like(attention_mask, device=attention_mask.device, dtype=attention_mask.dtype)
+        
         if position_ids is not None and bias_positions:
             # Convert bias_positions to tensors for vectorized operations
             q_positions = torch.tensor([pos[0] for pos in bias_positions], device=position_ids.device)
@@ -960,15 +962,14 @@ class Qwen2DecoderLayer(nn.Module):
             # else:
             #     bias_strength = self.bias_strength
             bias_strength = self.bias_strength
-            add_bias_mat = torch.zeros_like(attention_mask, device=attention_mask.device, dtype=attention_mask.dtype)
             # Initialize with negative bias strength
             # float_neg_inf = torch.tensor(float('-65504.'), dtype=attention_mask.dtype, device=attention_mask.device)
             # float_neg_inf = torch.tensor(-self.bias_strength, dtype=attention_mask.dtype, device=attention_mask.device)
             # todo: k_positions (boosted positions) are having too large indices (larger than the full sequence length)
             add_bias_mat[0, 0, q_positions, k_positions] = 2*bias_strength
             # Add to attention mask
-            save_path = Path(f"atten_mask_images/attention_mask_{int(time.time())}_{self._attn_mask_ind}.png")
-            save_path.parent.mkdir(parents=True, exist_ok=True)
+            # save_path = Path(f"atten_mask_images/attention_mask_{int(time.time())}_{self._attn_mask_ind}.png")
+            # save_path.parent.mkdir(parents=True, exist_ok=True)
             # attention_mask = attention_mask + 2*add_bias_mat
             # attention_mask = attention_mask + add_bias_mat
             # self._save_attention_mask_image(attention_mask, save_path)
