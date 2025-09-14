@@ -55,35 +55,68 @@ def worker_function(
     """Worker function that processes a batch of images."""
     
     print(f"Worker {worker_id}: Starting with {len(image_batch)} images")
+    print(f"Worker {worker_id}: PID = {os.getpid()}")
     
-    # Import inside worker to avoid CUDA context issues
-    from extract_attention_interactive_refactored import (
-        load_model_and_setup, 
-        run_bias_sweep_experiment, 
-        enable_inference_optimizations,
-        create_experiment_config
-    )
+    try:
+        # Import inside worker to avoid CUDA context issues
+        print(f"Worker {worker_id}: Importing required modules...")
+        from extract_attention_interactive_refactored import (
+            load_model_and_setup, 
+            run_bias_sweep_experiment, 
+            enable_inference_optimizations,
+            create_experiment_config
+        )
+        print(f"Worker {worker_id}: Modules imported successfully")
+    except Exception as e:
+        print(f"Worker {worker_id}: ERROR importing modules: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "worker_id": worker_id,
+            "error": f"Import error: {e}",
+            "results": {},
+            "processed_count": 0,
+            "failed_images": []
+        }
     
-    # Enable optimizations and set GPU
-    enable_inference_optimizations()
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    
-    # Load model
-    print(f"Worker {worker_id}: Loading model...")
-    model_config = {
-        "model_path": base_args["model_path"],
-        "attn_implementation": base_args["attn_implementation"],
-        "load_4bit": base_args["load_4bit"],
-        "load_8bit": base_args["load_8bit"],
-        "attn_layer_ind": base_args["attn_layer_ind"]
-    }
-    
-    tokenizer, model, image_processor, max_length = load_model_and_setup(**model_config)
-    print(f"Worker {worker_id}: Model loaded successfully")
+    try:
+        # Enable optimizations and set GPU
+        print(f"Worker {worker_id}: Setting up optimizations...")
+        enable_inference_optimizations()
+        
+        # Add a small delay to stagger worker GPU access
+        time.sleep(worker_id * 2)  # Each worker waits a bit longer
+        
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        
+        # Load model
+        print(f"Worker {worker_id}: Loading model...")
+        model_config = {
+            "model_path": base_args["model_path"],
+            "attn_implementation": base_args["attn_implementation"],
+            "load_4bit": base_args["load_4bit"],
+            "load_8bit": base_args["load_8bit"],
+            "attn_layer_ind": base_args["attn_layer_ind"]
+        }
+        
+        tokenizer, model, image_processor, max_length = load_model_and_setup(**model_config)
+        print(f"Worker {worker_id}: Model loaded successfully")
+    except Exception as e:
+        print(f"Worker {worker_id}: ERROR loading model: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "worker_id": worker_id,
+            "error": f"Model loading error: {e}",
+            "results": {},
+            "processed_count": 0,
+            "failed_images": []
+        }
     
     # Create worker output directory
     worker_output_dir = output_dir / f"worker_{worker_id}"
     worker_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Worker {worker_id}: Output directory created at {worker_output_dir}")
     
     # Process each image in the batch
     worker_results = {}
@@ -92,55 +125,71 @@ def worker_function(
     for idx, (image_key, subject_description) in enumerate(image_batch):
         print(f"Worker {worker_id}: Processing image {idx+1}/{len(image_batch)} - {image_key}")
         
-        # Find image and mask paths
-        image_path = find_image_path(image_key, base_args["base_image_dir"])
-        mask_path = find_mask_path(image_key, base_args["base_mask_dir"])
-        
-        if not image_path or not mask_path:
-            print(f"Worker {worker_id}: Could not find files for {image_key}")
+        try:
+            # Find image and mask paths
+            image_path = find_image_path(image_key, base_args["base_image_dir"])
+            mask_path = find_mask_path(image_key, base_args["base_mask_dir"])
+            
+            if not image_path or not mask_path:
+                print(f"Worker {worker_id}: Could not find files for {image_key}")
+                print(f"Worker {worker_id}: Image path: {image_path}")
+                print(f"Worker {worker_id}: Mask path: {mask_path}")
+                failed_images.append(image_key)
+                continue
+            
+            # Build prompt
+            if base_args["use_person_descriptions"] and subject_description:
+                prompt = f"The {subject_description} is looking at"
+            else:
+                prompt = base_args["prompt"]
+            
+            # Create experiment config and run bias sweep
+            experiment_config = create_experiment_config(
+                image_path=str(image_path),
+                mask_path=str(mask_path),
+                prompt=prompt,
+                output_dir=str(worker_output_dir / image_key),
+                generation_config=base_args["generation_config"],
+                attention_config=base_args["attention_config"]
+            )
+            
+            image_results = run_bias_sweep_experiment(
+                base_experiment_config=experiment_config,
+                model=model,
+                tokenizer=tokenizer,
+                image_processor=image_processor,
+                bias_range=base_args["bias_range"],
+                save_summary=True,
+                use_gaze_guidance=base_args.get("use_gaze_guidance", True),
+                guidance_config=base_args.get("guidance_config"),
+                beam_search_config=base_args.get("beam_search_config")
+            )
+            
+            worker_results[image_key] = {
+                "bias_sweep_results": image_results,
+                "image_path": str(image_path),
+                "mask_path": str(mask_path),
+                "prompt": prompt,
+                "subject_description": subject_description
+            }
+            print(f"Worker {worker_id}: Successfully processed {image_key}")
+            
+        except Exception as e:
+            print(f"Worker {worker_id}: ERROR processing {image_key}: {e}")
+            import traceback
+            traceback.print_exc()
             failed_images.append(image_key)
-            continue
-        
-        # Build prompt
-        if base_args["use_person_descriptions"] and subject_description:
-            prompt = f"The {subject_description} is looking at"
-        else:
-            prompt = base_args["prompt"]
-        
-        # Create experiment config and run bias sweep
-        experiment_config = create_experiment_config(
-            image_path=str(image_path),
-            mask_path=str(mask_path),
-            prompt=prompt,
-            output_dir=str(worker_output_dir / image_key),
-            generation_config=base_args["generation_config"],
-            attention_config=base_args["attention_config"]
-        )
-        
-        image_results = run_bias_sweep_experiment(
-            base_experiment_config=experiment_config,
-            model=model,
-            tokenizer=tokenizer,
-            image_processor=image_processor,
-            bias_range=base_args["bias_range"],
-            save_summary=True,
-            use_gaze_guidance=base_args.get("use_gaze_guidance", True),
-            guidance_config=base_args.get("guidance_config"),
-            beam_search_config=base_args.get("beam_search_config")
-        )
-        
-        worker_results[image_key] = {
-            "bias_sweep_results": image_results,
-            "image_path": str(image_path),
-            "mask_path": str(mask_path),
-            "prompt": prompt,
-            "subject_description": subject_description
-        }
     
     # Save worker results
-    results_file = worker_output_dir / "worker_results.json"
-    with open(results_file, 'w') as f:
-        json.dump(convert_numpy_types(worker_results), f, indent=2)
+    try:
+        results_file = worker_output_dir / "worker_results.json"
+        with open(results_file, 'w') as f:
+            json.dump(convert_numpy_types(worker_results), f, indent=2)
+        print(f"Worker {worker_id}: Results saved to {results_file}")
+    except Exception as e:
+        print(f"Worker {worker_id}: ERROR saving results: {e}")
+        import traceback
+        traceback.print_exc()
     
     print(f"Worker {worker_id}: Completed! Processed {len(worker_results)} images, {len(failed_images)} failed")
     
@@ -149,7 +198,8 @@ def worker_function(
         "results": worker_results,
         "processed_count": len(worker_results),
         "failed_images": failed_images,
-        "results_file": str(results_file)
+        "results_file": str(results_file) if 'results_file' in locals() else None,
+        "error": None
     }
 
 
@@ -231,18 +281,33 @@ def run_parallel_processing(
     print(f"\nStarting {num_workers} worker processes...")
     start_time = time.time()
     
-    with mp.Pool(processes=num_workers) as pool:
-        worker_args = [
-            (i, worker_batches[i], base_args, output_dir)
-            for i in range(num_workers)
-        ]
-        
-        worker_results = pool.starmap(worker_function, worker_args)
+    try:
+        with mp.Pool(processes=num_workers) as pool:
+            worker_args = [
+                (i, worker_batches[i], base_args, output_dir)
+                for i in range(num_workers)
+            ]
+            
+            print(f"Worker arguments prepared:")
+            for i, (worker_id, batch, _, _) in enumerate(worker_args):
+                print(f"  Worker {worker_id}: {len(batch)} images")
+            
+            worker_results = pool.starmap(worker_function, worker_args)
+    except Exception as e:
+        print(f"ERROR in multiprocessing pool: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Multiprocessing error: {e}"}
     
     end_time = time.time()
     total_time = end_time - start_time
     
     print(f"\nAll workers completed in {total_time:.1f} seconds!")
+    
+    # Check for worker errors
+    for result in worker_results:
+        if result.get("error"):
+            print(f"Worker {result['worker_id']} had an error: {result['error']}")
     
     return merge_results(worker_results, output_dir, total_time)
 
@@ -255,11 +320,19 @@ def merge_results(worker_results: List[Dict], output_dir: Path, total_time: floa
     merged_results = {}
     total_processed = 0
     all_failed_images = []
+    worker_errors = []
     
     for result in worker_results:
-        merged_results.update(result["results"])
-        total_processed += result["processed_count"]
-        all_failed_images.extend(result["failed_images"])
+        if result.get("error"):
+            worker_errors.append({
+                "worker_id": result["worker_id"],
+                "error": result["error"]
+            })
+            print(f"Worker {result['worker_id']} had error: {result['error']}")
+        else:
+            merged_results.update(result.get("results", {}))
+            total_processed += result.get("processed_count", 0)
+            all_failed_images.extend(result.get("failed_images", []))
     
     # Save merged results
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -279,11 +352,13 @@ def merge_results(worker_results: List[Dict], output_dir: Path, total_time: floa
         "total_time_seconds": total_time,
         "avg_time_per_image": total_time / total_processed if total_processed > 0 else 0,
         "failed_images": all_failed_images,
+        "worker_errors": worker_errors,
         "worker_summary": [
             {
                 "worker_id": r["worker_id"],
-                "processed": r["processed_count"],
-                "failed": len(r["failed_images"])
+                "processed": r.get("processed_count", 0),
+                "failed": len(r.get("failed_images", [])),
+                "error": r.get("error")
             }
             for r in worker_results
         ]
@@ -306,7 +381,13 @@ def merge_results(worker_results: List[Dict], output_dir: Path, total_time: floa
     print(f"Summary saved to: {summary_file}")
     
     for worker_summary in summary["worker_summary"]:
-        print(f"Worker {worker_summary['worker_id']}: {worker_summary['processed']} processed, {worker_summary['failed']} failed")
+        status = f" (ERROR: {worker_summary['error']})" if worker_summary['error'] else ""
+        print(f"Worker {worker_summary['worker_id']}: {worker_summary['processed']} processed, {worker_summary['failed']} failed{status}")
+    
+    if worker_errors:
+        print(f"\nWorker errors ({len(worker_errors)}):")
+        for error in worker_errors:
+            print(f"  Worker {error['worker_id']}: {error['error']}")
     
     if all_failed_images:
         print(f"\nFailed images ({len(all_failed_images)}): {all_failed_images[:10]}{'...' if len(all_failed_images) > 10 else ''}")
