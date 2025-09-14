@@ -84,8 +84,33 @@ def worker_function(
         print(f"Worker {worker_id}: Setting up optimizations...")
         enable_inference_optimizations()
         
-        # Add a small delay to stagger worker GPU access
-        time.sleep(worker_id * 2)  # Each worker waits a bit longer
+        # File-based synchronization to prevent GPU conflicts
+        sync_dir = output_dir / "worker_sync"
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        worker_ready_file = sync_dir / f"worker_{worker_id}_ready.txt"
+        
+        # Add a longer delay to stagger worker GPU access more aggressively
+        delay = worker_id * 30  # 30 seconds between workers
+        print(f"Worker {worker_id}: Waiting {delay} seconds to stagger GPU access...")
+        time.sleep(delay)
+        
+        # Wait for previous worker to finish loading (if any)
+        if worker_id > 0:
+            prev_worker_file = sync_dir / f"worker_{worker_id - 1}_ready.txt"
+            wait_time = 0
+            while not prev_worker_file.exists() and wait_time < 300:  # Wait max 5 minutes
+                print(f"Worker {worker_id}: Waiting for worker {worker_id - 1} to finish loading... ({wait_time}s)")
+                time.sleep(10)
+                wait_time += 10
+            
+            if wait_time >= 300:
+                print(f"Worker {worker_id}: WARNING - Previous worker didn't signal ready, proceeding anyway")
+        
+        # Force garbage collection before GPU access
+        import gc
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
         
         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
         
@@ -101,6 +126,21 @@ def worker_function(
         
         tokenizer, model, image_processor, max_length = load_model_and_setup(**model_config)
         print(f"Worker {worker_id}: Model loaded successfully")
+        
+        # Additional cleanup after model loading
+        torch.cuda.empty_cache()
+        print(f"Worker {worker_id}: GPU cache cleared after model loading")
+        
+        # Quick test to ensure model is working
+        print(f"Worker {worker_id}: Testing model readiness...")
+        print(f"Worker {worker_id}: Model device: {next(model.parameters()).device}")
+        print(f"Worker {worker_id}: Model is ready for inference")
+        
+        # Signal that this worker is ready
+        with open(worker_ready_file, 'w') as f:
+            f.write(f"Worker {worker_id} ready at {time.time()}")
+        print(f"Worker {worker_id}: Signaled ready for processing")
+        
     except Exception as e:
         print(f"Worker {worker_id}: ERROR loading model: {e}")
         import traceback
@@ -114,16 +154,34 @@ def worker_function(
         }
     
     # Create worker output directory
-    worker_output_dir = output_dir / f"worker_{worker_id}"
-    worker_output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Worker {worker_id}: Output directory created at {worker_output_dir}")
+    try:
+        worker_output_dir = output_dir / f"worker_{worker_id}"
+        worker_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Worker {worker_id}: Output directory created at {worker_output_dir}")
+    except Exception as e:
+        print(f"Worker {worker_id}: ERROR creating output directory: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "worker_id": worker_id,
+            "error": f"Directory creation error: {e}",
+            "results": {},
+            "processed_count": 0,
+            "failed_images": []
+        }
     
     # Process each image in the batch
     worker_results = {}
     failed_images = []
     
+    print(f"Worker {worker_id}: Starting image processing loop with {len(image_batch)} images")
+    
     for idx, (image_key, subject_description) in enumerate(image_batch):
         print(f"Worker {worker_id}: Processing image {idx+1}/{len(image_batch)} - {image_key}")
+        
+        # Add a heartbeat every 10 images to confirm worker is alive
+        if idx > 0 and idx % 10 == 0:
+            print(f"Worker {worker_id}: HEARTBEAT - Processed {idx} images so far")
         
         try:
             # Find image and mask paths
