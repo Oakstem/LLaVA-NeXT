@@ -19,8 +19,8 @@ import time
 # annot_path = r"D:\Projects\data\gazefollow\test_annotations_release.txt"
 annot_path = r"D:\Projects\data\gazefollow\train_annotations_release.txt"
 base_data_dir_path = r"D:\Projects\data\gazefollow"
-llava_results_dir = r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\20250503_001255_You_are_an_expert_vision_assis"
-llava_results_dir = r"D:\Projects\data\gazefollow\results\valid_runs\20250902_015248_00000001_00030291"
+# llava_results_dir = r"D:\Projects\LLaVA-NeXT\llava_attention_sweep\20250503_001255_You_are_an_expert_vision_assis"
+llava_results_dir = r"D:\Projects\data\gazefollow\results\valid_runs\combined_ppl_desc"
 llava_results_dir = Path(fix_wsl_paths(llava_results_dir))
 base_data_dir_path = Path(fix_wsl_paths(base_data_dir_path))
 annot_path = fix_wsl_paths(annot_path)
@@ -218,17 +218,17 @@ for gaze_points_path in tqdm(llava_gaze_points):
     # gaze_points_path = llava_gaze_points[0]
     gaze_filename = gaze_points_path.stem
     # load the gaze points
-    gaze_points = torch.load(gaze_points_path)
+    gaze_points = torch.load(gaze_points_path, weights_only=False)
     # get the gaze points
-    gaze_point = torch.load(gaze_points_path)['centers']
+    gaze_point = torch.load(gaze_points_path, weights_only=False)['centers']
     # get the image name
     image_name = [val.split('_')[0] for val in gaze_points_path.parts if val.endswith('_attn')][0]
     person_id = gaze_filename.split('_')[2]
     if image_name not in gaze_points_dd:
         gaze_points_dd[image_name] = {}
     gaze_points_dd[image_name][person_id] = gaze_point
-    if len(gaze_points_dd.keys()) > 10:
-        break
+    # if len(gaze_points_dd.keys()) > 10:
+    #     break
         
 
 #%% lets apply our median + mean filtering to extract a single center point for each person
@@ -272,8 +272,8 @@ for ind, row in enumerate(tqdm(llava_persons_segment)):
     person_data['image_shape'] = (h, w)
     person_bboxes[image_id] = person_data
 
-    if ind > 10:
-        break
+    # if ind > 10:
+    #     break
 
 
 #%% Now lets go over the GT dataframe and add the resulted gaze points for each frame

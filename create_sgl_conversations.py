@@ -15,6 +15,7 @@ from generation_utils import fix_wsl_paths
 
 
 COMBINED_CSV_PATH = r"D:\Projects\data\gazefollow\results\valid_runs\combined_description_results.csv"
+# COMBINED_CSV_PATH = r"/mnt/d/Projects/data/gazefollow/results/valid_runs/combined_ppl_desc_results.csv"
 COMBINED_CSV_PATH = fix_wsl_paths(COMBINED_CSV_PATH)
 OUTPUT_FILE_PATH = Path(COMBINED_CSV_PATH).parent / "sgl_conversation_data.json"
 # Base path for the image field in the output JSON
@@ -70,7 +71,7 @@ def cleanup_temp_files():
     for temp_file in temp_dir.glob(temp_pattern):
         try:
             temp_file.unlink()
-            print(f"Cleaned up temporary file: {temp_file}")
+            # print(f"Cleaned up temporary file: {temp_file}")
         except Exception as e:
             print(f"Warning: Could not remove temporary file {temp_file}: {e}")
 
