@@ -34,7 +34,7 @@ from llava.model.llava_arch import unpad_image
 # Import our enhanced generation metrics
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
-    generate_next_token_with_evaluation,
+    generate_next_token_with_evaluation, create_generation_summary,
     analyze_generation_quality, calculate_attention_correlation_from_similarity
 )
 
@@ -1910,3 +1910,303 @@ def get_image_files(
         return []
 
     return filter_and_limit_files(image_files, filter_keys, limit_items)
+
+
+# ============================================================================
+# Refactored utility functions for run_generation_with_attention
+# ============================================================================
+
+def initialize_generation_state(
+    gen_config: Dict[str, Any],
+    tokenizer: "PreTrainedTokenizer",
+    input_ids: torch.Tensor
+) -> Dict[str, Any]:
+    """
+    Initialize the generation state variables.
+    
+    Args:
+        gen_config: Generation configuration dictionary
+        tokenizer: Model tokenizer
+        input_ids: Initial input token IDs
+        
+    Returns:
+        Dictionary containing initialized state variables
+    """
+    eos_token_id = tokenizer.eos_token_id
+    if isinstance(eos_token_id, list):
+        eos_token_id = eos_token_id[0]
+    
+    return {
+        "max_new_tokens": gen_config["max_new_tokens"],
+        "generated_ids": [],
+        "past_key_values": None,
+        "current_input_ids": input_ids,
+        "confidence_tracker": ConfidenceMetrics(),
+        "repetitivity_tracker": RepetitivityMetrics(window_size=10),
+        "candidate_evaluator": TopKCandidateEvaluator(k=5, tokenizer=tokenizer),
+        "all_step_metrics": [],
+        "all_attention_maps": [],
+        "eos_token_id": eos_token_id,
+        "target_tokens": 0,
+        "image_embeddings": None,
+        "first_step_hidden_state": None,
+        "set_layer_image_embeddings": None,  # Store embeddings from first step for reuse
+        "all_correlation_metrics": [],
+        "person_mask_correlation_metrics": [],
+        "apply_only_target_mask": False
+    }
+
+
+def process_hidden_states_and_embeddings(
+    outputs: Any,
+    attn_config: Dict[str, Any],
+    image_token_start_index_in_llm: int,
+    num_patches: int,
+    model: "PreTrainedModel",
+    state: Dict[str, Any]
+) -> Optional[torch.Tensor]:
+    """
+    Process hidden states and extract image embeddings on first step only.
+    
+    Args:
+        outputs: Model outputs containing hidden states
+        attn_config: Attention configuration
+        image_token_start_index_in_llm: Start index of image tokens
+        num_patches: Number of image patches
+        model: The language model
+        state: Generation state dictionary (modified in place)
+        
+    Returns:
+        Image embeddings for similarity computation (only on first step, None afterwards)
+    """
+    if not outputs.hidden_states:
+        return None
+        
+    last_hidden_state = outputs.hidden_states[-1].squeeze(0)
+    
+    if state["image_embeddings"] is None:  # First step only
+        # Store the first step hidden state for later output
+        state["first_step_hidden_state"] = last_hidden_state
+        state["image_embeddings"] = last_hidden_state[
+            image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches
+        ]
+        
+        # Get embeddings from specified layer for similarity computation
+        # This will be reused for all subsequent steps
+        set_layer_hidden_state = outputs.hidden_states[-1].squeeze(0)
+        set_layer_image_embeddings = set_layer_hidden_state[
+            image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches
+        ]
+        
+        # Store these embeddings for reuse in all steps
+        state["set_layer_image_embeddings"] = set_layer_image_embeddings
+        
+        return set_layer_image_embeddings
+    
+    # For subsequent steps, return the stored embeddings from first step
+    return state.get("set_layer_image_embeddings", None)
+
+
+def create_similarity_visualization(
+    set_layer_image_embeddings: Optional[torch.Tensor],
+    next_token_id: torch.Tensor,
+    model: "PreTrainedModel",
+    image: Image.Image,
+    grid_size: Tuple[int, int],
+    similarity_output_dir: Path,
+    step: int,
+    token_text: str
+) -> Optional[np.ndarray]:
+    """
+    Create and save embedding similarity visualization.
+    
+    Args:
+        set_layer_image_embeddings: Image embeddings from specific layer
+        next_token_id: Generated token ID
+        model: The language model
+        image: Original image
+        grid_size: Grid dimensions for visualization
+        similarity_output_dir: Output directory for similarity maps
+        step: Current generation step
+        token_text: Generated token text
+        
+    Returns:
+        Similarity map array or None if no embeddings provided
+    """
+    if set_layer_image_embeddings is None:
+        return None
+        
+    try:
+        safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text) or f"tokenid_{next_token_id.item()}"
+        sim_path = similarity_output_dir / f"similarity_{step:03d}_{safe_token_text}.png"
+        
+        # Convert embeddings to token space for similarity computation
+        tmp_image_embeddings_converted = model.get_model().embed_tokens(
+            torch.argmax(model.get_output_embeddings()(set_layer_image_embeddings), dim=-1)
+        )
+        tmp_text_embedding_converted = model.get_model().embed_tokens(next_token_id).squeeze(0)
+        
+        similarity_map = visualize_embedding_similarity(
+            text_token_embedding=tmp_text_embedding_converted,
+            image_token_embeddings=tmp_image_embeddings_converted,
+            original_image=image,
+            grid_size=grid_size,
+            output_path=sim_path,
+        )
+        
+        return similarity_map
+    except Exception as e:
+        print(f"Warning: Failed to create similarity visualization: {e}")
+        return None
+
+
+def calculate_correlation_metrics(
+    state: Dict[str, Any],
+    input_masks: Dict[str, Any],
+    similarity_map: Optional[np.ndarray],
+    step: int,
+    token_text: str,
+    person_mask_indices: List[int],
+    atten_indices: List[int]
+) -> None:
+    """
+    Calculate and store correlation metrics for person and target masks.
+    
+    Args:
+        state: Generation state dictionary (modified in place)
+        input_masks: Dictionary containing mask data
+        similarity_map: Text-to-image similarity matrix
+        step: Current generation step
+        token_text: Generated token text
+        person_mask_indices: Indices for person mask
+        atten_indices: Indices for attention target mask
+    """
+    # Calculate person mask correlation before switching to target mask
+    if (not state["apply_only_target_mask"] and 
+        state["all_attention_maps"] and 
+        len(person_mask_indices) > 0 and
+        similarity_map is not None):
+        
+        person_attention_correlation = calculate_attention_correlation_from_similarity(
+            text_to_image_similarity_matrix=similarity_map,
+            attention_mask=input_masks.get('person_mask', None),
+            attention_map=state["all_attention_maps"][-1] if state["all_attention_maps"] else None
+        )
+        state["person_mask_correlation_metrics"].append({
+            'step': step,
+            'token': token_text,
+            'mask_type': 'person_source',
+            **person_attention_correlation
+        })
+
+    # Calculate target mask correlation after switching to target mode
+    if (state["all_attention_maps"] and 
+        len(atten_indices) > 0 and 
+        state["apply_only_target_mask"] and 
+        similarity_map is not None and
+        token_text.lower().strip() not in ['at', 'looking', 'is', 'a', 'an']):
+        
+        attention_correlation = calculate_attention_correlation_from_similarity(
+            text_to_image_similarity_matrix=similarity_map,
+            attention_mask=input_masks.get('target_mask', None),
+        )
+        state["all_correlation_metrics"].append({
+            'step': step,
+            'token': token_text,
+            'mask_type': 'target',
+            **attention_correlation
+        })
+
+
+def update_generation_state(
+    state: Dict[str, Any],
+    next_token_id: torch.Tensor,
+    token_text: str,
+    outputs: Any,
+    attention_map: Optional[np.ndarray]
+) -> None:
+    """
+    Update generation state with new token and attention information.
+    
+    Args:
+        state: Generation state dictionary (modified in place)
+        next_token_id: Generated token ID
+        token_text: Generated token text
+        outputs: Model outputs
+        attention_map: Processed attention map
+    """
+    # Update token tracking
+    if state["apply_only_target_mask"]:
+        state["target_tokens"] += 1
+
+    # Check for transition to target mask mode
+    if 'looking' in token_text.lower():
+        state["apply_only_target_mask"] = True
+
+    # Add token to generated sequence
+    state["generated_ids"].append(next_token_id.item())
+
+    # Store attention map if available
+    if attention_map is not None:
+        state["all_attention_maps"].append(attention_map)
+
+    # Update model state for next iteration
+    state["current_input_ids"] = next_token_id.view(1, -1)
+    state["past_key_values"] = outputs.past_key_values
+
+
+def create_generation_results(
+    state: Dict[str, Any],
+    tokenizer: "PreTrainedTokenizer",
+    output_directories: Dict[str, str],
+    gen_config: Dict[str, Any],
+    attn_config: Dict[str, Any],
+    guidance_config: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Create the final results dictionary from generation state.
+    
+    Args:
+        state: Generation state dictionary
+        tokenizer: Model tokenizer
+        output_directories: Dictionary of output directory paths
+        gen_config: Generation configuration
+        attn_config: Attention configuration
+        guidance_config: Guidance configuration
+        
+    Returns:
+        Complete results dictionary
+    """
+    final_text = tokenizer.decode(state["generated_ids"], skip_special_tokens=True).strip()
+    
+    generation_summary, quality_analysis = None, None
+    if state["all_step_metrics"]:
+        generation_summary = create_generation_summary(
+            state["confidence_tracker"], 
+            state["repetitivity_tracker"], 
+            state["candidate_evaluator"],
+            final_text, 
+            state["all_step_metrics"], 
+            state["all_correlation_metrics"],
+            person_mask_correlation_metrics=state["person_mask_correlation_metrics"]
+        )
+        quality_analysis = analyze_generation_quality(generation_summary)
+
+    return {
+        "generated_text": final_text,
+        "generated_tokens": state["generated_ids"],
+        "num_tokens": len(state["generated_ids"]),
+        "output_directories": output_directories,
+        "config_used": {
+            "generation": gen_config,
+            "attention": attn_config,
+            "guidance": guidance_config,
+        },
+        "evaluation_summary": generation_summary,
+        "quality_analysis": quality_analysis,
+        "attention_correlation": generation_summary.get("average_attention_correlation", {}) if generation_summary else {},
+        "person_mask_correlation": state["person_mask_correlation_metrics"],
+        "target_mask_correlation": state["all_correlation_metrics"],
+        "step_metrics": state["all_step_metrics"],
+        "first_step_hidden_state": state["first_step_hidden_state"],
+    }

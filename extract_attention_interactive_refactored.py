@@ -56,6 +56,13 @@ from generation_utils import (
     build_stem_index,
     map_person_desc_to_paths,
     get_image_files,
+    # Refactored utility functions
+    initialize_generation_state,
+    process_hidden_states_and_embeddings,
+    create_similarity_visualization,
+    calculate_correlation_metrics,
+    update_generation_state,
+    create_generation_results,
 )
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
@@ -105,234 +112,159 @@ def run_generation_with_attention(
     bias_strength: float = 0.0,
     prev_run_last_hidden_state: Optional[torch.Tensor] = None,
     break_after_first_step: bool = False,
-    use_gaze_guidance: bool = True,  # New parameter
-    guidance_config: Optional[Dict[str, Any]] = None,  # New parameter
+    use_gaze_guidance: bool = True,
+    guidance_config: Optional[Dict[str, Any]] = None,
     beam_search_config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Run generation with attention extraction and optional gaze guidance.
 
     Args:
-        use_gaze_guidance: Enable gaze-guided token selection based on similarity to target area
+        image_path: Path to input image
+        mask_path: Path to attention mask file
+        prompt: Input text prompt
+        output_dir: Directory for saving outputs
+        model: Pre-trained language model
+        tokenizer: Model tokenizer
+        image_processor: Image preprocessing component
+        generation_config: Generation parameters
+        attention_config: Attention extraction parameters
+        bias_strength: Strength of attention bias
+        prev_run_last_hidden_state: Hidden state from previous run
+        break_after_first_step: Stop generation after first token
+        use_gaze_guidance: Enable gaze-guided token selection
         guidance_config: Configuration for gaze guidance behavior
+        beam_search_config: Configuration for beam search (unused)
+
+    Returns:
+        Dictionary containing generation results and analysis
     """
+    # Prepare configurations and paths
     gen_config, attn_config = _prepare_configs(generation_config, attention_config)
     mask_path = fix_wsl_paths(str(mask_path))
     image_path = fix_wsl_paths(str(image_path))
-    # mask_embedding_path = mask_path.replace("masks.npy", "_target_embeddings.pt")
-
-    # target_mask_embedding = torch.load(mask_embedding_path) if Path(mask_embedding_path).exists() else None
-    # if target_mask_embedding is not None:
-    #     print(f"Using existing mask embedding from {mask_embedding_path}")
 
     print(f"Processing image: {image_path}")
     print(f"Using mask: {mask_path}")
     print(f"Prompt: {prompt}")
     print(f"Gaze guidance enabled: {use_gaze_guidance}")
 
-    output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir = _setup_output_directories(output_dir)
+    # Setup output directories
+    output_directories = _setup_output_directories(output_dir)
+    (output_dir, vis_output_dir_raw, vis_output_dir_processed, 
+     tensor_output_dir, collage_output_dir, similarity_output_dir) = output_directories
 
-    (
-        image,
-        input_masks,
-        image_tensor,
-        image_sizes,
-        atten_indices,
-        person_mask_indices,
-        input_ids,
-    ) = _prepare_inputs(
-        image_path,
-        mask_path,
-        prompt,
-        image_processor,
-        tokenizer,
-        model,
+    # Prepare inputs
+    (image, input_masks, image_tensor, image_sizes, atten_indices,
+     person_mask_indices, input_ids) = _prepare_inputs(
+        image_path, mask_path, prompt, image_processor, tokenizer, model
     )
 
+    # Setup model configuration
     boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
-    #todo: remove:
-    # boost_positions = {'gaze_source': atten_indices, 'gaze_target': person_mask_indices}
     num_patches, grid_size, image_token_start_index_in_llm, image_token_end_index_in_llm = _determine_image_patch_info(model, input_ids)
 
+    # Initialize generation state
     print("Starting generation with attention extraction and advanced evaluation...")
-    max_new_tokens = gen_config["max_new_tokens"]
-    generated_ids = []
-    past_key_values = None
-    current_input_ids = input_ids
-    collected_maps = []
-    confidence_tracker = ConfidenceMetrics()
-    repetitivity_tracker = RepetitivityMetrics(window_size=10)
-    candidate_evaluator = TopKCandidateEvaluator(k=5, tokenizer=tokenizer)
-    all_step_metrics = []
-    all_attention_maps = []
-    eos_token_id = tokenizer.eos_token_id
+    state = initialize_generation_state(gen_config, tokenizer, input_ids)
 
-    if isinstance(eos_token_id, list):
-        eos_token_id = eos_token_id[0]
-    target_tokens = 0
-    image_embeddings = None
-    first_step_hidden_state = None # To store the first step's hidden state for later output
-    all_correlation_metrics = []
-    person_mask_correlation_metrics = []  # Track person mask correlations before target switch
-    apply_only_target_mask = False
-
-    for i in range(max_new_tokens):
+    # Main generation loop
+    for i in range(state["max_new_tokens"]):
         with torch.inference_mode():
+            # Prepare model inputs
             model_inputs = {
-                "input_ids": current_input_ids, "past_key_values": past_key_values, "use_cache": True,
-                "output_attentions": True, "output_hidden_states": True, "atten_ids": None,
-                "boost_positions": boost_positions, "bias_strength": bias_strength,
+                "input_ids": state["current_input_ids"],
+                "past_key_values": state["past_key_values"],
+                "use_cache": True,
+                "output_attentions": True,
+                "output_hidden_states": True,
+                "atten_ids": None,
+                "boost_positions": boost_positions,
+                "bias_strength": bias_strength,
                 "query_indices": attn_config.get("query_indices", None),
-                "target_mask_embedding": prev_run_last_hidden_state,        # target_mask_embedding
+                "target_mask_embedding": prev_run_last_hidden_state,
                 "base_image_token_inds": [image_token_start_index_in_llm, image_token_start_index_in_llm + num_patches],
                 "input_masks": input_masks,
-                'apply_only_target_mask': apply_only_target_mask,
-                "target_tokens": target_tokens,
+                "apply_only_target_mask": state["apply_only_target_mask"],
+                "target_tokens": state["target_tokens"],
             }
             if i == 0:
                 model_inputs.update({"images": image_tensor, "image_sizes": image_sizes, "modalities": ["image"]})
 
-            # Use enhanced generation with gaze guidance
+            # Generate next token with gaze guidance
             next_token_id, token_text, outputs, evaluation_metrics = generate_next_token_with_gaze_guidance(
                 model_inputs, model, tokenizer, gen_config,
-                confidence_tracker, repetitivity_tracker, candidate_evaluator, i,
-                image_embeddings=image_embeddings,
-                target_mask=input_masks.get('target_mask', None) if apply_only_target_mask else None,
-                source_mask=input_masks.get('person_mask', None) if not apply_only_target_mask else None,
-                apply_only_target_mask=apply_only_target_mask,
+                state["confidence_tracker"], state["repetitivity_tracker"], 
+                state["candidate_evaluator"], i,
+                image_embeddings=state["image_embeddings"],
+                target_mask=input_masks.get('target_mask', None) if state["apply_only_target_mask"] else None,
+                source_mask=input_masks.get('person_mask', None) if not state["apply_only_target_mask"] else None,
+                apply_only_target_mask=state["apply_only_target_mask"],
                 guidance_config=guidance_config
             )
-            all_step_metrics.append(evaluation_metrics)
+            state["all_step_metrics"].append(evaluation_metrics)
 
-            if apply_only_target_mask:
-                target_tokens += 1
+            # Process hidden states and extract embeddings
+            set_layer_image_embeddings = process_hidden_states_and_embeddings(
+                outputs, attn_config, image_token_start_index_in_llm, 
+                num_patches, model, state
+            )
 
-            if 'looking' in token_text.lower():
-                # move to target attention mask boost (instead of gaze source)
-                apply_only_target_mask = True
+            # Create similarity visualization
+            similarity_map = create_similarity_visualization(
+                set_layer_image_embeddings, next_token_id, model, image,
+                grid_size, similarity_output_dir, i, token_text
+            )
 
-
-            generated_ids.append(next_token_id.item())
-
-            if outputs.hidden_states:
-                last_hidden_state = outputs.hidden_states[-1].squeeze(0)
-                text_embedding = last_hidden_state[-1]
-                text_embedding = outputs.hidden_states[attn_config["layer_idx"]].squeeze(0)[-1]
-                if image_embeddings is None:    # happens only on the first step
-                    # Store the first step (last) hidden state for later output
-                    first_step_hidden_state = last_hidden_state
-                    first_step_all_layers = outputs.hidden_states
-                    image_embeddings = last_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
-                    set_layer_hidden_state = outputs.hidden_states[26].squeeze(0)
-                    set_layer_hidden_state = outputs.hidden_states[-1].squeeze(0)       # test only, remove once done
-                    set_layer_image_embeddings = set_layer_hidden_state[image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches]
-                    # set_layer_last_token_embedding = set_layer_hidden_state[-1]
-
-                safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text) or f"tokenid_{next_token_id.item()}"
-
-                similarity_map = None
-
-                # if apply_only_target_mask:
-                    # if token_text.lower().strip() not in ['at', 'looking', 'is', 'a', 'an']:
-                sim_path = similarity_output_dir / f"similarity_{i:03d}_{safe_token_text}.png"
-                tmp_image_embeddings_converted = model.get_model().embed_tokens(torch.argmax(model.get_output_embeddings()(set_layer_image_embeddings), dim=-1))
-                tmp_text_embedding_converted = model.get_model().embed_tokens(next_token_id).squeeze(0)
-                similarity_map = visualize_embedding_similarity(
-                    text_token_embedding=tmp_text_embedding_converted,
-                    image_token_embeddings=tmp_image_embeddings_converted,
-                    original_image=image,
-                grid_size=grid_size,
-                output_path=sim_path,
-                # threshold_value=0.3
-                )
-
-            # Call the logging function and break if EOS
-            if log_generation_step(i, token_text, evaluation_metrics, next_token_id, eos_token_id):
+            # Check for early termination
+            if log_generation_step(i, token_text, evaluation_metrics, next_token_id, state["eos_token_id"]):
                 break
 
+            # Extract and process attention
             processed_img, attention_map = _extract_and_process_attention(
-                outputs, next_token_id, token_text, i, num_patches, grid_size, image_token_start_index_in_llm,
-                image, attn_config, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir
+                outputs, next_token_id, token_text, i, num_patches, grid_size, 
+                image_token_start_index_in_llm, image, attn_config, 
+                vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir
             )
-            if attention_map is not None:
-                all_attention_maps.append(attention_map)
 
-            current_input_ids = next_token_id.view(1, -1)
-            past_key_values = outputs.past_key_values
+            # Calculate correlation metrics
+            calculate_correlation_metrics(
+                state, input_masks, similarity_map, i, token_text,
+                person_mask_indices, atten_indices
+            )
 
-            # Calculate person mask correlation before switching to target mask
-            if not apply_only_target_mask and all_attention_maps and len(person_mask_indices) > 0:
-                # Use the most recent attention map for person correlation
-                person_attention_correlation = calculate_attention_correlation_from_similarity(
-                    text_to_image_similarity_matrix=similarity_map,
-                    attention_mask=input_masks.get('person_mask', None),
-                    attention_map=all_attention_maps[-1] if all_attention_maps else None
-                )
-                person_mask_correlation_metrics.append({
-                    'step': i,
-                    'token': token_text,
-                    'mask_type': 'person_source',
-                    **person_attention_correlation
-                })
-
-            if all_attention_maps and len(atten_indices) > 0 and apply_only_target_mask and similarity_map is not None \
-            and token_text.lower().strip() not in ['at', 'looking', 'is', 'a', 'an']:
-                attention_correlation = calculate_attention_correlation_from_similarity(
-                    text_to_image_similarity_matrix=similarity_map,
-                    attention_mask=input_masks.get('target_mask', None),
-                )
-                all_correlation_metrics.append({
-                    'step': i,
-                    'token': token_text,
-                    # 'correlation': attention_correlation,
-                    'mask_type': 'target',
-                    **attention_correlation
-                })
+            # Update generation state
+            update_generation_state(state, next_token_id, token_text, outputs, attention_map)
 
             if break_after_first_step:
                 print("Breaking after the first step as requested.")
                 break
 
-    final_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-    generation_summary, quality_analysis = None, None
-    if all_step_metrics:
-        generation_summary = create_generation_summary(
-            confidence_tracker, repetitivity_tracker, candidate_evaluator,
-            final_text, all_step_metrics, all_correlation_metrics,
-            person_mask_correlation_metrics=person_mask_correlation_metrics
-        )
-        quality_analysis = analyze_generation_quality(generation_summary)
-
-    # Final summary printing would go here
-    print_summary(generation_summary, quality_analysis, final_text, generated_ids, output_dir)
-
-    return {
-        "generated_text": final_text,
-        "generated_tokens": generated_ids,
-        "num_tokens": len(generated_ids),
-        "output_directories": {
-            "main": str(output_dir),
-            "raw_attention": str(vis_output_dir_raw),
-            "processed_attention": str(vis_output_dir_processed),
-            "embedding_similarity": str(similarity_output_dir),
-            "tensors": str(tensor_output_dir),
-            "collages": str(collage_output_dir),
-        },
-        "config_used": {
-            "generation": gen_config,
-            "attention": attn_config,
-            "guidance": guidance_config,
-        },
-        "evaluation_summary": generation_summary,
-        "quality_analysis": quality_analysis,
-        "attention_correlation": generation_summary.get(
-            "average_attention_correlation", {}
-        ),
-        "person_mask_correlation": person_mask_correlation_metrics,
-        "target_mask_correlation": all_correlation_metrics,
-        "step_metrics": all_step_metrics,
-        "first_step_hidden_state": first_step_hidden_state,
+    # Create final results
+    output_directories_dict = {
+        "main": str(output_dir),
+        "raw_attention": str(vis_output_dir_raw),
+        "processed_attention": str(vis_output_dir_processed),
+        "embedding_similarity": str(similarity_output_dir),
+        "tensors": str(tensor_output_dir),
+        "collages": str(collage_output_dir),
     }
+    
+    results = create_generation_results(
+        state, tokenizer, output_directories_dict, 
+        gen_config, attn_config, guidance_config
+    )
+
+    # Print summary
+    print_summary(
+        results["evaluation_summary"], 
+        results["quality_analysis"], 
+        results["generated_text"], 
+        results["generated_tokens"], 
+        output_dir
+    )
+
+    return results
 
 
 def load_previous_batch_results(results_dir: Union[str, Path]) -> Dict[str, Any]:
@@ -765,7 +697,7 @@ if __name__ == '__main__':
     enable_inference_optimizations()
     
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
-    parser.add_argument('--mode', type=str, default='batch', choices=['single', 'batch', 'sweep'],
+    parser.add_argument('--mode', type=str, default='sweep', choices=['single', 'batch', 'sweep'],
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
 
     # --- Model Loading Arguments ---
@@ -776,15 +708,14 @@ if __name__ == '__main__':
     parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000001.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks\gaze__00000001_masks.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000032.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks\gaze__00000032_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
-    # parser.add_argument('--prompt', type=str, default="Repeat the sentence and make sure to include the words 'looking at'. The _ is looking at _", help="Input prompt.")\
-    # parser.add_argument('--prompt', type=str, default="Describe the _ (object)", help="Input prompt.")
-    parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
-    " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \
-    "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
+    parser.add_argument('--prompt', type=str, default="The _ is looking at _ . Where is the _ person looking?", help="Input prompt.")
+    # parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
+    # " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \
+    # "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
     parser.add_argument('--output_dir', type=str, default=f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Directory to save outputs.")
 
     # --- Batch Processing Arguments ---
