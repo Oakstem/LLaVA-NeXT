@@ -560,7 +560,11 @@ class LlavaMetaForCausalLM(ABC):
             special_tokens_inds = special_tokens_inds[(special_tokens_inds >= 0) & (special_tokens_inds < full_input_len)]
         else:
             special_tokens_inds = None
-        tokens_indexing['insert_embd'] = special_tokens_inds
+        if special_tokens_inds is not None:
+            tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0], special_tokens_inds[2]],
+                                              'target': [special_tokens_inds[1]]}
+        else:
+            tokens_indexing['insert_embd'] = None
 
         if _labels is None:
             # Extract indexes where the labels are image labels (IMAGE_TOKEN_INDEX)

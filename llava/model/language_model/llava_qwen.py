@@ -103,7 +103,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             if images is not None and image_sizes is not None:
                 (input_ids, position_ids, attention_mask_prepared, past_key_values, inputs_embeds, labels,
                  _image_features_ret, _user_prompt_features_ret, self.tokens_indexing) = \
-                    self.prepare_inputs_labels_for_multimodal(
+                      self.prepare_inputs_labels_for_multimodal(
                         input_ids=original_input_ids,
                         position_ids=position_ids,
                         attention_mask=attention_mask,
@@ -126,13 +126,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         person_mask_embedding = mask_embedding[person_attn_mask_indices, :].mean(dim=0)
                         # only for testing:
                         # person_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
-                        inputs_embeds[:, self.tokens_indexing['insert_embd'][0], :] = person_mask_embedding
-                        final_ids_to_attend['gaze_source'] += [int(self.tokens_indexing['insert_embd'][0].cpu().numpy())]  # Add source position to ids_to_attend
-                    if len(person_attn_mask_indices) > 0 and len(self.tokens_indexing['insert_embd']) > 1:
+                        inputs_embeds[:, self.tokens_indexing['insert_embd']['source'], :] = person_mask_embedding
+                        final_ids_to_attend['gaze_source'] += [int(val.cpu().numpy()) for val in self.tokens_indexing['insert_embd']['source']]  # Add source position to ids_to_attend
+                    if len(person_attn_mask_indices) > 0 and len(self.tokens_indexing['insert_embd']['target']) > 0:
                         # Use the second mask index to get the target mask embedding
                         target_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
                         # inputs_embeds[:, -6, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _
-                        inputs_embeds[:, self.tokens_indexing['insert_embd'][1], :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _"
+                        inputs_embeds[:, self.tokens_indexing['insert_embd']['target'], :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _"
 
             else:
                 # Unpack 6 values when images are not present (e.g., subsequent generation steps)

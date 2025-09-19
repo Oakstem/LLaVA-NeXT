@@ -134,7 +134,7 @@ def worker_function(
             "image_path": str(image_path),
             "mask_path": str(mask_path),
             "prompt": prompt,
-            "subject_description": subject_description
+            "subjecgitgitt_description": subject_description
         }
     
     # Save worker results

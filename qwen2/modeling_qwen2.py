@@ -803,12 +803,12 @@ class Qwen2DecoderLayer(nn.Module):
                 gaze_source_boost_positions = gaze_source_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
                 # gaze_target_boost_positions = gaze_target_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
                 tokens_indexing = kwargs.get('tokens_indexing', None)
-                gaze_source_query_positions = [tokens_indexing['insert_embd'][0]]
+                gaze_source_query_positions = [tokens_indexing['insert_embd']['source']]
                 if len(tokens_indexing['insert_embd']) > 1:
-                    gaze_target_query_positions = [tokens_indexing['insert_embd'][1]]
-                    if len(tokens_indexing['insert_embd'][1].size()) < 1:
-                        gaze_target_query_positions = [gaze_target_query_positions]
-                        gaze_source_query_positions = [gaze_source_query_positions]
+                    gaze_target_query_positions = [tokens_indexing['insert_embd']['target']]
+                    # if len(tokens_indexing['insert_embd']['target'].size()) < 1:
+                    #     gaze_target_query_positions = [gaze_target_query_positions]
+                    #     gaze_source_query_positions = [gaze_source_query_positions]
                 else:
                     # no second '_' was found in the prompt, so we assume no gaze target boost positions
                     gaze_target_boost_positions = None
@@ -898,23 +898,27 @@ class Qwen2DecoderLayer(nn.Module):
     def _create_bias_positions_attend_to(boost_positions, query_positions, seq_len, abs_indexing=False):
         """Make all positions attend more to boost_positions"""
         bias_positions = []
-
+        range_fn = None
+        
         if not abs_indexing:
             query_start = seq_len + query_positions[0] - 5    # last 5 tokens are system added tokens, we need to focus on the last user prompt tokens
             query_end = seq_len + query_positions[-1] - 5
         else:
-            query_start = query_positions[0][0]
-            query_end = query_positions[0][-1] + 1
+            range_fn = [int(val.cpu().numpy()) for val in query_positions[0]]
 
-        if seq_len > 1:
-            # range_fn = range(seq_len-8, seq_len-5) # works well for hands localization
-            range_fn = list(range(query_start, query_end))  # added "in the image", try with -15:-5
-            # range_fn2 = list(range(seq_len-11, seq_len-5))  # added "in the image", try with -15:-5
-            # range_fn = range_fn + range_fn2
-            # range_fn = range_fn + [-39]
-            # range_fn = range(seq_len)
-        else:
-            range_fn = range(seq_len)
+            # query_start = query_positions[0]
+            # query_end = query_positions[-1] + 1
+
+        if range_fn is None:
+            if seq_len > 1:
+                # range_fn = range(seq_len-8, seq_len-5) # works well for hands localization
+                range_fn = list(range(query_start, query_end))  # added "in the image", try with -15:-5
+                # range_fn2 = list(range(seq_len-11, seq_len-5))  # added "in the image", try with -15:-5
+                # range_fn = range_fn + range_fn2
+                # range_fn = range_fn + [-39]
+                # range_fn = range(seq_len)
+            else:
+                range_fn = range(seq_len)
         # range_fn = range(seq_len)
 
         for q_pos in range_fn:
