@@ -26,9 +26,10 @@ import threading
 
 
 #%% Relevant paths
-steered_generated_results = r"D:\Projects\data\gazefollow\results\steered_attention_runs\refactored_experiment_20250825_232643\batch_bias_sweep_results_20250828_053454.json"
-gazefollowing_results_csv = r"D:\Projects\data\gazefollow\results\valid_runs\20250902_015248_You_are_an_expert_vision_assis_results.csv"
-person_description_data_dir = r"D:\Projects\data\gazefollow\results\valid_runs\20250902_015248_00000001_00030291"
+steered_generated_results = r"D:\Projects\data\gazefollow\results\steered_attention_runs\json_results\combined.json"
+# gazefollowing_results_csv = r"D:\Projects\data\gazefollow\results\valid_runs\20250902_015248_You_are_an_expert_vision_assis_results.csv"
+gazefollowing_results_csv = r"D:\Projects\data\gazefollow\results\valid_runs\combined_ppl_desc_results.csv"
+person_description_data_dir = r"D:\Projects\data\gazefollow\results\valid_runs\combined_ppl_desc"
 
 steered_generated_results = fix_wsl_paths(steered_generated_results)
 gazefollowing_results_csv = fix_wsl_paths(gazefollowing_results_csv)
@@ -79,8 +80,19 @@ def load_all_description_files(gazefollowing_results_df, person_description_data
                 print(f"Description file for {image_id} does not exist, skipping.")
     return desc_data
 
-# Example usage:
-desc_data = load_all_description_files(gazefollowing_results_df, person_description_data_dir)
+# first check if the the person description json already exists
+desc_data_json_path = os.path.join(os.path.dirname(gazefollowing_results_csv), "all_person_description_text_data.json")
+if os.path.exists(desc_data_json_path):
+    with open(desc_data_json_path, "r") as f:
+        desc_data = json.load(f)
+    print(f"Loaded existing description data from {desc_data_json_path}")
+else:
+    desc_data = load_all_description_files(gazefollowing_results_df, person_description_data_dir)
+print(f"Loaded {len(desc_data)} description files.")
+#%% Store the desc_data to a json file for future reference
+with open(desc_data_json_path, "w") as f:
+    json.dump(desc_data, f, indent=2)
+print(f"All description data saved to {desc_data_json_path}")
 
 #%%
 ind = 0
@@ -154,7 +166,9 @@ print(f"Final save to {periodic_save_path}")
 gazefollowing_results_df = pd.read_csv(periodic_save_path, index_col=0)
 gazefollowing_results_df.index = gazefollowing_results_df['image_path'].str.split("/").str[-1].str.split(".").str[0]
 steered_prefixed = steered_results_df[["source_description", "target_description"]].add_prefix("steered_")
-combined_df = gazefollowing_results_df.join(steered_prefixed)
+combined_df = gazefollowing_results_df.merge(
+    steered_prefixed, left_index=True, right_index=True, how="left"
+)
 
 # %% Save the results to a csv
 output_csv_path = os.path.join(os.path.dirname(gazefollowing_results_csv), "combined_description_results.csv")
