@@ -449,7 +449,8 @@ def process_batch_from_json(
     resume_from_dir: Optional[Union[str, Path]] = None,
     use_person_descriptions: bool = False,
     json_path: Optional[Union[str, Path]] = None,
-    start_from: Optional[str] = None
+    start_from: Optional[str] = None,
+    mask_filename_template2: str = "gaze__{}_results.npy",
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process multiple images, performing bias sweeps for each image.
@@ -583,8 +584,10 @@ def process_batch_from_json(
         mask_path = base_mask_dir / mask_filename_template.format(img_path.stem)
 
         if not mask_path.exists():
-            print(f"Skipping {image_key}: mask not found at {mask_path}")
-            continue
+            mask_path = base_mask_dir / mask_filename_template2.format(img_path.stem)
+            if not mask_path.exists():
+                print(f"Skipping {image_key}: mask not found at {mask_path}")
+                continue
 
         output_dir = base_output_dir / image_key
 

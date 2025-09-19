@@ -750,7 +750,7 @@ def get_attention_indices_from_mask(
     apply_for_anyres_patches: bool = True
 ) -> Tuple[List[int], np.ndarray]:
     """Convert mask pixels to token indices."""
-    if mask.shape[1] == 2:
+    if len(mask.shape)>1 and mask.shape[1] == 2:
         # new mask format, we get the coordinates directly, the <x, y> pairs
         mask_coords = mask.reshape(-1, 2)
         # flip x and y to row and column
@@ -954,7 +954,8 @@ def visualize_embedding_similarity(
     output_path: Union[str, Path],
     region_radius: int = 3,
     top_k: int = 2,
-    normalize: bool = True
+    normalize: bool = True,
+    save_file: bool = False
 ) -> None:
     """
     Calculates and visualizes the semantic similarity between a text token's embedding
@@ -968,6 +969,7 @@ def visualize_embedding_similarity(
         output_path: The path to save the visualization.
         region_radius: The radius around each top similarity value to include in visualization.
         top_k: The number of top similarity values to highlight (default: 3).
+        save_file: Whether to save the visualization to file (default: False).
     """
     # 1. Calculate dot product similarity
     # text_token_embedding: [D], image_token_embeddings: [N, D] -> similarity_scores: [N]
@@ -1037,12 +1039,13 @@ def visualize_embedding_similarity(
     heatmap_colors = cm.inferno(np.array(resized_map_img))[:, :, :3]
     heatmap_uint8 = (heatmap_colors * 255).astype(np.uint8)
 
-    # 4. Blend with original image and save
+    # 4. Blend with original image and conditionally save
     overlay_img = Image.blend(original_image, Image.fromarray(heatmap_uint8), alpha=0.6)
     
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    overlay_img.save(output_path)
+    if save_file:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        overlay_img.save(output_path)
 
     return masked_similarity_map
 
@@ -1683,7 +1686,8 @@ def prepare_batch_paths(
     image_key: str,
     base_image_dir: Union[str, Path],
     base_mask_dir: Union[str, Path],
-    mask_filename_template: str = "gaze__{}_masks.npy"
+    mask_filename_template: str = "gaze__{}_masks.npy",
+    mask_filename_template2: str = "gaze__{}_results.npy"
 ) -> Tuple[Path, Path]:
     """Derive image and mask paths from image_key and validate existence."""
     base_image_dir = Path(fix_wsl_paths(str(base_image_dir)))
@@ -1693,8 +1697,10 @@ def prepare_batch_paths(
     image_path = base_image_dir / folder / filename
     mask_path = base_mask_dir / mask_filename_template.format(Path(filename).stem)
     if not image_path.exists() or not mask_path.exists():
-        print(f"Image or mask not found for {image_key}")
-        return None, None
+        mask_path = base_mask_dir / mask_filename_template2.format(Path(filename).stem)
+        if not mask_path.exists():
+            print(f"Image or mask not found for {image_key}")
+            return None, None
     return image_path, mask_path
 
 def create_experiment_config(
