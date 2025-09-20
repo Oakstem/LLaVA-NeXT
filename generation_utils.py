@@ -597,11 +597,11 @@ def load_model_and_setup(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
             peft_model = PeftModel.from_pretrained(model, adapter_path, is_trainable=False)
-        if hasattr(peft_model, "merge_and_unload"):
-            print("Merging LoRA weights into the base model...")
-            model = peft_model.merge_and_unload()
-        else:
-            model = peft_model
+        # if hasattr(peft_model, "merge_and_unload"):
+        #     print("Merging LoRA weights into the base model...")
+        #     model = peft_model.merge_and_unload()
+        # else:
+        model = peft_model
         print("LoRA adapter loaded successfully.")
     else:
         # Suppress warnings during model loading
