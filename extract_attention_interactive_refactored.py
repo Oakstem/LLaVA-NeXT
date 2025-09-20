@@ -905,7 +905,9 @@ if __name__ == '__main__':
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
 
     # --- Model Loading Arguments ---
-    parser.add_argument('--model_path', type=str, default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Path to the model.")
+    parser.add_argument('--model_path', type=str, default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Path to the base model or fully merged checkpoint.")
+    parser.add_argument('--model_base', type=str, default=None, help="Optional explicit base model path when loading adapters.")
+    parser.add_argument('--adapter_path', type=str, default=None, help="Optional LoRA adapter checkpoint to load on top of the base model.")
     parser.add_argument('--attn_implementation', type=str, default="sdpa", help="Attention implementation ('sdpa' or 'eager').")
     parser.add_argument('--load_4bit', action='store_true', help="Load model in 4-bit.")
     parser.add_argument('--load_8bit', action='store_true', help="Load model in 8-bit.")
@@ -951,7 +953,19 @@ if __name__ == '__main__':
     parser.add_argument('--show_resume_examples', action='store_true', help="Show usage examples for resume functionality and exit.")
 
     args = parser.parse_args()
-    args.output_dir = Path(fix_wsl_paths(args.base_image_dir)).parent / 'results' / 'steered_generation' / Path(args.output_dir).name
+
+    model_path = fix_wsl_paths(args.model_path)
+    adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
+    model_base_path = fix_wsl_paths(args.model_base) if args.model_base else None
+
+    if adapter_path and model_base_path is None:
+        model_base_path = model_path
+
+    user_specified_output = '--output_dir' in sys.argv
+    if user_specified_output:
+        args.output_dir = Path(fix_wsl_paths(args.output_dir))
+    else:
+        args.output_dir = Path(fix_wsl_paths(args.base_image_dir)).parent / 'results' / 'steered_generation' / Path(args.output_dir).name
     # Show resume examples if requested
     if args.show_resume_examples:
         print_resume_usage_examples()
@@ -959,11 +973,13 @@ if __name__ == '__main__':
 
     # --- Model Loading ---
     MODEL_CONFIG = {
-        "model_path": args.model_path,
+        "model_path": model_path,
         "attn_implementation": args.attn_implementation,
         "load_4bit": args.load_4bit,
         "load_8bit": args.load_8bit,
-        "attn_layer_ind": args.attn_layer_ind
+        "attn_layer_ind": args.attn_layer_ind,
+        "model_base": model_base_path,
+        "adapter_path": adapter_path
     }
     tokenizer, model, image_processor, max_length = load_model_and_setup(**MODEL_CONFIG)
 
