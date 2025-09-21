@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:8
-#SBATCH --mem=256G
+#SBATCH --gres=gpu:1
+#SBATCH --mem=30G
 #SBATCH --time=24:00:00
 #SBATCH --partition=gpu
 
@@ -21,7 +21,7 @@ export NCCL_SOCKET_IFNAME=eth0
 export NCCL_DEBUG=INFO
 
 echo "Activating virtual environment..."
-source ~/llava/bin/activate
+source /galitylab/students/alonmardi/llava/bin/activate
 
 # Verify activation
 which python
@@ -56,7 +56,7 @@ cd /mnt/d/Projects/LLaVA-NeXT
 # Number of GPUs for this node
 NUM_GPUS=8
 
-ACCELERATE_CPU_AFFINITY=1 ~/llava/bin/python -m torch.distributed.launch \
+ACCELERATE_CPU_AFFINITY=1 /galitylab/students/alonmardi/llava/bin/python -m torch.distributed.launch \
     --nproc_per_node=${NUM_GPUS} \
     --use_env \
     llava/train/train_mem.py \
