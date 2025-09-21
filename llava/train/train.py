@@ -135,6 +135,11 @@ class DataArguments:
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
     image_processor: Optional[Any] = field(default=None, metadata={"help": "Image processor for processing images"})
+    
+    # Evaluation parameters
+    eval_split_ratio: float = field(default=0.2, metadata={"help": "Ratio of data to use for evaluation (e.g., 0.2 for 20%)"})
+    enable_evaluation: bool = field(default=False, metadata={"help": "Whether to enable evaluation during training"})
+    eval_data_path: Optional[str] = field(default=None, metadata={"help": "Optional separate evaluation data path. If not provided, will split from training data."})
 
 
 @dataclass
@@ -169,6 +174,11 @@ class TrainingArguments(transformers.TrainingArguments):
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
     bf16: bool = field(default=True, metadata={"help": "Whether to use bf16 training."})
     fp16: bool = field(default=False, metadata={"help": "Whether to use fp16 training."})
+    
+    # Evaluation parameters
+    eval_steps: Optional[int] = field(default=5, metadata={"help": "Number of training steps between evaluations. If None, uses evaluation_strategy."})
+    evaluation_strategy: str = field(default="steps", metadata={"help": "Evaluation strategy: 'no', 'steps', 'epoch'."})
+    eval_accumulation_steps: Optional[int] = field(default=None, metadata={"help": "Number of predictions steps to accumulate before moving tensors to CPU."})
 
 
 # @dataclass
@@ -958,10 +968,11 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
 
 
 class LazySupervisedDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments):
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, split_indices: Optional[List[int]] = None):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.list_data_dict = []
+        self.split_indices = split_indices
 
         # Handle multiple JSON files specified in the data_path
         if "{" in data_path and "}" in data_path:
@@ -1038,6 +1049,12 @@ class LazySupervisedDataset(Dataset):
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
+        
+        # Apply split indices if provided
+        if self.split_indices is not None:
+            original_data = self.list_data_dict
+            self.list_data_dict = [original_data[i] for i in self.split_indices]
+            rank0_print(f"Applied split: using {len(self.list_data_dict)} samples from the split")
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -1293,11 +1310,55 @@ class DataCollatorForSupervisedDataset(object):
         return batch
 
 
+def create_train_eval_splits(data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, eval_split_ratio: float = 0.2, seed: int = 42):
+    """Create train and eval datasets with the specified split ratio."""
+    # First create a full dataset to get all the data
+    full_dataset = LazySupervisedDataset(data_path, tokenizer, data_args)
+    total_samples = len(full_dataset.list_data_dict)
+    
+    # Create indices for splitting
+    indices = list(range(total_samples))
+    random.seed(seed)
+    random.shuffle(indices)
+    
+    # Split indices
+    eval_size = int(total_samples * eval_split_ratio)
+    eval_indices = indices[:eval_size]
+    train_indices = indices[eval_size:]
+    
+    rank0_print(f"Split dataset: {len(train_indices)} train samples, {len(eval_indices)} eval samples")
+    
+    # Create split datasets
+    train_dataset = LazySupervisedDataset(data_path, tokenizer, data_args, split_indices=train_indices)
+    eval_dataset = LazySupervisedDataset(data_path, tokenizer, data_args, split_indices=eval_indices)
+    
+    return train_dataset, eval_dataset
+
+
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    
+    # Check if evaluation is enabled
+    if data_args.enable_evaluation:
+        if data_args.eval_data_path is not None:
+            # Use separate eval dataset
+            train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+            eval_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.eval_data_path, data_args=data_args)
+            rank0_print(f"Using separate eval dataset: {len(train_dataset)} train, {len(eval_dataset)} eval")
+        else:
+            # Split the training data
+            train_dataset, eval_dataset = create_train_eval_splits(
+                data_path=data_args.data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                eval_split_ratio=data_args.eval_split_ratio
+            )
+        return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
+    else:
+        # No evaluation - use all data for training
+        train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+        return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -1714,6 +1775,21 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    
+    # Configure evaluation settings
+    if data_args.enable_evaluation and data_module["eval_dataset"] is not None:
+        # Set evaluation strategy if not already set
+        if training_args.evaluation_strategy == "no":
+            training_args.evaluation_strategy = "steps"
+        
+        # Set eval_steps if provided
+        if training_args.eval_steps is None and training_args.evaluation_strategy == "steps":
+            training_args.eval_steps = 500  # Default to every 500 steps
+        
+        rank0_print(f"Evaluation enabled: strategy={training_args.evaluation_strategy}, eval_steps={training_args.eval_steps}")
+        rank0_print(f"Eval dataset size: {len(data_module['eval_dataset'])}")
+    else:
+        rank0_print("Evaluation disabled")
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
