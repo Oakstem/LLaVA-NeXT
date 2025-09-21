@@ -71,3 +71,8 @@ mlx_configs/
 data_processing/
 # demo/
 training_outputs/
+*.jpg
+*.jpeg
+*.png
+attention_output/
+*.csv
