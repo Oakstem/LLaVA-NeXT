@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=22:00:00
 #SBATCH --partition=gpu
 
 # Create logs directory if it doesn't exist
@@ -40,17 +40,18 @@ export PYTHONPATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT:$PYTHONPATH
 cd /galitylab/students/alonmardi/projects/LLaVA-NeXT && \
 python llava/train/train.py \
   --model_name_or_path "lmms-lab/llava-onevision-qwen2-7b-ov-chat" \
-  --data_path "/galitylab/students/alonmardi/projects/LLaVA-NeXT/datasets/sgl_conversation_data.json" \
-  --output_dir "/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs" \
+  --data_path "/galitylab/students/alonmardi/gazefollow/results/json_results/sgl_conversation_data.json" \
+  --output_dir "/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/$(date +%Y%m%d_%H%M%S)" \
   --lora_enable True \
   --lora_r 4 \
   --lora_alpha 16 \
   --lora_target_modules "lm_head" \
-  --num_train_epochs 5 \
+  --mm_tunable_parts "mm_mlp_adapter,mm_language_model" \
+  --num_train_epochs 4 \
   --per_device_train_batch_size 1 \
-  --save_steps 100 \
-  --logging_steps 10 \
+  --save_steps 1000 \
+  --logging_steps 100 \
   --image_folder "/galitylab/students/alonmardi/gazefollow" \
-  --bf16
+  --bf16    
 
 echo "Gazefollow training completed at $(date)"
