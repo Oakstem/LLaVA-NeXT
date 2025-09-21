@@ -70,7 +70,7 @@ def cleanup_temp_files():
     for temp_file in temp_dir.glob(temp_pattern):
         try:
             temp_file.unlink()
-            print(f"Cleaned up temporary file: {temp_file}")
+            # print(f"Cleaned up temporary file: {temp_file}")
         except Exception as e:
             print(f"Warning: Could not remove temporary file {temp_file}: {e}")
 
