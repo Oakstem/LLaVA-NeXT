@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=llava_siglip_finetune
-#SBATCH --output=logs/llava_siglip_finetune_%j.out
 #SBATCH --error=logs/llava_siglip_finetune_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
@@ -50,8 +49,8 @@ echo "RUN_NAME: ${RUN_NAME}"
 echo "PREV_STAGE_CHECKPOINT: ${PREV_STAGE_CHECKPOINT}"
 
 # Set environment variables and run training
-export PYTHONPATH="/mnt/d/Projects/LLaVA-NeXT:$PYTHONPATH"
-cd /mnt/d/Projects/LLaVA-NeXT
+export PYTHONPATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT:$PYTHONPATH"
+cd /galitylab/students/alonmardi/projects/LLaVA-NeXT
 
 # Number of GPUs for this node
 NUM_GPUS=8
@@ -63,9 +62,8 @@ ACCELERATE_CPU_AFFINITY=1 /galitylab/students/alonmardi/llava/bin/python -m torc
     --deepspeed scripts/zero3.json \
     --model_name_or_path $PREV_STAGE_CHECKPOINT \
     --version $PROMPT_VERSION \
-    --data_path /mnt/d/Projects/LLaVA-NeXT/datasets/sgl_conversation_data.json \
-    --image_folder /mnt/d/Projects/LLaVA-NeXT/datasets/images \
-    --video_folder /mnt/d/Projects/LLaVA-NeXT/datasets/videos \
+    --data_path /galitylab/students/alonmardi/gazefollow/results/json_results/sgl_conversation_data.json \
+    --image_folder /galitylab/students/alonmardi/gazefollow \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
@@ -79,7 +77,7 @@ ACCELERATE_CPU_AFFINITY=1 /galitylab/students/alonmardi/llava/bin/python -m torc
     --mm_patch_merge_type spatial_unpad \
     --bf16 True \
     --run_name $RUN_NAME \
-    --output_dir /mnt/d/Projects/LLaVA-NeXT/training_outputs/$RUN_NAME \
+    --output_dir /galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/$RUN_NAME \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
