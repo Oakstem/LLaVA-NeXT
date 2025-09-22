@@ -49,8 +49,9 @@ python llava/train/train.py \
   --mm_tunable_parts "mm_mlp_adapter,mm_language_model" \
   --num_train_epochs 4 \
   --per_device_train_batch_size 1 \
-  --save_steps 1000 \
-  --logging_steps 100 \
+  --gradient_accumulation_steps 4 \
+  --save_steps 10000 \
+  --logging_steps 1000 \
   --image_folder "/galitylab/students/alonmardi/gazefollow" \
   --bf16    
 
