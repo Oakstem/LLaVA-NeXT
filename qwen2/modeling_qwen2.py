@@ -796,7 +796,7 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_size = hidden_states.size()
         bsz, q_len = hidden_size[0], hidden_size[1]
         # debug print
-        print(f"hidden states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape if attention_mask is not None else None}, position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        # print(f"hidden states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape if attention_mask is not None else None}, position_ids shape: {position_ids.shape if position_ids is not None else None}")
         if kwargs.get("boost_positions", None) is not None:
             gaze_target_boost_positions = kwargs.get('boost_positions', None).get('gaze_target', None)
             gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
@@ -837,7 +837,10 @@ class Qwen2DecoderLayer(nn.Module):
                 if source_attention_mask is not None:
                     source_attention_mask = attention_mask
                 target_bias_mat = self._add_positional_bias(attention_mask, attention_bias_positions_gaze_target, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_target is not None else None
-                source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_source is not None else None
+                try:
+                    source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_source is not None else None
+                except Exception as e:
+                    print(f"Error occurred while adding positional bias to source attention mask: {e}")
                 if kwargs.get("apply_only_target_mask", False):
                     combined_bias = target_bias_mat
                     # get all indices where target bias is 0 (not masked), without the source indices
@@ -903,7 +906,7 @@ class Qwen2DecoderLayer(nn.Module):
         range_fn = None
         
         # debug print
-        print(f"boost_positions: {boost_positions}, query_positions: {query_positions}, seq_len: {seq_len}, abs_indexing: {abs_indexing}")
+        # print(f"boost_positions: {boost_positions}, query_positions: {query_positions}, seq_len: {seq_len}, abs_indexing: {abs_indexing}")
 
         if not abs_indexing:
             query_start = seq_len + query_positions[0] - 5    # last 5 tokens are system added tokens, we need to focus on the last user prompt tokens
@@ -914,29 +917,28 @@ class Qwen2DecoderLayer(nn.Module):
             # query_start = query_positions[0]
             # query_end = query_positions[-1] + 1
 
-        if range_fn is None:
-            if seq_len > 1:
-                # range_fn = range(seq_len-8, seq_len-5) # works well for hands localization
-                range_fn = list(range(query_start, query_end))  # added "in the image", try with -15:-5
-                # range_fn2 = list(range(seq_len-11, seq_len-5))  # added "in the image", try with -15:-5
-                # range_fn = range_fn + range_fn2
-                # range_fn = range_fn + [-39]
-                # range_fn = range(seq_len)
-            else:
-                range_fn = range(seq_len)
+        if range_fn is None:            
+            # range_fn = range(seq_len-8, seq_len-5) # works well for hands localization
+            range_fn = list(range(query_start, query_end))  # added "in the image", try with -15:-5
+            # range_fn2 = list(range(seq_len-11, seq_len-5))  # added "in the image", try with -15:-5
+            # range_fn = range_fn + range_fn2
+            # range_fn = range_fn + [-39]
+            # range_fn = range(seq_len)
+        if seq_len == 1:
+            range_fn = range(seq_len)
         # range_fn = range(seq_len)
 
         for q_pos in range_fn:
             for boost_pos in boost_positions:
                 bias_positions.append((q_pos, boost_pos))  # All queries -> boost keys
         # debug print
-        print(f"bias_positions: {bias_positions}")
+        # print(f"bias_positions: {bias_positions}")
         return bias_positions
     
     def _add_positional_bias(self, attention_mask, bias_positions, bsz, q_len, kv_seq_len, position_ids, bias_strength=1.):
         """Fully vectorized positional bias addition"""
         # debug print
-        print(f"q_len: {q_len}, kv_seq_len: {kv_seq_len}")
+        # print(f"q_len: {q_len}, kv_seq_len: {kv_seq_len}")
         if attention_mask is None:
             attention_mask = torch.zeros(bsz, 1, q_len, kv_seq_len, device=position_ids.device, dtype=torch.float32)
 
