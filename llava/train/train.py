@@ -15,7 +15,6 @@
 #    limitations under the License.
 
 import ast
-import os
 import copy
 from dataclasses import dataclass, field
 import json
@@ -25,7 +24,7 @@ from typing import Dict, Optional, Sequence, List
 from PIL import Image, ImageFile
 from packaging import version
 import numpy as np
-
+import warnings
 import time
 import random
 import yaml
@@ -137,8 +136,8 @@ class DataArguments:
     image_processor: Optional[Any] = field(default=None, metadata={"help": "Image processor for processing images"})
     
     # Evaluation parameters
-    eval_split_ratio: float = field(default=0.2, metadata={"help": "Ratio of data to use for evaluation (e.g., 0.2 for 20%)"})
-    enable_evaluation: bool = field(default=False, metadata={"help": "Whether to enable evaluation during training"})
+    eval_split_ratio: float = field(default=0.1, metadata={"help": "Ratio of data to use for evaluation (e.g., 0.2 for 20%)"})
+    enable_evaluation: bool = field(default=True, metadata={"help": "Whether to enable evaluation during training"})
     eval_data_path: Optional[str] = field(default=None, metadata={"help": "Optional separate evaluation data path. If not provided, will split from training data."})
 
 
@@ -176,7 +175,7 @@ class TrainingArguments(transformers.TrainingArguments):
     fp16: bool = field(default=False, metadata={"help": "Whether to use fp16 training."})
     
     # Evaluation parameters
-    eval_steps: Optional[int] = field(default=5, metadata={"help": "Number of training steps between evaluations. If None, uses evaluation_strategy."})
+    eval_steps: Optional[int] = field(default=5000, metadata={"help": "Number of training steps between evaluations. If None, uses evaluation_strategy."})
     evaluation_strategy: str = field(default="steps", metadata={"help": "Evaluation strategy: 'no', 'steps', 'epoch'."})
     eval_accumulation_steps: Optional[int] = field(default=None, metadata={"help": "Number of predictions steps to accumulate before moving tensors to CPU."})
 
@@ -258,6 +257,7 @@ def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
     multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
+    # multimodal_keywords = ["mm_projector"]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -1328,9 +1328,20 @@ def create_train_eval_splits(data_path: str, tokenizer: transformers.PreTrainedT
     
     rank0_print(f"Split dataset: {len(train_indices)} train samples, {len(eval_indices)} eval samples")
     
-    # Create split datasets
-    train_dataset = LazySupervisedDataset(data_path, tokenizer, data_args, split_indices=train_indices)
-    eval_dataset = LazySupervisedDataset(data_path, tokenizer, data_args, split_indices=eval_indices)
+    # Create split datasets by reusing the loaded data and directly applying splits
+    train_dataset = LazySupervisedDataset.__new__(LazySupervisedDataset)
+    train_dataset.tokenizer = tokenizer
+    train_dataset.data_args = data_args
+    train_dataset.split_indices = train_indices
+    train_dataset.list_data_dict = [full_dataset.list_data_dict[i] for i in train_indices]
+    rank0_print(f"Applied split: using {len(train_dataset.list_data_dict)} samples for training")
+    
+    eval_dataset = LazySupervisedDataset.__new__(LazySupervisedDataset)
+    eval_dataset.tokenizer = tokenizer
+    eval_dataset.data_args = data_args
+    eval_dataset.split_indices = eval_indices
+    eval_dataset.list_data_dict = [full_dataset.list_data_dict[i] for i in eval_indices]
+    rank0_print(f"Applied split: using {len(eval_dataset.list_data_dict)} samples for evaluation")
     
     return train_dataset, eval_dataset
 
@@ -1553,7 +1564,7 @@ def train(attn_implementation=None):
             )
         )
 
-    # model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    # Load pretrained LLaVA model (already includes mm_mlp_adapter)
     pretrained = "lmms-lab/llava-onevision-qwen2-7b-ov-chat"
     model_name = "llava_qwen"
     device = "cuda"
@@ -1563,7 +1574,18 @@ def train(attn_implementation=None):
         "torch_dtype": "bfloat16" if training_args.bf16 else "float16" if training_args.fp16 else "float32",
         # "attn_implementation": "sdpa",
     }
-    tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, **llava_model_args)  # Add any other thing you want to pass in llava_model_args
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
+        tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, **llava_model_args)
+    
+    # Store the image processor from the pretrained model
+    if image_processor is not None:
+        data_args.image_processor = image_processor
+        data_args.is_multimodal = True
+        rank0_print("Image processor loaded from pretrained model")
+    
+    rank0_print(f"Model Class: {model.__class__.__name__}")
+    rank0_print(f"Prompt version: {model_args.version}")
 
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
@@ -1648,116 +1670,176 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
     
-    model_args.vision_tower = True
-    if model_args.vision_tower is not None:
-        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
-
+    # Set vision tower parameter from model args if provided, otherwise use pretrained
+    if model_args.vision_tower is None:
+        # Use the vision tower from the pretrained model
+        model_args.vision_tower = getattr(model.config, 'mm_vision_tower', 'google/siglip-so400m-patch14-384')
+    
+    rank0_print(f"Using vision tower: {model_args.vision_tower}")
+    
+    # Only initialize vision modules if they're not already present or if we need to update them
+    if hasattr(model, 'get_vision_tower') and model.get_vision_tower() is not None:
+        rank0_print("Vision modules already initialized from pretrained model")
         vision_tower = model.get_vision_tower()
-        # vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
-        vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16)
+    else:
+        rank0_print("Initializing vision modules")
+        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
+        vision_tower = model.get_vision_tower()
+    
+    # Ensure vision tower is moved to the correct device and dtype
+    # vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+    vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16)
 
+    # Set image processor and multimodal flag regardless of initialization path
+    if vision_tower.image_processor is not None:
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
+        rank0_print("Image processor set from vision tower")
+    elif data_args.image_processor is None:
+        rank0_print("WARNING: No image processor found, this may cause issues with image processing")
+    
+    # Verify image processor is properly set
+    if data_args.image_processor is None:
+        raise ValueError("Image processor is None - this will cause errors during data loading")
 
-        model.config.image_aspect_ratio = data_args.image_aspect_ratio
-        if data_args.image_grid_pinpoints is not None:
-            if isinstance(data_args.image_grid_pinpoints, str) and "x" in data_args.image_grid_pinpoints:
-                try:
-                    patch_size = data_args.image_processor.size[0]
-                except Exception as e:
-                    patch_size = data_args.image_processor.size["shortest_edge"]
+    model.config.image_aspect_ratio = data_args.image_aspect_ratio
+    if data_args.image_grid_pinpoints is not None:
+        if isinstance(data_args.image_grid_pinpoints, str) and "x" in data_args.image_grid_pinpoints:
+            try:
+                patch_size = data_args.image_processor.size[0]
+            except Exception as e:
+                patch_size = data_args.image_processor.size["shortest_edge"]
 
-                assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
-                # Use regex to extract the range from the input string
-                matches = re.findall(r"\((\d+)x(\d+)\)", data_args.image_grid_pinpoints)
-                range_start = tuple(map(int, matches[0]))
-                range_end = tuple(map(int, matches[-1]))
-                # Generate a matrix of tuples from (range_start[0], range_start[1]) to (range_end[0], range_end[1])
-                grid_pinpoints = [(i, j) for i in range(range_start[0], range_end[0] + 1) for j in range(range_start[1], range_end[1] + 1)]
-                # Multiply all elements by patch_size
-                data_args.image_grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
-            elif isinstance(data_args.image_grid_pinpoints, str):
-                data_args.image_grid_pinpoints = ast.literal_eval(data_args.image_grid_pinpoints)
+            assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
+            # Use regex to extract the range from the input string
+            matches = re.findall(r"\((\d+)x(\d+)\)", data_args.image_grid_pinpoints)
+            range_start = tuple(map(int, matches[0]))
+            range_end = tuple(map(int, matches[-1]))
+            # Generate a matrix of tuples from (range_start[0], range_start[1]) to (range_end[0], range_end[1])
+            grid_pinpoints = [(i, j) for i in range(range_start[0], range_end[0] + 1) for j in range(range_start[1], range_end[1] + 1)]
+            # Multiply all elements by patch_size
+            data_args.image_grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
+        elif isinstance(data_args.image_grid_pinpoints, str):
+            data_args.image_grid_pinpoints = ast.literal_eval(data_args.image_grid_pinpoints)
 
-        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
-        model.config.image_crop_resolution = data_args.image_crop_resolution
-        model.config.image_split_resolution = data_args.image_split_resolution
-        model.config.tokenizer_padding_side = tokenizer.padding_side
-        model.config.tokenizer_model_max_length = tokenizer.model_max_length
-        model.config.mm_newline_position = model_args.mm_newline_position
-        model.config.add_faster_video = model_args.add_faster_video
-        model.config.faster_token_stride = model_args.faster_token_stride
-        model.config.add_time_instruction = data_args.add_time_instruction
-        model.config.force_sample = data_args.force_sample
-        model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
+    model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
+    model.config.image_crop_resolution = data_args.image_crop_resolution
+    model.config.image_split_resolution = data_args.image_split_resolution
+    model.config.tokenizer_padding_side = tokenizer.padding_side
+    model.config.tokenizer_model_max_length = tokenizer.model_max_length
+    model.config.mm_newline_position = model_args.mm_newline_position
+    model.config.add_faster_video = model_args.add_faster_video
+    model.config.faster_token_stride = model_args.faster_token_stride
+    model.config.add_time_instruction = data_args.add_time_instruction
+    model.config.force_sample = data_args.force_sample
+    model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
 
-        ### Deciding train which part of the model
-        if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
-            model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
-            model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
-            if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
-                model.requires_grad_(False)
-            if model_args.tune_mm_mlp_adapter:
-                for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = True
-            if model_args.tune_mm_vision_resampler:
-                for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = True
-
-            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-            if training_args.freeze_mm_mlp_adapter:
-                for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = False
-
-            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
-            if training_args.freeze_mm_vision_resampler:
-                for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = False
-
-            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
-            if model_args.unfreeze_mm_vision_tower:
-                vision_tower.requires_grad_(True)
-            else:
-                vision_tower.requires_grad_(False)
-
-        else:
-            rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
-            model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
-            # Set the entire model to not require gradients by default
+    ### Deciding train which part of the model
+    if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
+        model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
+        if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
             model.requires_grad_(False)
+        if model_args.tune_mm_mlp_adapter:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = True
+        if model_args.tune_mm_vision_resampler:
+            for p in model.get_model().vision_resampler.parameters():
+                p.requires_grad = True
+
+        model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+        if training_args.freeze_mm_mlp_adapter:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = False
+
+        model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
+        if training_args.freeze_mm_vision_resampler:
+            for p in model.get_model().vision_resampler.parameters():
+                p.requires_grad = False
+
+        model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
+        if model_args.unfreeze_mm_vision_tower:
+            vision_tower.requires_grad_(True)
+        else:
             vision_tower.requires_grad_(False)
-            model.get_model().mm_projector.requires_grad_(False)
-            model.get_model().vision_resampler.requires_grad_(False)
-            # Parse the mm_tunable_parts to decide which parts to unfreeze
-            tunable_parts = model_args.mm_tunable_parts.split(",")
-            if "mm_mlp_adapter" in tunable_parts:
+
+    else:
+        rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
+        model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+        # Set the entire model to not require gradients by default
+        model.requires_grad_(False)
+        vision_tower.requires_grad_(False)
+        model.get_model().mm_projector.requires_grad_(False)
+        model.get_model().vision_resampler.requires_grad_(False)
+        # Parse the mm_tunable_parts to decide which parts to unfreeze
+        tunable_parts = model_args.mm_tunable_parts.split(",")
+        if "mm_mlp_adapter" in tunable_parts:
+            if training_args.lora_enable:
+                # Only enable LoRA adapters for mm_projector
+                for name, param in model.named_parameters():
+                    if "mm_projector" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
+                # Enable all mm_projector parameters
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = True
-            if "mm_vision_resampler" in tunable_parts:
+        if "mm_vision_resampler" in tunable_parts:
+            if training_args.lora_enable:
+                # Only enable LoRA adapters for vision_resampler
+                for name, param in model.named_parameters():
+                    if "vision_resampler" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
+                # Enable all vision_resampler parameters
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = True
-            if "mm_vision_tower" in tunable_parts:
+        if "mm_vision_tower" in tunable_parts:
+            if training_args.lora_enable:
+                # Only enable LoRA adapters for vision_tower
+                for name, param in model.named_parameters():
+                    if "vision_tower" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
+                # Enable all vision_tower parameters
                 for name, param in model.named_parameters():
                     if "vision_tower" in name:
                         param.requires_grad_(True)
-            if "mm_language_model" in tunable_parts:
+        if "mm_language_model" in tunable_parts:
+            if training_args.lora_enable:
+                # When LoRA is enabled, the language model training is handled by LoRA adapters
+                # Need to explicitly enable gradients for LoRA parameters after global freeze
+                rank0_print("Language model training enabled via LoRA adapters (base model parameters remain frozen)")
+                # Re-enable gradients for LoRA adapter parameters
+                language_model_params = []
+                for name, param in model.named_parameters():
+                    if "lora_" in name or param.requires_grad:
+                        param.requires_grad_(True)
+                        language_model_params.append(name)
+            else:
+                # Traditional fine-tuning: set language model parameters to require gradients
+                language_model_params = []
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         param.requires_grad_(True)
+                        language_model_params.append(name)
+                
+            rank0_print(f"Language model parameters set to require gradients ({len(language_model_params)} parameters):")
+            for param_name in language_model_params:
+                rank0_print(f"  {param_name}")
 
-        total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
-        trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
-        rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
-        rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
-        if training_args.bits in [4, 8]:
-            model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+    total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
+    trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
+    rank0_print(f"Total parameters: {total_params:,}")
+    rank0_print(f"Trainable parameters: {trainable_params:,}")
+    if training_args.bits in [4, 8]:
+        model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
-        model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
-        model.config.mm_projector_lr = training_args.mm_projector_lr
-        model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
-        training_args.use_im_start_end = model_args.mm_use_im_start_end
-        model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
-        # model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)        # todo: test if this really required
+    model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
+    model.config.mm_projector_lr = training_args.mm_projector_lr
+    model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
+    training_args.use_im_start_end = model_args.mm_use_im_start_end
+    model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
+    # model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)        # todo: test if this really required
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -1774,9 +1856,8 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     
-    # Configure evaluation settings
+    # Configure evaluation settings before creating trainer
     if data_args.enable_evaluation and data_module["eval_dataset"] is not None:
         # Set evaluation strategy if not already set
         if training_args.evaluation_strategy == "no":
@@ -1789,7 +1870,12 @@ def train(attn_implementation=None):
         rank0_print(f"Evaluation enabled: strategy={training_args.evaluation_strategy}, eval_steps={training_args.eval_steps}")
         rank0_print(f"Eval dataset size: {len(data_module['eval_dataset'])}")
     else:
+        # Explicitly disable evaluation when no eval dataset is available
+        training_args.evaluation_strategy = "no"
+        training_args.eval_steps = None
         rank0_print("Evaluation disabled")
+    
+    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
