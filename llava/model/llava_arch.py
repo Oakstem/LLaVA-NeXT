@@ -561,8 +561,12 @@ class LlavaMetaForCausalLM(ABC):
         else:
             special_tokens_inds = None
         if special_tokens_inds is not None:
-            tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0], special_tokens_inds[2]],
-                                              'target': [special_tokens_inds[1]]}
+            if special_tokens_inds.numel() > 2:
+                tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0], special_tokens_inds[2]],
+                                                'target': [special_tokens_inds[1]]}
+            elif special_tokens_inds.numel() == 2:
+                tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0]],
+                                                  'target': [special_tokens_inds[1]]}
         else:
             tokens_indexing['insert_embd'] = None
 

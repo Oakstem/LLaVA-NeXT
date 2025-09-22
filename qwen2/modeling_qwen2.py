@@ -795,6 +795,8 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_size = hidden_states.size()
         bsz, q_len = hidden_size[0], hidden_size[1]
+        # debug print
+        print(f"hidden states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape if attention_mask is not None else None}, position_ids shape: {position_ids.shape if position_ids is not None else None}")
         if kwargs.get("boost_positions", None) is not None:
             gaze_target_boost_positions = kwargs.get('boost_positions', None).get('gaze_target', None)
             gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
@@ -900,6 +902,9 @@ class Qwen2DecoderLayer(nn.Module):
         bias_positions = []
         range_fn = None
         
+        # debug print
+        print(f"boost_positions: {boost_positions}, query_positions: {query_positions}, seq_len: {seq_len}, abs_indexing: {abs_indexing}")
+
         if not abs_indexing:
             query_start = seq_len + query_positions[0] - 5    # last 5 tokens are system added tokens, we need to focus on the last user prompt tokens
             query_end = seq_len + query_positions[-1] - 5
@@ -924,16 +929,25 @@ class Qwen2DecoderLayer(nn.Module):
         for q_pos in range_fn:
             for boost_pos in boost_positions:
                 bias_positions.append((q_pos, boost_pos))  # All queries -> boost keys
+        # debug print
+        print(f"bias_positions: {bias_positions}")
         return bias_positions
     
     def _add_positional_bias(self, attention_mask, bias_positions, bsz, q_len, kv_seq_len, position_ids, bias_strength=1.):
         """Fully vectorized positional bias addition"""
+        # debug print
+        print(f"q_len: {q_len}, kv_seq_len: {kv_seq_len}")
         if attention_mask is None:
             attention_mask = torch.zeros(bsz, 1, q_len, kv_seq_len, device=position_ids.device, dtype=torch.float32)
 
         add_bias_mat = torch.zeros_like(attention_mask, device=attention_mask.device, dtype=attention_mask.dtype)
         
         if position_ids is not None and bias_positions:
+            # print(f"{position_ids} (type: {type(position_ids)})")
+            # if hasattr(position_ids, '__len__'):
+            #     print(f"    length: {len(position_ids)}")
+            #     if len(position_ids) > 0:
+            #         print(f"    first item: {position_ids[0]} (type: {type(position_ids[0])})")
             # Convert bias_positions to tensors for vectorized operations
             q_positions = torch.tensor([pos[0] for pos in bias_positions], device=position_ids.device)
             k_positions = torch.tensor([pos[1] for pos in bias_positions], device=position_ids.device)

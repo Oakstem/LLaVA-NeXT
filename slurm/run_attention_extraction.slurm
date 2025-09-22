@@ -10,15 +10,16 @@
 #SBATCH --nodes=1
 
 # Configuration variables - modify these as needed
-MODE="${MODE:-batch}"  # Options: single, batch, sweep
+MODE="${MODE:-sweep}"  # Options: single, batch, sweep
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 ATTN_LAYER_IND="${ATTN_LAYER_IND:-23}"
 
 # Single mode arguments
-IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000000/00000001.jpg}"
-MASK_PATH="${MASK_PATH:-/galitylab/students/alonmardi/gazefollow/train_gaze_segmentations/small_masks/gaze__00000001_masks.npy}"
-PROMPT="${PROMPT:-You are provided with embeddings representing people or objects in an image. Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.}"
+IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000000/00000032.jpg}"
+MASK_PATH="${MASK_PATH:-$(echo "$IMAGE_PATH" | sed 's|.*/\([^/]*\)\.[^.]*$|/galitylab/students/alonmardi/gazefollow/train_gaze_segmentations/small_masks/small_masks/gaze__\1_masks.npy|')}"
+#PROMPT="${PROMPT:-You are provided with embeddings representing people or objects in an image. Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.}"
+PROMPT="${PROMPT:-The _ is looking at _ . Where is the person looking?}"
 
 # Batch mode arguments
 JSON_PATH="${JSON_PATH:-}"
