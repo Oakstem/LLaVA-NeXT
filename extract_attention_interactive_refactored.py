@@ -112,9 +112,9 @@ def run_generation_with_attention(
     bias_strength: float = 0.0,
     prev_run_last_hidden_state: Optional[torch.Tensor] = None,
     break_after_first_step: bool = False,
-    use_gaze_guidance: bool = True,
-    guidance_config: Optional[Dict[str, Any]] = None,
-    beam_search_config: Optional[Dict[str, Any]] = None
+    use_gaze_guidance: bool = True,  # New parameter
+    guidance_config: Optional[Dict[str, Any]] = None,  # New parameter
+    save_debug_files: bool = False,
 ) -> Dict[str, Any]:
     """
     Run generation with attention extraction and optional gaze guidance.
@@ -335,6 +335,75 @@ def validate_resume_directory(resume_dir: Union[str, Path]) -> bool:
     return True
 
 
+def load_sgl_conversation_data(sgl_path: Union[str, Path]) -> set:
+    """
+    Load SGL conversation data and extract processed image IDs.
+
+    Args:
+        sgl_path: Path to the SGL conversation data JSON file
+
+    Returns:
+        Set of processed image IDs
+    """
+    sgl_path = Path(fix_wsl_paths(str(sgl_path)))
+    
+    if not sgl_path.exists():
+        print(f"Warning: SGL conversation file not found at {sgl_path}")
+        return set()
+    
+    try:
+        with open(sgl_path, 'r') as f:
+            sgl_data = json.load(f)
+        
+        processed_ids = set()
+        for entry in sgl_data:
+            if 'id' in entry:
+                processed_ids.add(entry['id'])
+        
+        print(f"Loaded {len(processed_ids)} processed image IDs from SGL conversation data")
+        return processed_ids
+    
+    except Exception as e:
+        print(f"Error loading SGL conversation data: {e}")
+        return set()
+
+
+def filter_images_by_sgl_data(
+    person_desc_data: Dict[str, str],
+    sgl_processed_ids: set
+) -> Dict[str, str]:
+    """
+    Filter out images that are already processed in SGL conversation data.
+
+    Args:
+        person_desc_data: Dictionary of all images to process
+        sgl_processed_ids: Set of processed image IDs from SGL data
+
+    Returns:
+        Dictionary of remaining images to process
+    """
+    remaining = {}
+    original_count = len(person_desc_data)
+    
+    for image_key, subject_description in person_desc_data.items():
+        # Extract image ID from the key
+        if isinstance(image_key, Path):
+            image_id = image_key.stem
+        else:
+            image_id = Path(image_key).stem
+        
+        # Check if this image ID is already processed
+        if image_id not in sgl_processed_ids:
+            remaining[image_key] = subject_description
+        else:
+            print(f"Skipping already processed image: {image_id}")
+
+    filtered_count = original_count - len(remaining)
+    print(f"Filtered out {filtered_count} already processed images")
+    print(f"Found {len(remaining)} images remaining to process out of {original_count} total")
+    return remaining
+
+
 def get_remaining_images(
     person_desc_data: Dict[str, str],
     completed_results: Dict[str, Any]
@@ -381,7 +450,10 @@ def process_batch_from_json(
     resume_from_dir: Optional[Union[str, Path]] = None,
     use_person_descriptions: bool = False,
     json_path: Optional[Union[str, Path]] = None,
-    start_from: Optional[str] = None
+    start_from: Optional[str] = None,
+    skip_first: int = 0,
+    mask_filename_template2: str = "gaze__{}_results.npy",
+    sgl_conversation_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process multiple images, performing bias sweeps for each image.
@@ -442,6 +514,14 @@ def process_batch_from_json(
         files_df.set_index('image_file', inplace=True)
         person_desc_data = files_df['description'].to_dict()
 
+    # Apply SGL conversation filtering if path is provided
+    if sgl_conversation_path:
+        print(f"SGL conversation path provided: {sgl_conversation_path}")
+        sgl_processed_ids = load_sgl_conversation_data(sgl_conversation_path)
+        print(f"Original dataset: {len(person_desc_data)} images")
+        person_desc_data = filter_images_by_sgl_data(person_desc_data, sgl_processed_ids)
+        print(f"After SGL filtering: {len(person_desc_data)} images")
+
     # Determine which images still need processing (if resuming)
     full_entries_before_resume = dict(person_desc_data)  # for total count
     if resume_from_dir and all_image_results:
@@ -480,6 +560,17 @@ def process_batch_from_json(
         else:
             print(f"Warning: Image with ID '{start_from}' not found. Processing all images.")
 
+    # Apply skip_first filtering if specified
+    if skip_first > 0:
+        image_keys = list(person_desc_data.keys())
+        if skip_first < len(image_keys):
+            skipped_keys = image_keys[skip_first:]
+            person_desc_data = {key: person_desc_data[key] for key in skipped_keys}
+            print(f"Skipping first {skip_first} image(s) - processing {len(person_desc_data)} remaining images")
+        else:
+            print(f"Warning: skip_first ({skip_first}) is greater than or equal to available images ({len(image_keys)}). No images to process.")
+            return {}
+
     # Report resume status
     total_images = len(full_entries_before_resume)
     completed_count = len(all_image_results)
@@ -487,6 +578,9 @@ def process_batch_from_json(
     
     if start_from:
         print(f"START-FROM STATUS: Found {original_image_count} total image(s), processing {remaining_count} image(s) starting from '{start_from}'")
+    
+    if skip_first > 0:
+        print(f"SKIP-FIRST STATUS: Skipped first {skip_first} image(s), processing {remaining_count} remaining image(s)")
     
     if resume_from_dir:
         print(f"RESUME STATUS: {completed_count}/{total_images} images completed, {remaining_count} remaining")
@@ -515,8 +609,10 @@ def process_batch_from_json(
         mask_path = base_mask_dir / mask_filename_template.format(img_path.stem)
 
         if not mask_path.exists():
-            print(f"Skipping {image_key}: mask not found at {mask_path}")
-            continue
+            mask_path = base_mask_dir / mask_filename_template2.format(img_path.stem)
+            if not mask_path.exists():
+                print(f"Skipping {image_key}: mask not found at {mask_path}")
+                continue
 
         output_dir = base_output_dir / image_key
 
@@ -585,7 +681,6 @@ def run_bias_sweep_experiment(
     save_summary: bool = True,
     use_gaze_guidance: bool = True,
     guidance_config: Optional[Dict[str, Any]] = None,
-    beam_search_config: Optional[Dict[str, Any]] = None
 ) -> Dict[float, Dict[str, Any]]:
     """
     Runs the generation experiment across a range of bias strengths.
@@ -612,7 +707,6 @@ def run_bias_sweep_experiment(
             break_after_first_step=True,  # Only run the first step to get embeddings
             use_gaze_guidance=use_gaze_guidance,
             guidance_config=guidance_config,
-            beam_search_config=beam_search_config
         )
 
     for bias_i in bias_range:
@@ -635,7 +729,8 @@ def run_bias_sweep_experiment(
             bias_strength=bias_i,
             prev_run_last_hidden_state=init_run_results['first_step_hidden_state'],  # Use initial run results for embeddings
             use_gaze_guidance=use_gaze_guidance,
-            guidance_config=guidance_config
+            guidance_config=guidance_config,
+            save_debug_files=base_experiment_config['generation_config'].get("save_debug_files", False)
         )
         results.pop('first_step_hidden_state', None)
         all_results[bias_i] = results
@@ -645,6 +740,7 @@ def run_bias_sweep_experiment(
     performance_summary = analyze_bias_sweep_results(all_results, base_output_dir, save_summary=save_summary)
 
     return all_results
+
 
 def print_resume_usage_examples():
     """Print usage examples for the resume functionality."""
@@ -673,17 +769,56 @@ def print_resume_usage_examples():
     print("          --base_image_dir /path/to/images \\")
     print("          --base_mask_dir /path/to/masks")
     print()
-    print("4. Resume functionality will automatically:")
+    print("4. Use SGL conversation filtering with regular batch mode:")
+    print("   python extract_attention_interactive_refactored.py --mode batch \\")
+    print("          --sgl_conversation_path sgl_conversation_data.json \\")
+    print("          --base_image_dir /path/to/images \\")
+    print("          --base_mask_dir /path/to/masks")
+    print()
+    print("5. Combine SGL filtering with resume and start-from:")
+    print("   python extract_attention_interactive_refactored.py --mode batch \\")
+    print("          --sgl_conversation_path sgl_conversation_data.json \\")
+    print("          --resume_from_dir /path/to/previous/run/output \\")
+    print("          --start_from image_12345 \\")
+    print("          --base_image_dir /path/to/images \\")
+    print("          --base_mask_dir /path/to/masks")
+    print()
+    print("6. Skip the first X images in batch processing:")
+    print("   python extract_attention_interactive_refactored.py --mode batch \\")
+    print("          --skip_first 100 \\")
+    print("          --base_image_dir /path/to/images \\")
+    print("          --base_mask_dir /path/to/masks")
+    print()
+    print("7. Combine all filtering options:")
+    print("   python extract_attention_interactive_refactored.py --mode batch \\")
+    print("          --sgl_conversation_path sgl_conversation_data.json \\")
+    print("          --skip_first 50 \\")
+    print("          --start_from image_12345 \\")
+    print("          --resume_from_dir /path/to/previous/run/output \\")
+    print("          --base_image_dir /path/to/images \\")
+    print("          --base_mask_dir /path/to/masks")
+    print()
+    print("8. Resume functionality will automatically:")
     print("   - Load the most recent batch_bias_sweep_results_*.json file")
     print("   - Determine which images were already processed")
     print("   - Continue processing only the remaining images")
     print()
-    print("5. Start-from functionality will:")
+    print("9. Start-from functionality will:")
     print("   - Skip all images that come before the specified image ID in sorted order")
     print("   - Use the image stem (filename without extension) for matching")
     print("   - Work with both resume and fresh processing")
     print()
-    print("6. Example directory structure for resuming:")
+    print("10. Skip-first functionality will:")
+    print("   - Skip the first X images in the dataset after all other filtering")
+    print("   - Applied after SGL filtering, resume filtering, and start-from filtering")
+    print("   - Useful for distributed processing or continuing from a specific point")
+    print()
+    print("11. SGL filtering (--sgl_conversation_path) will:")
+    print("   - Load processed image IDs from sgl_conversation_data.json")
+    print("   - Skip images that already have conversation entries")
+    print("   - Apply before resume and start-from filtering")
+    print()
+    print("12. Example directory structure for resuming:")
     print("   /previous/run/output/")
     print("   ├── batch_bias_sweep_results_20250714_123456.json  <- Resume from here")
     print("   ├── image1/")
@@ -701,7 +836,9 @@ if __name__ == '__main__':
                         help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
 
     # --- Model Loading Arguments ---
-    parser.add_argument('--model_path', type=str, default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Path to the model.")
+    parser.add_argument('--model_path', type=str, default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Path to the base model or fully merged checkpoint.")
+    parser.add_argument('--model_base', type=str, default=None, help="Optional explicit base model path when loading adapters.")
+    parser.add_argument('--adapter_path', type=str, default=None, help="Optional LoRA adapter checkpoint to load on top of the base model.")
     parser.add_argument('--attn_implementation', type=str, default="sdpa", help="Attention implementation ('sdpa' or 'eager').")
     parser.add_argument('--load_4bit', action='store_true', help="Load model in 4-bit.")
     parser.add_argument('--load_8bit', action='store_true', help="Load model in 8-bit.")
@@ -727,6 +864,9 @@ if __name__ == '__main__':
     parser.add_argument('--resume_from_dir', default=False, help="Path to previous run directory to resume batch processing from.")
     parser.add_argument('--use_person_descriptions', action='store_true', help="Use person descriptions from JSON file in prompts.")
     parser.add_argument('--start_from', type=str, default=None, help="Image ID (stem name without extension) to start processing from, skipping all images that come before it in sorted order.")
+    parser.add_argument('--skip_first', type=int, default=0, help="Skip the first X images in the dataset (applied after filtering and sorting).")
+    parser.add_argument('--sgl_conversation_path', type=str, default='sgl_conversation_data.json', help="Path to SGL conversation data JSON file for filtering already processed images.")
+    parser.add_argument('--save_debug_files', action='store_true', default=False, help="Save debug files during generation.")
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
@@ -741,14 +881,21 @@ if __name__ == '__main__':
 
     # --- Help and Usage ---
     parser.add_argument('--show_resume_examples', action='store_true', help="Show usage examples for resume functionality and exit.")
-    # --- Beam Search Arguments ---
-    parser.add_argument('--use_beam_search', action='store_true', help="Enable beam search for generation.")
-    parser.add_argument('--num_beams', type=int, default=1, help="Number of beams for beam search.")
-    parser.add_argument('--length_penalty', type=float, default=1.0, help="Length penalty for beam search.")
-    parser.add_argument('--early_stopping', action='store_true', help="Enable early stopping in beam search.")
 
     args = parser.parse_args()
-    args.output_dir = Path(fix_wsl_paths(args.base_image_dir)).parent / 'results' / 'steered_generation' / Path(args.output_dir).name
+
+    model_path = fix_wsl_paths(args.model_path)
+    adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
+    model_base_path = fix_wsl_paths(args.model_base) if args.model_base else None
+
+    if adapter_path and model_base_path is None:
+        model_base_path = model_path
+
+    user_specified_output = '--output_dir' in sys.argv
+    if user_specified_output:
+        args.output_dir = Path(fix_wsl_paths(args.output_dir))
+    else:
+        args.output_dir = Path(fix_wsl_paths(args.base_image_dir)).parent / 'results' / 'steered_generation' / Path(args.output_dir).name
     # Show resume examples if requested
     if args.show_resume_examples:
         print_resume_usage_examples()
@@ -756,11 +903,13 @@ if __name__ == '__main__':
 
     # --- Model Loading ---
     MODEL_CONFIG = {
-        "model_path": args.model_path,
+        "model_path": model_path,
         "attn_implementation": args.attn_implementation,
         "load_4bit": args.load_4bit,
         "load_8bit": args.load_8bit,
-        "attn_layer_ind": args.attn_layer_ind
+        "attn_layer_ind": args.attn_layer_ind,
+        "model_base": model_base_path,
+        "adapter_path": adapter_path
     }
     tokenizer, model, image_processor, max_length = load_model_and_setup(**MODEL_CONFIG)
 
@@ -769,6 +918,7 @@ if __name__ == '__main__':
     generation_config = {
         "bias_strength": 2.5, "max_new_tokens": 30, "temperature": 0.1,
         "do_sample": False, "top_k": 50, "output_hidden_states": True,
+        "save_debug_files": args.save_debug_files
     }
     attention_config = {
         "attn_threshold": 0.4, "opening_kernel_size": 5, "min_blob_area": 50,
@@ -790,12 +940,6 @@ if __name__ == '__main__':
         "enable_after_keyword": "looking"
     }
 
-    beam_search_config = {
-        'use_beam_search': args.use_beam_search,
-        'length_penalty': args.length_penalty,
-        'early_stopping': args.early_stopping,
-        'num_beams': args.num_beams
-        }
 
     if args.mode == 'single':
         print("--- Running Single Experiment ---")
@@ -812,14 +956,14 @@ if __name__ == '__main__':
              bias_strength=generation_config.get("bias_strength", 0.0),
              use_gaze_guidance=args.use_gaze_guidance,
              guidance_config=guidance_config,
-             use_beam_search=args.use_beam_search,
-             beam_search_config=beam_search_config
         )
 
     elif args.mode == 'batch':
         print("--- Running Batch Processing with Bias Sweeps ---")
         if args.resume_from_dir:
             print(f"Resuming from previous run: {args.resume_from_dir}")
+        if args.sgl_conversation_path:
+            print(f"Using SGL conversation filtering with: {args.sgl_conversation_path}")
         bias_range = np.linspace(args.bias_min, args.bias_max, args.bias_steps)
         process_batch_from_json(
             json_path=args.json_path,
@@ -837,6 +981,8 @@ if __name__ == '__main__':
             prompt_template=args.prompt,
             use_person_descriptions=args.use_person_descriptions,
             start_from=args.start_from,
+            skip_first=args.skip_first,
+            sgl_conversation_path=args.sgl_conversation_path,
         )
 
     elif args.mode == 'sweep':
@@ -848,6 +994,7 @@ if __name__ == '__main__':
             "output_dir": args.output_dir,
             "generation_config": generation_config,
             "attention_config": attention_config,
+            "save_debug_files": args.save_debug_files
         }
         bias_range = np.linspace(args.bias_min, args.bias_max, args.bias_steps)
         run_bias_sweep_experiment(
@@ -859,5 +1006,4 @@ if __name__ == '__main__':
             save_summary=True,
             use_gaze_guidance=args.use_gaze_guidance,
             guidance_config=guidance_config,
-            beam_search_config=beam_search_config
         )

@@ -204,7 +204,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         else:
             source_attention_mask = None
 
-        if inputs_embeds is None and attention_mask is not None:
+        if inputs_embeds is None and attention_mask is not None and attention_mask.dim() > 2:
             tokens_to_take = 1
             attention_mask = attention_mask[:, :, -tokens_to_take:, :]      # reduce only to the last query token
             if source_attention_mask is not None:
@@ -270,8 +270,25 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
+        image_embeds = None
+        self.tokens_indexing = None
         if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _, image_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+            multimodal_outputs = self.prepare_inputs_labels_for_multimodal(
+            inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes
+            )
+
+            output_len = len(multimodal_outputs)
+            if output_len == 6:
+                inputs, position_ids, attention_mask, _, inputs_embeds, _ = multimodal_outputs
+            elif output_len >= 8:
+                inputs, position_ids, attention_mask, _, inputs_embeds, _, image_embeds = multimodal_outputs[:7]
+            if output_len == 9:
+                self.tokens_indexing = multimodal_outputs[8]
+            else:
+                raise ValueError(
+                    "prepare_inputs_labels_for_multimodal returned an unexpected number of values: "
+                    f"{output_len}."
+                )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 

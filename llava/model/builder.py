@@ -57,6 +57,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             )
         if "lora" in model_name.lower() and model_base is not None:
             lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            kwargs["adapter_kwargs"] = {"_adapter_model_path": model_path}
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             rank0_print("Loading LLaVA from base model...")
             if "mixtral" in model_name.lower():
@@ -79,13 +80,18 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             else:
                 from llava.model.language_model.llava_llama import LlavaConfig
-
+                from llava.model.language_model.llava_qwen import LlavaQwenConfig
                 lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
+                llava_cfg2 = LlavaQwenConfig.from_pretrained('lmms-lab/llava-onevision-qwen2-7b-ov-chat')
+                # update the lora config with llava_cfg2
+                for k, v in llava_cfg2.__dict__.items():
+                    if not k.startswith("_") and not hasattr(lora_cfg_pretrained, k) or 'vision' in k:
+                        setattr(lora_cfg_pretrained, k, v)
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
 
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
-            if model.lm_head.weight.shape[0] != token_num:
+            if model.lm_head.weight.shape[0] != tokenpip_num:
                 model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
                 model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
 
@@ -290,7 +296,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if not vision_tower.is_loaded:
             vision_tower.load_model(device_map=device_map)
         if device_map != "auto":
-            vision_tower.to(device="cuda", dtype=torch.float16)
+            if torch.cuda.is_available():
+                vision_tower.to(device="cuda", dtype=torch.float16)
+            else:
+                vision_tower.to(device="cpu")
         image_processor = vision_tower.image_processor
 
     if hasattr(model.config, "max_sequence_length"):

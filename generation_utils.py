@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import warnings
 from datetime import datetime
 from pathlib import Path
 import copy
@@ -530,7 +531,9 @@ def load_model_and_setup(
     attn_implementation: str = "sdpa",
     load_4bit: bool = False,
     load_8bit: bool = False,
-    attn_layer_ind: int = -1
+    attn_layer_ind: int = -1,
+    model_base: Optional[str] = None,
+    adapter_path: Optional[str] = None
 ) -> Tuple[PreTrainedTokenizer, PreTrainedModel, SigLipImageProcessor, int]:
     """
     Load and initialize the LLaVA model with specified configurations.
@@ -538,32 +541,95 @@ def load_model_and_setup(
     """
     print("Loading model and components...")
 
-    model_name = "llava_qwen"
-    device_map = "auto"
+    target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_map = "auto" if target_device.type == "cuda" else None
     llava_model_args = {"multimodal": True}
     custom_config = {'attn_layer_ind': attn_layer_ind}
 
-    print(f"Model path: {model_path}")
+    use_adapter = adapter_path is not None
+    base_model_path = model_base or model_path
+    target_model_path = adapter_path if use_adapter else model_path
+
+    model_name_source = base_model_path if base_model_path else model_path
+    model_name = get_model_name_from_path(model_name_source) or "llava_qwen"
+
+    if use_adapter:
+        print(f"Base model path: {base_model_path}")
+        print(f"LoRA adapter path: {adapter_path}")
+    else:
+        print(f"Model path: {model_path}")
+        if model_base:
+            print(f"Using auxiliary base path: {model_base}")
+
+    print(f"Derived model name: {model_name}")
     print(f"Attention implementation: {attn_implementation}")
     print(f"Custom config: {custom_config}")
 
     if load_4bit and load_8bit:
         raise ValueError("Cannot load in both 4-bit and 8-bit mode.")
 
-    # Load the model components
-    tokenizer, model, image_processor, max_length = load_pretrained_model(
-        model_path, None, model_name,
-        load_8bit=load_8bit,
-        load_4bit=load_4bit,
-        device_map=device_map,
-        attn_implementation=attn_implementation,
-        overwrite_config=custom_config,
-        **llava_model_args
-    )
+    if use_adapter:
+        if not base_model_path:
+            raise ValueError("LoRA adapter loading requires a base model path. Provide --model_base or use --model_path to point to the base checkpoint.")
+
+        # Suppress warnings during model loading
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
+            tokenizer, model, image_processor, max_length = load_pretrained_model(
+                base_model_path,
+                None,
+                model_name,
+                load_8bit=load_8bit,
+                load_4bit=load_4bit,
+                device_map=device_map,
+                attn_implementation=attn_implementation,
+                overwrite_config=custom_config,
+                **llava_model_args
+            )
+
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise ImportError("peft must be installed to load LoRA adapters") from exc
+
+        print("Loading LoRA adapter weights...")
+        # Suppress warnings during adapter loading
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
+            peft_model = PeftModel.from_pretrained(model, adapter_path, is_trainable=False)
+        # if hasattr(peft_model, "merge_and_unload"):
+        #     print("Merging LoRA weights into the base model...")
+        #     model = peft_model.merge_and_unload()
+        # else:
+        model = peft_model
+        print("LoRA adapter loaded successfully.")
+    else:
+        # Suppress warnings during model loading
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
+            tokenizer, model, image_processor, max_length = load_pretrained_model(
+                target_model_path,
+                model_base,
+                model_name,
+                load_8bit=load_8bit,
+                load_4bit=load_4bit,
+                device_map=device_map,
+                attn_implementation=attn_implementation,
+                overwrite_config=custom_config,
+                **llava_model_args
+            )
+
+    if device_map is None:
+        model = model.to(target_device)
+        if target_device.type != "cuda":
+            model = model.float()
 
     model.eval()
     print("✅ Model loaded successfully!")
-    print(f"Model device: {model.device}")
+    if hasattr(model, "device"):
+        print(f"Model device: {model.device}")
+    else:
+        print(f"Model running on: {target_device}")
     print(f"Max context length: {max_length}")
 
     return tokenizer, model, image_processor, max_length
@@ -750,7 +816,7 @@ def get_attention_indices_from_mask(
     apply_for_anyres_patches: bool = True
 ) -> Tuple[List[int], np.ndarray]:
     """Convert mask pixels to token indices."""
-    if mask.shape[1] == 2:
+    if len(mask.shape)>1 and mask.shape[1] == 2:
         # new mask format, we get the coordinates directly, the <x, y> pairs
         mask_coords = mask.reshape(-1, 2)
         # flip x and y to row and column
@@ -954,7 +1020,8 @@ def visualize_embedding_similarity(
     output_path: Union[str, Path],
     region_radius: int = 3,
     top_k: int = 2,
-    normalize: bool = True
+    normalize: bool = True,
+    save_file: bool = False
 ) -> None:
     """
     Calculates and visualizes the semantic similarity between a text token's embedding
@@ -968,6 +1035,7 @@ def visualize_embedding_similarity(
         output_path: The path to save the visualization.
         region_radius: The radius around each top similarity value to include in visualization.
         top_k: The number of top similarity values to highlight (default: 3).
+        save_file: Whether to save the visualization to file (default: False).
     """
     # 1. Calculate dot product similarity
     # text_token_embedding: [D], image_token_embeddings: [N, D] -> similarity_scores: [N]
@@ -1037,12 +1105,13 @@ def visualize_embedding_similarity(
     heatmap_colors = cm.inferno(np.array(resized_map_img))[:, :, :3]
     heatmap_uint8 = (heatmap_colors * 255).astype(np.uint8)
 
-    # 4. Blend with original image and save
+    # 4. Blend with original image and conditionally save
     overlay_img = Image.blend(original_image, Image.fromarray(heatmap_uint8), alpha=0.6)
     
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    overlay_img.save(output_path)
+    if save_file:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        overlay_img.save(output_path)
 
     return masked_similarity_map
 
@@ -1683,7 +1752,8 @@ def prepare_batch_paths(
     image_key: str,
     base_image_dir: Union[str, Path],
     base_mask_dir: Union[str, Path],
-    mask_filename_template: str = "gaze__{}_masks.npy"
+    mask_filename_template: str = "gaze__{}_masks.npy",
+    mask_filename_template2: str = "gaze__{}_results.npy"
 ) -> Tuple[Path, Path]:
     """Derive image and mask paths from image_key and validate existence."""
     base_image_dir = Path(fix_wsl_paths(str(base_image_dir)))
@@ -1693,8 +1763,10 @@ def prepare_batch_paths(
     image_path = base_image_dir / folder / filename
     mask_path = base_mask_dir / mask_filename_template.format(Path(filename).stem)
     if not image_path.exists() or not mask_path.exists():
-        print(f"Image or mask not found for {image_key}")
-        return None, None
+        mask_path = base_mask_dir / mask_filename_template2.format(Path(filename).stem)
+        if not mask_path.exists():
+            print(f"Image or mask not found for {image_key}")
+            return None, None
     return image_path, mask_path
 
 def create_experiment_config(

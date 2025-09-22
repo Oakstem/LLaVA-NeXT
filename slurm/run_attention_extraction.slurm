@@ -2,7 +2,7 @@
 #SBATCH --job-name=attention_extraction
 #SBATCH --output=logs/attention_extraction_%j.out
 #SBATCH --error=logs/attention_extraction_%j.err
-#SBATCH --time=72:00:00
+#SBATCH --time=22:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -12,7 +12,7 @@
 # Configuration variables - modify these as needed
 MODE="${MODE:-batch}"  # Options: single, batch, sweep
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
-QUANTIZATION="${QUANTIZATION:-4bit}"  # Options: 4bit, 8bit, none
+QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 ATTN_LAYER_IND="${ATTN_LAYER_IND:-23}"
 
 # Single mode arguments
@@ -23,16 +23,16 @@ PROMPT="${PROMPT:-You are provided with embeddings representing people or object
 # Batch mode arguments
 JSON_PATH="${JSON_PATH:-}"
 BASE_IMAGE_DIR="${BASE_IMAGE_DIR:-/galitylab/students/alonmardi/gazefollow/train}"
-BASE_MASK_DIR="${BASE_MASK_DIR:-/galitylab/students/alonmardi/gazefollow/train_gaze_segmentations/small_masks}"
+BASE_MASK_DIR="${BASE_MASK_DIR:-/galitylab/students/alonmardi/gazefollow/train_gaze_segmentations/small_masks/small_masks}"
 LIMIT_ITEMS="${LIMIT_ITEMS:-}"
 RESUME_FROM_DIR="${RESUME_FROM_DIR:-}"
 USE_PERSON_DESCRIPTIONS="${USE_PERSON_DESCRIPTIONS:-false}"
-START_FROM="${START_FROM:-}"
+START_FROM="${START_FROM:-00102212}"
 
 # Bias sweep arguments
 BIAS_MIN="${BIAS_MIN:-1.0}"
-BIAS_MAX="${BIAS_MAX:-6.0}"
-BIAS_STEPS="${BIAS_STEPS:-3}"
+BIAS_MAX="${BIAS_MAX:-3.0}"
+BIAS_STEPS="${BIAS_STEPS:-2}"
 
 # Gaze guidance arguments
 USE_GAZE_GUIDANCE="${USE_GAZE_GUIDANCE:-false}"
