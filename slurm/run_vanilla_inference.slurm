@@ -12,7 +12,7 @@
 # Configuration variables - modify these as needed
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-# ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/checkpoint-13000}"
+# ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20250922_124635/checkpoint-12000}"
 ADAPTER_PATH="${ADAPTER_PATH:-}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
@@ -25,11 +25,11 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 TEMPERATURE="${TEMPERATURE:-0.9}"
 TOP_P="${TOP_P:-0.8}"
 NUM_BEAMS="${NUM_BEAMS:-1}"
-DO_SAMPLE="${DO_SAMPLE:-false}"
+DO_SAMPLE="${DO_SAMPLE:-true}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
 SAVE_OUTPUT="${SAVE_OUTPUT:-}"
 CHAT_MODE="${CHAT_MODE:-true}"
-NO_STREAM="${NO_STREAM:-true}"
+NO_STREAM="${NO_STREAM:-false}"
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
