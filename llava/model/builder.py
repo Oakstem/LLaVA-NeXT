@@ -50,6 +50,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         is_multimodal = False
 
     if "llava" in model_name.lower() or is_multimodal:
+        print("Loading LLaVA model...")
+        if "lora" not in model_name:
+            model_name = f"{model_name}-lora"
         # Load LLaVA model
         if "lora" in model_name.lower() and model_base is None:
             warnings.warn(
@@ -81,6 +84,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             else:
                 from llava.model.language_model.llava_llama import LlavaConfig
                 from llava.model.language_model.llava_qwen import LlavaQwenConfig
+                print("model_base:", model_base)
                 lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
                 llava_cfg2 = LlavaQwenConfig.from_pretrained('lmms-lab/llava-onevision-qwen2-7b-ov-chat')
                 # update the lora config with llava_cfg2
@@ -258,6 +262,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     raise ValueError(f"Model {model_name} not supported")
 
     else:
+        print(f"Not LLaVA model, loading {model_path}...")
         # Load language model
         if model_base is not None:
             # PEFT model
