@@ -49,11 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-path", required=True, help="Path to the input image.")
     
     # prompt_group = parser.add_mutually_exclusive_group(required=True)
-    parser.add_argument("--prompt", default="where the person is looking at?", help="User prompt to pair with the image.")
+    parser.add_argument("--prompt", default="describe every person and where is he looking at?", help="User prompt to pair with the image.")
     # prompt_group.add_argument("--prompt-file", help="Path to a text file containing the prompt.")
     
     parser.add_argument("--conv-template", default=None, help="Conversation template key (defaults to qwen_1_5 for Qwen-style models).")
-    parser.add_argument("--max-new-tokens", type=int, default=64, help="Maximum number of tokens to generate.")
+    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum number of tokens to generate.")
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature (ignored if --do-sample is False).")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus sampling value.")
     parser.add_argument("--num-beams", type=int, default=1, help="Number of beams for beam search decoding.")

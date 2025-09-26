@@ -870,8 +870,8 @@ if __name__ == '__main__':
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
-    parser.add_argument('--bias_max', type=float, default=6., help="Maximum bias strength for the sweep.")
-    parser.add_argument('--bias_steps', type=int, default=3, help="Number of steps in the bias sweep.")
+    parser.add_argument('--bias_max', type=float, default=3.5, help="Maximum bias strength for the sweep.")
+    parser.add_argument('--bias_steps', type=int, default=5, help="Number of steps in the bias sweep.")
 
     # --- Gaze Guidance Arguments ---
     parser.add_argument('--use_gaze_guidance', action='store_true', help="Enable gaze-guided token selection.")
