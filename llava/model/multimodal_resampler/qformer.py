@@ -483,6 +483,7 @@ class BertEncoder(nn.Module):
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
+                    use_reentrant=False
                 )
             else:
                 layer_outputs = layer_module(
