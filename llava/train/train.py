@@ -169,6 +169,7 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
+    gradient_checkpointing_kwargs: Optional[dict] = field(default_factory=lambda: {"use_reentrant": False})
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
     bf16: bool = field(default=True, metadata={"help": "Whether to use bf16 training."})
@@ -1612,6 +1613,10 @@ def train(attn_implementation=None):
                 output.requires_grad_(True)
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+        
+        # Configure gradient checkpointing with use_reentrant=False
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=training_args.gradient_checkpointing_kwargs)
 
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
