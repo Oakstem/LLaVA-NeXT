@@ -1,66 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=llava_direct_finetune_siglip
-#SBATCH --output=l# Print all training parameters before starting
-echo "=== TRAINING PARAMETERS ==="
-echo "SLURM Job ID: $SLURM_JOB_ID"
-echo "Model: ${CKPT_PATH}"
-echo "Vision Tower: ${VISION_MODEL_VERSION}"
-echo "Prompt Version: ${PROMPT_VERSION}"
-echo "Run Name: $MID_RUN_NAME"
-echo "Output Directory: ${OUTPUT_BASE_DIR}/${MID_RUN_NAME}"
-echo ""
-echo "=== DATA CONFIGURATION ==="
-echo "Data Path: ${DATA_PATH}"
-echo "Image Folder: ${IMAGE_FOLDER}"
-echo "DeepSpeed Config: ${DEEPSPEED_CONFIG}"
-echo ""
-echo "=== MODEL ARCHITECTURE ==="
-echo "MM Tunable Parts: ${MM_TUNABLE_PARTS}"
-echo "MM Vision Tower LR: ${MM_VISION_TOWER_LR}"
-echo "MM Projector Type: ${MM_PROJECTOR_TYPE}"
-echo "MM Vision Select Layer: ${MM_VISION_SELECT_LAYER}"
-echo "MM Use IM Start End: ${MM_USE_IM_START_END}"
-echo "MM Use IM Patch Token: ${MM_USE_IM_PATCH_TOKEN}"
-echo "Group by Modality Length: ${GROUP_BY_MODALITY_LENGTH}"
-echo "Image Aspect Ratio: ${IMAGE_ASPECT_RATIO}"
-echo "Image Grid Pinpoints: ${IMAGE_GRID_PINPOINTS}"
-echo "MM Patch Merge Type: ${MM_PATCH_MERGE_TYPE}"
-echo ""
-echo "=== LORA CONFIGURATION ==="
-echo "LoRA Enable: ${LORA_ENABLE}"
-echo "LoRA r: ${LORA_R}"
-echo "LoRA alpha: ${LORA_ALPHA}"
-echo ""
-echo "=== TRAINING HYPERPARAMETERS ==="
-echo "Epochs: ${NUM_TRAIN_EPOCHS}"
-echo "Train Batch Size: ${PER_DEVICE_TRAIN_BATCH_SIZE}"
-echo "Eval Batch Size: ${PER_DEVICE_EVAL_BATCH_SIZE}"
-echo "Gradient Accumulation Steps: ${GRADIENT_ACCUMULATION_STEPS}"
-echo "Learning Rate: ${LEARNING_RATE}"
-echo "Weight Decay: ${WEIGHT_DECAY}"
-echo "Warmup Ratio: ${WARMUP_RATIO}"
-echo "LR Scheduler: ${LR_SCHEDULER_TYPE}"
-echo ""
-echo "=== EVALUATION & SAVING ==="
-echo "Evaluation Strategy: ${EVALUATION_STRATEGY}"
-echo "Eval Steps: ${EVAL_STEPS}"
-echo "Save Strategy: ${SAVE_STRATEGY}"
-echo "Save Steps: ${SAVE_STEPS}"
-echo "Save Total Limit: ${SAVE_TOTAL_LIMIT}"
-echo "Logging Steps: ${LOGGING_STEPS}"
-echo ""
-echo "=== PRECISION & PERFORMANCE ==="
-echo "BF16: ${BF16}"
-echo "TF32: ${TF32}"
-echo "Model Max Length: ${MODEL_MAX_LENGTH}"
-echo "========================="netune_siglip_%j.out
+#SBATCH --output=logs/llava_direct_finetune_siglip_%j.out
 #SBATCH --error=logs/llava_direct_finetune_siglip_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=22:00:00
+#SBATCH --time=24:00:00
 #SBATCH --partition=gpu
 
 # Create logs directory if it doesn't exist
@@ -122,7 +69,7 @@ OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outp
 DEEPSPEED_CONFIG="scripts/zero3.json"
 
 # Model architecture parameters
-MM_TUNABLE_PARTS="mm_mlp_adapter,mm_language_model"
+MM_TUNABLE_PARTS="mm_mlp_adapter,mm_vision_resampler,mm_language_model"
 MM_VISION_TOWER_LR="1e-6"
 MM_PROJECTOR_TYPE="mlp2x_gelu"
 MM_VISION_SELECT_LAYER="-2"
@@ -141,19 +88,20 @@ LORA_ALPHA="16"
 # Training hyperparameters
 NUM_TRAIN_EPOCHS="2"
 PER_DEVICE_TRAIN_BATCH_SIZE="2"
-PER_DEVICE_EVAL_BATCH_SIZE="1"
-GRADIENT_ACCUMULATION_STEPS="1"
-LEARNING_RATE="1e-5"
+PER_DEVICE_EVAL_BATCH_SIZE="4"
+GRADIENT_ACCUMULATION_STEPS="2"
+GRADIENT_CHECKPOINTING="True"
+LEARNING_RATE="5e-6"
 WEIGHT_DECAY="0."
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
 
 # Evaluation and saving
 EVALUATION_STRATEGY="steps"
-EVAL_STEPS="2000"
+EVAL_STEPS="10000"
 SAVE_STRATEGY="steps"
-SAVE_STEPS="1000"
-SAVE_TOTAL_LIMIT="2"
+SAVE_STEPS="5000"
+SAVE_TOTAL_LIMIT="20"
 LOGGING_STEPS="100"
 
 # Precision and performance
@@ -212,6 +160,7 @@ echo "Epochs: ${NUM_TRAIN_EPOCHS}"
 echo "Train Batch Size: ${PER_DEVICE_TRAIN_BATCH_SIZE}"
 echo "Eval Batch Size: ${PER_DEVICE_EVAL_BATCH_SIZE}"
 echo "Gradient Accumulation Steps: ${GRADIENT_ACCUMULATION_STEPS}"
+echo "Gradient Checkpointing: ${GRADIENT_CHECKPOINTING}"
 echo "Learning Rate: ${LEARNING_RATE}"
 echo "Weight Decay: ${WEIGHT_DECAY}"
 echo "Warmup Ratio: ${WARMUP_RATIO}"
@@ -275,7 +224,8 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
     --logging_steps ${LOGGING_STEPS} \
     --tf32 ${TF32} \
-    --model_max_length ${MODEL_MAX_LENGTH}
+    --model_max_length ${MODEL_MAX_LENGTH} \
+    --gradient_checkpointing ${GRADIENT_CHECKPOINTING}
     # --dataloader_num_workers 12 \
     # --lazy_preprocess True \
     # --report_to wandb \
@@ -283,7 +233,6 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     # --attn_implementation sdpa \
     # --optim "adamw_torch_fused" \
     # --max_grad_norm 1.0 \
-    # --save_safetensors True 2>&1
-    # --gradient_checkpointing True
+    # --save_safetensors True
 
 echo "Direct finetune training completed at $(date)"
