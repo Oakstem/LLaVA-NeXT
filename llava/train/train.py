@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
-from typing import Dict, Optional, Sequence, List
+from typing import Dict, Optional, Sequence, List, Any
 from PIL import Image, ImageFile
 from packaging import version
 import numpy as np
@@ -118,6 +118,11 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data, in llava's instruction.json format. Supporting multiple json files via /path/to/{a,b,c}.json"})
+    # Split dataset parameters
+    use_split_dataset: bool = field(default=False, metadata={"help": "Whether to use pre-split train/val datasets"})
+    split_dataset_dir: Optional[str] = field(default=None, metadata={"help": "Directory containing split datasets (with train.json and val.json)"})
+    dataset_name: Optional[str] = field(default=None, metadata={"help": "Name of the dataset when using split datasets"})
+    
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     early_mix_text: bool = False
@@ -952,26 +957,78 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
     return dict(input_ids=input_ids, labels=targets)
 
 
+def load_split_dataset(data_args: DataArguments, split: str = "train") -> List[Dict[str, Any]]:
+    """
+    Load dataset from split dataset directory structure.
+    
+    Args:
+        data_args: DataArguments containing split dataset configuration
+        split: Either "train" or "val"
+        
+    Returns:
+        List of data samples
+    """
+    if not data_args.use_split_dataset:
+        raise ValueError("use_split_dataset must be True to load split datasets")
+    
+    if data_args.split_dataset_dir is None:
+        raise ValueError("split_dataset_dir must be specified when using split datasets")
+    
+    if data_args.dataset_name is None:
+        raise ValueError("dataset_name must be specified when using split datasets")
+    
+    # Check if config file exists and load it for validation
+    config_path = os.path.join(data_args.split_dataset_dir, data_args.dataset_name, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            rank0_print(f"Loading split dataset: {config['dataset_name']}")
+            rank0_print(f"Total samples in dataset: {config['total_samples']}")
+    
+    # Load the split file
+    split_file = f"{split}.json"
+    split_path = os.path.join(data_args.split_dataset_dir, data_args.dataset_name, split_file)
+    
+    if not os.path.exists(split_path):
+        raise FileNotFoundError(f"Split file not found: {split_path}")
+    
+    rank0_print(f"Loading {split} split from {split_path}")
+    
+    with open(split_path, 'r') as f:
+        data = json.load(f)
+    
+    rank0_print(f"Loaded {len(data)} samples from {split} split")
+    return data
+
+
 class LazySupervisedDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments):
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, split: str = "train"):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.list_data_dict = []
+        self.split = split
 
-        # Handle multiple JSON files specified in the data_path
-        if "{" in data_path and "}" in data_path:
-            base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
-            file_names = file_pattern.split(",")
-            rank0_print(f"Loading {file_names} from {base_path}")
-            data_args.dataset_paths = []
-            for file_name in file_names:
-                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
-                full_path = f"{base_path}{file_name}.json"
-                rank0_print(f"Loading {full_path}")
-                with open(full_path, "r") as file:
-                    cur_data_dict = json.load(file)
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
-                    self.list_data_dict.extend(cur_data_dict)
+        # Check if using split dataset mode
+        if data_args.use_split_dataset:
+            rank0_print(f"Loading split dataset for {split}")
+            self.list_data_dict = load_split_dataset(data_args, split)
+            data_args.dataset_paths = [os.path.join(data_args.split_dataset_dir, data_args.dataset_name, f"{split}.json")]
+        else:
+            # Original dataset loading logic
+            # Handle multiple JSON files specified in the data_path
+            if "{" in data_path and "}" in data_path:
+                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+                file_names = file_pattern.split(",")
+                rank0_print(f"Loading {file_names} from {base_path}")
+                data_args.dataset_paths = []
+                for file_name in file_names:
+                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                    full_path = f"{base_path}{file_name}.json"
+                    rank0_print(f"Loading {full_path}")
+                    with open(full_path, "r") as file:
+                        cur_data_dict = json.load(file)
+                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                        self.list_data_dict.extend(cur_data_dict)
         elif data_path.endswith(".yaml"):
             with open(data_path, "r") as file:
                 yaml_data = yaml.safe_load(file)
@@ -1288,9 +1345,36 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+    
+    if data_args.use_split_dataset:
+        # Create both train and validation datasets from split data
+        rank0_print("Creating train and validation datasets from split data")
+        train_dataset = LazySupervisedDataset(
+            tokenizer=tokenizer, 
+            data_path=data_args.data_path, 
+            data_args=data_args, 
+            split="train"
+        )
+        eval_dataset = LazySupervisedDataset(
+            tokenizer=tokenizer, 
+            data_path=data_args.data_path, 
+            data_args=data_args, 
+            split="val"
+        )
+        rank0_print(f"Created train dataset with {len(train_dataset)} samples")
+        rank0_print(f"Created validation dataset with {len(eval_dataset)} samples")
+    else:
+        # Original behavior - only training dataset
+        train_dataset = LazySupervisedDataset(
+            tokenizer=tokenizer, 
+            data_path=data_args.data_path, 
+            data_args=data_args,
+            split="train"
+        )
+        eval_dataset = None
+    
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
