@@ -13,15 +13,43 @@
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
 # ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20250922_124635/checkpoint-12000}"
-ADAPTER_PATH="${ADAPTER_PATH:-}"
+ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20250926_145244/checkpoint-15000}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 
 # Inference parameters
-IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/baseline_images/39740.png}"
-PROMPT="${PROMPT:-where the woman is looking at?}"
+IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/baseline_images/11865.jpg}"
+# if [ -z "$PROMPT" ]; then
+#     read -r -d '' PROMPT <<'EOF'
+# You are an expert vision assistant.
+# Step 1 - Caption
+# • Provide one concise sentence that broadly describes the entire scene.
+# • Begin the line with: Caption:
+# Step 2 - Foreground people & gaze
+# 1. Detect every person whose height is at least 5% of the image (foreground).
+# 2. List them from left to right and number sequentially starting at 1.
+# For each person output exactly one line in this format:
+# Person {N}: {short description}, looking at {target | outside the frame | uncertain}
+# 3. If there are more then 1 person, describe their social interactions.
+# Output format (no extra lines, no prose other than what is specified):
+# -------------------------------------------------
+# Caption: {your one-sentence scene description}
+# Person 1: {short description}, looking at ...
+# Person 2: {short description}, looking at ...
+# ...
+# Social interactions: {describe any social interactions briefly}
+# -------------------------------------------------
+# Additional rules
+# • Keep the phrase "looking at" unchanged.
+# • {short description} must be 6 words or fewer (e.g., "man in red jacket").
+# • If no foreground person is detected, write exactly: No foreground people detected.
+# • If gaze cannot be determined, use "uncertain".
+# • Do not output your reasoning or any extra text.
+# EOF
+# fi
+PROMPT="${PROMPT:-Describe where every person in the image is looking and whats their interaction.}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.9}"
 TOP_P="${TOP_P:-0.8}"
 NUM_BEAMS="${NUM_BEAMS:-1}"
