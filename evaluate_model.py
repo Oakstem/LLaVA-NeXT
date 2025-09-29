@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
 from tqdm import tqdm
 import torch
-import torch.nn.functional as F
 import time
 import os
 import math
@@ -173,50 +172,6 @@ def prepare_image_tensor(image_path: str, image_processor, model) -> Optional[Tu
         return None
 
 
-def calculate_loss(
-    labels: torch.Tensor,
-    logits: torch.Tensor,
-    ignore_index: int = IGNORE_INDEX,
-) -> float:
-    """
-    Calculate cross-entropy loss between predicted logits and target labels.
-    This matches the loss calculation used during training.
-    """
-    if logits.ndim != 3 or labels.ndim != 2 and labels.ndim != 3:
-        raise ValueError("Expected logits with shape [batch, seq, vocab] and labels with matching batch/seq dimensions")
-
-    # Ensure labels live on the same device/dtype as logits before mutation
-    labels = labels.to(logits.device)
-
-    # Align rank of labels with logits if needed (e.g. squeeze batch dim)
-    if labels.ndim == 2 and logits.size(0) == 1:
-        labels = labels.unsqueeze(0)
-
-    # Replace any invalid target IDs (e.g. IMAGE_TOKEN_INDEX) with ignore_index to avoid CUDA assertions
-    vocab_size = logits.size(-1)
-    invalid_mask = (labels >= vocab_size) | (labels < 0)
-    if invalid_mask.any():
-        labels = labels.clone()
-        labels[invalid_mask] = ignore_index
-
-    # Simple cross-entropy loss calculation
-    shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab_size)
-    shift_labels = labels[..., 1:].contiguous().view(-1).long()
-
-    valid_mask = shift_labels != ignore_index
-    if not valid_mask.any():
-        return float('nan')
-
-    loss = F.cross_entropy(
-        shift_logits.float(),
-        shift_labels,
-        ignore_index=ignore_index,
-        reduction='mean',
-    )
-
-    return loss.item()
-
-
 def compute_ground_truth_loss(
     prompt_text: str,
     ground_truth: str,
@@ -266,13 +221,19 @@ def compute_ground_truth_loss(
         with torch.inference_mode():
             outputs = model(
                 input_ids=input_ids,
+                labels=labels,
                 images=image_tensor,
                 image_sizes=[list(image_size)],
                 modalities=["image"],
                 use_cache=False,
+                return_dict=True,
             )
 
-        return calculate_loss(labels, outputs.logits, ignore_index=IGNORE_INDEX)
+        loss_tensor = getattr(outputs, "loss", None)
+        if loss_tensor is None:
+            return None
+
+        return loss_tensor.detach().to("cpu", dtype=torch.float32).item()
     except Exception as exc:  # pragma: no cover - best effort safeguard
         print(f"Loss calculation failed: {exc}")
         return None
