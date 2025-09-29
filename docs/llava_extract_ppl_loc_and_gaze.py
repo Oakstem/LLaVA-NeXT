@@ -31,6 +31,45 @@ def save_results_to_json(results_dict, output_path):
     except Exception as e:
         print(f"Error saving results to JSON: {e}")
 
+def load_processed_images(processed_file_path):
+    """
+    Load already processed image IDs from a text file.
+
+    Args:
+        processed_file_path (str or Path): Path to file containing processed image IDs
+
+    Returns:
+        set: Set of processed image IDs (stems without extension and without _attn suffix)
+    """
+    processed_ids = set()
+    
+    if not processed_file_path:
+        return processed_ids
+        
+    processed_path = Path(processed_file_path)
+    if not processed_path.exists():
+        print(f"Warning: Processed file {processed_path} does not exist. Will process all images.")
+        return processed_ids
+    
+    try:
+        with open(processed_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    # Remove _attn suffix if present to get the original image ID
+                    if line.endswith('_attn'):
+                        image_id = line[:-5]  # Remove '_attn'
+                    else:
+                        image_id = line
+                    processed_ids.add(image_id)
+        
+        print(f"Loaded {len(processed_ids)} processed image IDs from {processed_path}")
+    except Exception as e:
+        print(f"Error reading processed file {processed_path}: {e}")
+        print("Will process all images.")
+    
+    return processed_ids
+
 def find_image_files(path, extensions, recursive=False):
     """
     Find all image files in the given path with specified extensions.
@@ -71,6 +110,7 @@ def main():
     parser.add_argument("--recursive", action="store_true", help="Recursively process images in subdirectories.")
     parser.add_argument("--image-extensions", default=".jpg,.jpeg,.png,.webp", help="Comma-separated list of image extensions to process (e.g., '.jpg,.png').")
     parser.add_argument("--start-from", type=str, help="Image ID (stem name without extension) to start processing from, skipping all images that come before it in sorted order.")
+    parser.add_argument("--skip-processed", type=str, default="ppl_loc_processed.txt", help="Path to a text file containing already processed image IDs (one per line). Images in this file will be skipped.")
 
     # Prompt options
     parser.add_argument("--prompt", default=None, help="Text prompt for the model.")
@@ -167,6 +207,17 @@ def main():
         print(f"Error: No image files found with extensions {image_extensions} in {args.image_path}")
         return
 
+    # Load processed images if skip-processed is provided
+    processed_images = load_processed_images(args.skip_processed)
+    
+    # Filter out already processed images
+    skipped_processed = 0
+    if processed_images:
+        original_count_before_filter = len(image_paths)
+        image_paths = [img_path for img_path in image_paths 
+                      if Path(img_path).stem not in processed_images]
+        skipped_processed = original_count_before_filter - len(image_paths)
+
     # Filter images based on start_from argument
     original_image_count = len(image_paths)
     if args.start_from:
@@ -184,6 +235,8 @@ def main():
             print(f"Warning: Image with ID '{args.start_from}' not found. Processing all images.")
 
     print(f"Found {original_image_count} total image(s), processing {len(image_paths)} image(s)")
+    if skipped_processed > 0:
+        print(f"Skipped {skipped_processed} already processed images")
 
     # --- Create Timestamped Output Directory ---
     # Sanitize the prompt for use in the directory name
@@ -225,7 +278,7 @@ def main():
 
     # Process all images
     start_time = time.time()
-    skipped_count = original_image_count - len(image_paths)
+    total_skipped_count = skipped_processed + (original_image_count - len(image_paths))
     
     for img_idx, image_path in enumerate(image_paths):
         # Progress reporting
@@ -243,13 +296,13 @@ def main():
             time_per_image = time_elapsed / img_idx
             eta_seconds = time_per_image * (len(image_paths) - img_idx)
             eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
-            if skipped_count > 0:
-                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%, skipped {skipped_count}) - ETA: {eta_str}"
+            if total_skipped_count > 0:
+                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%, skipped {total_skipped_count}) - ETA: {eta_str}"
             else:
                 progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%) - ETA: {eta_str}"
         else:
-            if skipped_count > 0:
-                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%, skipped {skipped_count})"
+            if total_skipped_count > 0:
+                progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%, skipped {total_skipped_count})"
             else:
                 progress_msg = f"Processing image {img_idx+1}/{len(image_paths)} (ID: {current_image_id}, {percent_complete:.1f}%)"
 
@@ -325,8 +378,8 @@ def main():
 
     total_time = time.time() - start_time
     print(f"\n{'-'*80}")
-    if skipped_count > 0:
-        print(f"All {len(image_paths)} images processed (skipped {skipped_count}) in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
+    if total_skipped_count > 0:
+        print(f"All {len(image_paths)} images processed (skipped {total_skipped_count} total) in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
     else:
         print(f"All {len(image_paths)} images processed in {time.strftime('%H:%M:%S', time.gmtime(total_time))}")
     print(f"Generated text results saved in individual layer directories")
