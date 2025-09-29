@@ -10,9 +10,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 import time
 import os
 from collections import defaultdict
@@ -36,6 +37,7 @@ from llava.mm_utils import (
 from llava.constants import (
     DEFAULT_IMAGE_TOKEN,
     IMAGE_TOKEN_INDEX,
+    IGNORE_INDEX,
 )
 from llava.conversation import conv_templates
 
@@ -80,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     # Other arguments
     parser.add_argument("--disable-optimizations", action="store_true", help="Skip enabling CUDA optimizations.")
     parser.add_argument("--verbose", action="store_true", help="Print detailed progress information.")
+    parser.add_argument("--safe-mode", action="store_true", help="Enable safe mode with more aggressive memory cleanup and smaller batches.")
+    parser.add_argument("--no-loss", action="store_true", help="Disable loss calculation entirely to avoid CUDA errors.")
     
     return parser.parse_args()
 
@@ -123,8 +127,21 @@ def determine_template(model_name: str, override: Optional[str]) -> str:
 def prepare_image_tensor(image_path: str, image_processor, model) -> Optional[Tuple[torch.Tensor, Tuple[int, int]]]:
     """Prepare image tensor, return None if image cannot be loaded."""
     try:
+        # Clear CUDA cache before processing (with error handling)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass  # Ignore CUDA errors during cache cleanup
+            
         pil_image = load_image(image_path)
-        processed = process_images([pil_image], image_processor, model.config)
+        
+        # Process image with error handling
+        try:
+            processed = process_images([pil_image], image_processor, model.config)
+        except Exception as e:
+            print(f"Error in process_images for {image_path}: {e}")
+            return None
 
         if isinstance(processed, tuple):
             image_tensor = processed[0]
@@ -142,11 +159,98 @@ def prepare_image_tensor(image_path: str, image_processor, model) -> Optional[Tu
         if not isinstance(image_tensor, torch.Tensor):
             return None
 
-        image_tensor = image_tensor.to(model.device, dtype=model.dtype)
+        # Move to device with error handling
+        try:
+            image_tensor = image_tensor.to(model.device, dtype=model.dtype)
+        except Exception as e:
+            print(f"CUDA error when moving tensor to device for {image_path}: {e}")
+            return None
+            
         return image_tensor, pil_image.size
     
     except Exception as e:
         print(f"Error loading image {image_path}: {e}")
+        return None
+
+
+def calculate_loss(
+    labels: torch.Tensor,
+    logits: torch.Tensor,
+    ignore_index: int = IGNORE_INDEX,
+) -> float:
+    """
+    Calculate cross-entropy loss between predicted logits and target labels.
+    This matches the loss calculation used during training.
+    """
+    # Simple cross-entropy loss calculation
+    loss_fct = F.cross_entropy
+    # Flatten the tokens
+    shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+    shift_labels = labels[..., 1:].contiguous().view(-1)
+    # Move labels to same device as logits
+    shift_labels = shift_labels.to(shift_logits.device)
+    loss = loss_fct(shift_logits, shift_labels, ignore_index=ignore_index)
+    return loss.item()
+
+
+def compute_ground_truth_loss(
+    prompt_text: str,
+    ground_truth: str,
+    tokenizer,
+    model,
+    conv_template: str,
+    image_tensor: torch.Tensor,
+    image_size: Tuple[int, int],
+) -> Optional[float]:
+    """Teacher-force the ground truth response to compute language modeling loss."""
+    try:
+        conv = conv_templates[conv_template].copy()
+        conv.tokenizer = tokenizer
+
+        if DEFAULT_IMAGE_TOKEN not in prompt_text:
+            user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt_text}"
+        else:
+            user_content = prompt_text
+
+        conv.append_message(conv.roles[0], user_content)
+        conv.append_message(conv.roles[1], ground_truth)
+        full_prompt = conv.get_prompt()
+
+        input_ids = tokenizer_image_token(
+            full_prompt,
+            tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        ).unsqueeze(0).to(model.device)
+
+        labels = input_ids.clone()
+
+        prompt_conv = conv_templates[conv_template].copy()
+        prompt_conv.tokenizer = tokenizer
+        prompt_conv.append_message(prompt_conv.roles[0], user_content)
+        prompt_conv.append_message(prompt_conv.roles[1], None)
+        prompt_only_ids = tokenizer_image_token(
+            prompt_conv.get_prompt(),
+            tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        )
+
+        prompt_length = prompt_only_ids.size(-1)
+        labels[:, :prompt_length] = IGNORE_INDEX
+
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=input_ids,
+                images=image_tensor,
+                image_sizes=[list(image_size)],
+                modalities=["image"],
+                use_cache=False,
+            )
+
+        return calculate_loss(labels, outputs.logits, ignore_index=IGNORE_INDEX)
+    except Exception as exc:  # pragma: no cover - best effort safeguard
+        print(f"Loss calculation failed: {exc}")
         return None
 
 
@@ -158,7 +262,8 @@ def generate_response(
     model,
     conv_template: str,
     generation_kwargs: dict,
-) -> str:
+    return_loss_data: bool = False,
+) -> Union[str, Tuple[str, torch.Tensor, torch.Tensor]]:
     """Generate response for a single prompt using iterative token generation similar to extract_attention script."""
     
     # Create conversation
@@ -197,6 +302,10 @@ def generate_response(
     # Prepare image sizes as [width, height] for model
     image_sizes = [list(image_size)]
     
+    # Store logits and labels for loss calculation if requested
+    all_logits = [] if return_loss_data else None
+    all_labels = [] if return_loss_data else None
+    
     # Generation loop - similar to extract_attention script
     for i in range(max_new_tokens):
         with torch.inference_mode():
@@ -220,6 +329,10 @@ def generate_response(
             # Generate next token
             outputs = model(**model_inputs)
             next_token_logits = outputs.logits[:, -1, :]
+            
+            # Store logits for loss calculation if requested
+            if return_loss_data:
+                all_logits.append(outputs.logits.cpu())
             
             # Apply generation strategy (sampling vs greedy)
             if generation_kwargs.get("do_sample", False):
@@ -267,6 +380,10 @@ def generate_response(
             # Add token to generated sequence
             generated_tokens.append(next_token_id.item())
             
+            # Store labels for loss calculation if requested
+            if return_loss_data:
+                all_labels.append(next_token_id.cpu())
+            
             # Update for next iteration - ensure proper dimensions like in extract_attention script
             current_input_ids = next_token_id.view(1, -1)
                 
@@ -275,6 +392,13 @@ def generate_response(
     
     # Decode the generated tokens
     response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    
+    if return_loss_data and all_logits and all_labels:
+        # Concatenate logits and labels for loss calculation
+        logits_tensor = torch.cat(all_logits, dim=1)  # Shape: [batch_size, seq_len, vocab_size]
+        labels_tensor = torch.cat(all_labels, dim=0).unsqueeze(0)  # Shape: [batch_size, seq_len]
+        return response, logits_tensor, labels_tensor
+    
     return response
 
 
@@ -319,6 +443,12 @@ def main():
     
     if args.load_4bit and args.load_8bit:
         raise ValueError("Cannot enable both --load-4bit and --load-8bit.")
+    
+    # Set CUDA launch blocking for better error reporting
+    import os
+    if torch.cuda.is_available():
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        print("Set CUDA_LAUNCH_BLOCKING=1 for better error reporting")
     
     # Enable optimizations
     if not args.disable_optimizations:
@@ -375,11 +505,22 @@ def main():
     ground_truths = []
     failed_samples = []
     evaluation_results = []
+    losses = []
     
     start_time = time.time()
     
-    for i, sample in enumerate(tqdm(dataset, desc="Evaluating samples")):
-        sample_id = sample.get("id", f"sample_{i}")
+    # Process in smaller batches to prevent memory issues
+    batch_size = 1 if args.safe_mode else 5  # Process 1 sample at a time in safe mode, 5 otherwise
+    
+    for batch_start in range(0, len(dataset), batch_size):
+        batch_end = min(batch_start + batch_size, len(dataset))
+        batch_samples = dataset[batch_start:batch_end]
+        
+        print(f"Processing batch {batch_start//batch_size + 1}/{(len(dataset) + batch_size - 1)//batch_size} (samples {batch_start+1}-{batch_end})")
+        
+        for i, sample in enumerate(tqdm(batch_samples, desc=f"Batch {batch_start//batch_size + 1}")):
+            sample_idx = batch_start + i
+            sample_id = sample.get("id", f"sample_{sample_idx}")
         image_path = sample.get("image", "")
         conversations = sample.get("conversations", [])
         
@@ -431,8 +572,9 @@ def main():
         
         image_tensor, image_size = image_result
         
-        # Generate prediction
+        # Generate prediction (loss calculation temporarily disabled due to CUDA assertion errors)
         try:
+            # Generate prediction normally
             prediction = generate_response(
                 prompt,
                 image_tensor,
@@ -443,23 +585,35 @@ def main():
                 generation_kwargs,
             )
             
+            # Temporarily disable loss calculation to avoid CUDA assertion errors
+            # TODO: Fix loss calculation with proper token ID validation
+            sample_loss = None
             predictions.append(prediction)
             ground_truths.append(ground_truth)
+            if sample_loss is not None:
+                losses.append(sample_loss)
+                if args.verbose:
+                    print(f"Sample {sample_id} loss: {sample_loss:.4f}")
             
             # Store detailed result
-            evaluation_results.append({
+            result = {
                 "id": sample_id,
                 "image_path": str(full_image_path),
                 "prompt": prompt,
                 "ground_truth": ground_truth,
                 "prediction": prediction,
                 "success": True
-            })
+            }
+            if sample_loss is not None:
+                result["loss"] = sample_loss
+            evaluation_results.append(result)
             
             if args.verbose:
                 print(f"Prompt: {prompt}")
                 print(f"Ground truth: {ground_truth}")
                 print(f"Prediction: {prediction}")
+                if sample_loss is not None:
+                    print(f"Loss: {sample_loss:.6f}")
                 print("-" * 40)
         
         except Exception as e:
@@ -470,6 +624,23 @@ def main():
                 "ground_truth": ground_truth
             })
             continue
+        
+        finally:
+            # Clean up GPU memory after each sample to prevent CUDA errors
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass  # Ignore CUDA errors during cleanup
+        
+        # Clean up GPU memory after each batch
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                if args.verbose:
+                    print(f"Cleaned GPU memory after batch {batch_start//batch_size + 1}")
+            except RuntimeError:
+                pass  # Ignore CUDA errors during cleanup
     
     end_time = time.time()
     evaluation_time = end_time - start_time
@@ -488,8 +659,18 @@ def main():
             except Exception as e:
                 print(f"Warning: Could not calculate advanced metrics: {e}")
         
+        # Calculate loss metrics if available
+        loss_metrics = {}
+        if losses:
+            loss_metrics.update({
+                "average_loss": sum(losses) / len(losses),
+                "min_loss": min(losses),
+                "max_loss": max(losses),
+                "samples_with_loss": len(losses),
+            })
+        
         # Combine all metrics
-        final_metrics = {**basic_metrics, **advanced_metrics}
+        final_metrics = {**basic_metrics, **advanced_metrics, **loss_metrics}
         
         # Add evaluation statistics
         final_metrics.update({
@@ -509,6 +690,8 @@ def main():
             "failed_samples": len(failed_samples),
             "success_rate": 0.0,
             "evaluation_time_seconds": evaluation_time,
+            "average_loss": None,
+            "samples_with_loss": 0,
         }
     
     # Print results
@@ -516,11 +699,58 @@ def main():
     print("EVALUATION RESULTS")
     print("=" * 60)
     
-    for metric_name, value in final_metrics.items():
-        if isinstance(value, float):
-            print(f"{metric_name}: {value:.4f}")
+    # Print basic metrics
+    if predictions:
+        print("\n📊 BASIC METRICS:")
+        for metric_name, value in basic_metrics.items():
+            if isinstance(value, float):
+                print(f"  {metric_name}: {value:.4f}")
+            else:
+                print(f"  {metric_name}: {value}")
+        
+        # Print advanced metrics if available
+        if advanced_metrics:
+            print("\n🔍 ADVANCED METRICS:")
+            for metric_name, value in advanced_metrics.items():
+                if isinstance(value, float):
+                    print(f"  {metric_name}: {value:.4f}")
+                else:
+                    print(f"  {metric_name}: {value}")
+        
+        # Print loss metrics prominently
+        if loss_metrics:
+            print("\n📉 LOSS METRICS:")
+            for metric_name, value in loss_metrics.items():
+                if isinstance(value, float):
+                    print(f"  {metric_name}: {value:.6f}")
+                else:
+                    print(f"  {metric_name}: {value}")
         else:
-            print(f"{metric_name}: {value}")
+            print("\n⚠️  LOSS METRICS: No loss values calculated")
+        
+        # Print evaluation statistics
+        print("\n📈 EVALUATION STATISTICS:")
+        stats_metrics = {
+            "total_samples": final_metrics["total_samples"],
+            "successful_predictions": final_metrics["successful_predictions"],
+            "failed_samples": final_metrics["failed_samples"],
+            "success_rate": final_metrics["success_rate"],
+            "evaluation_time_seconds": final_metrics["evaluation_time_seconds"],
+            "average_time_per_sample": final_metrics["average_time_per_sample"],
+        }
+        for metric_name, value in stats_metrics.items():
+            if isinstance(value, float):
+                print(f"  {metric_name}: {value:.4f}")
+            else:
+                print(f"  {metric_name}: {value}")
+    
+    else:
+        print("\n❌ No successful predictions to evaluate!")
+        for metric_name, value in final_metrics.items():
+            if isinstance(value, float):
+                print(f"  {metric_name}: {value:.4f}")
+            else:
+                print(f"  {metric_name}: {value}")
     
     # Save results
     print(f"\n5. Saving results to {output_dir}...")
@@ -565,7 +795,18 @@ def main():
     print("\nEvaluation completed successfully!")
     
     if failed_samples:
-        print(f"\nWarning: {len(failed_samples)} samples failed to process. Check failed_samples.json for details.")
+        print(f"\n⚠️  Warning: {len(failed_samples)} samples failed to process. Check failed_samples.json for details.")
+    
+    # Print loss summary
+    if losses:
+        print(f"\n� Loss Summary: Calculated loss for {len(losses)}/{len(predictions)} successful predictions")
+        print(f"   Average Loss: {sum(losses)/len(losses):.6f}")
+        print(f"   Loss Range: {min(losses):.6f} - {max(losses):.6f}")
+    else:
+        if args.no_loss:
+            print(f"\n📊 Loss calculation was disabled via --no-loss flag.")
+        else:
+            print(f"\n⚠️  No loss values were calculated. Consider using --verbose for debugging.")
 
 
 if __name__ == "__main__":

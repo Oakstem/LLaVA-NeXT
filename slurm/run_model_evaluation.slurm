@@ -9,6 +9,7 @@
 #SBATCH --mem=32G
 #SBATCH --nodes=1
 
+
 # Configuration variables - modify these as needed
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
@@ -35,6 +36,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./evaluation_results/eval_$(date +%Y%m%d_%H%M%S)}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-true}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 VERBOSE="${VERBOSE:-true}"
+SAFE_MODE="${SAFE_MODE:-true}"  # Enable safe mode by default for CUDA stability
 
 # Create necessary directories
 mkdir -p logs
@@ -75,6 +77,7 @@ echo "  Output Directory: $OUTPUT_DIR"
 echo "  Save Predictions: $SAVE_PREDICTIONS"
 echo "  Batch Size: $BATCH_SIZE"
 echo "  Verbose: $VERBOSE"
+echo "  Safe Mode: $SAFE_MODE"
 echo "=========================================="
 
 # Validate required files exist
@@ -119,6 +122,11 @@ echo ""
 # Set environment variables
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT:$PYTHONPATH"
+# Enable CUDA debugging
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1
+# Reduce CUDA memory fragmentation
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
 # Change to the project directory
 cd /galitylab/students/alonmardi/projects/LLaVA-NeXT
@@ -184,6 +192,11 @@ fi
 # Add verbose option
 if [ "$VERBOSE" = "true" ]; then
     ARGS+=("--verbose")
+fi
+
+# Add safe mode option
+if [ "$SAFE_MODE" = "true" ]; then
+    ARGS+=("--safe-mode")
 fi
 
 # Add limit option for testing
