@@ -204,6 +204,18 @@ def compute_ground_truth_loss(
 
         labels = input_ids.clone()
 
+        # Mask out image placeholder tokens so they do not participate in the loss
+        labels = labels.to(model.device)
+        invalid_label_mask = labels < 0
+        if invalid_label_mask.any():
+            labels = labels.masked_fill(invalid_label_mask, IGNORE_INDEX)
+
+        vocab_size = getattr(model.config, "vocab_size", None)
+        if vocab_size is not None:
+            overflow_mask = labels >= vocab_sizeg
+            if overflow_mask.any():
+                labels = labels.masked_fill(overflow_mask, IGNORE_INDEX)
+
         prompt_conv = conv_templates[conv_template].copy()
         prompt_conv.tokenizer = tokenizer
         prompt_conv.append_message(prompt_conv.roles[0], user_content)
