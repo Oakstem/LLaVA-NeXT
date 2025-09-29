@@ -8,6 +8,7 @@ matching ground truth gaze points with predicted gaze points and calculating err
 import json
 import logging
 import os
+import pickle
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -51,42 +52,181 @@ def iter_person_files(base_dir: Path):
                 yield Path(root) / file
 
 
-def iter_gaze_and_person_files(base_dir: Path):
-    """Yield each layer directory together with its gaze and person files."""
-
+def iter_gaze_and_person_files_optimized(base_dir: Path, skip_gaze_images: Optional[set] = None, skip_person_images: Optional[set] = None):
+    """Efficiently yield gaze and person files for each image using targeted path construction.
+    
+    Args:
+        base_dir: Base directory containing results
+        skip_gaze_images: Optional set of image keys to skip for gaze processing
+        skip_person_images: Optional set of image keys to skip for person processing
+        
+    Yields:
+        Tuple of (layer_dir, gaze_files, person_files) for each image
+    """
     base_dir = Path(base_dir)
-    dir_data: Dict[Path, Dict[str, List[Path]]] = defaultdict(lambda: {'gaze': [], 'person': []})
-
-    for root, dirs, files in os.walk(base_dir, topdown=True):
-        root_path = Path(root)
-        data = dir_data[root_path]
-
-        # Skip if not a layer directory
-        if not root_path.name.startswith('layer_'):
-            continue
-            
-        # Extract layer number and image name from path
-        layer_name = root_path.name
-        parent_path = root_path.parent
-        if not parent_path.name.endswith('_attn'):
-            continue
-            
-        image_name = parent_path.name.replace('_attn', '')
+    
+    # Initialize skip sets if not provided
+    skip_gaze_images = skip_gaze_images or set()
+    skip_person_images = skip_person_images or set()
+    
+    for image_attn_dir in base_dir.glob("*_attn"):
+        image_key = image_attn_dir.name.replace("_attn", "")
+        # Construct paths based on known structure
+        image_attn_dir = base_dir / f"{image_key}_attn"
+        layer_23_dir = image_attn_dir / "layer_23"
         
-        # Look for gaze files in the expected structure
-        each_person_dir = root_path / 'each_person_attn_maps'
-        if not each_person_dir.exists():
+        # Skip if layer directory doesn't exist
+        if not layer_23_dir.exists():
             continue
-            
-        gaze_files = list(each_person_dir.glob('**/gaze*_smooth_centers.pt'))
-
-        # Look for person segmentation file
+        
+        # Find all gaze files for this image using single glob (skip if already processed)
+        gaze_files = []
+        if image_key not in skip_gaze_images:
+            each_person_dir = layer_23_dir / "each_person_attn_maps"
+            if each_person_dir.exists():
+                # Single glob to find all gaze files for all persons in this image
+                gaze_files = list(each_person_dir.glob("person_*/gaze_target_*_attn_map_smooth_centers.pt"))
+        
+        # Find person segmentation file for this image (skip if already processed)
         person_files = []
-        person_files = list(root_path.glob("segmentation_results/*_all_segmentation_results.json"))
+        if image_key not in skip_person_images:
+            segmentation_dir = layer_23_dir / "segmentation_results"
+            if segmentation_dir.exists():
+                person_file = segmentation_dir / f"{image_key}_all_segmentation_results.json"
+                if person_file.exists():
+                    person_files = [person_file]
         
-        # Yield if we have both types of files
-        # if gaze_files and person_files:
-        yield root_path, gaze_files, person_files
+        # Yield if we have any files for this image
+        if gaze_files or person_files:
+            yield layer_23_dir, gaze_files, person_files
+
+
+def create_file_mapping_cache(base_dir: Path, cache_file: Optional[Path] = None, 
+                             force_rebuild: bool = False) -> Dict[str, Dict[str, List[Path]]]:
+    """Create a comprehensive file mapping cache for all images and their associated files.
+    
+    Args:
+        base_dir: Base directory containing results
+        cache_file: Path to cache file (if None, uses default location)
+        force_rebuild: Whether to force rebuilding the cache even if it exists
+        
+    Returns:
+        Dictionary mapping image_key -> {'gaze_files': [...], 'person_files': [...]}
+    """
+    if cache_file is None:
+        cache_file = base_dir.parent / f"{base_dir.name}_file_mapping_cache.pkl"
+    
+    # Check if cache exists and is newer than the base directory
+    if not force_rebuild and cache_file.exists():
+        try:
+            cache_mtime = cache_file.stat().st_mtime
+            base_dir_mtime = base_dir.stat().st_mtime
+            
+            # Check if any subdirectories are newer than cache
+            newest_subdir_time = base_dir_mtime
+            for subdir in base_dir.glob("*_attn"):
+                if subdir.is_dir():
+                    subdir_mtime = subdir.stat().st_mtime
+                    newest_subdir_time = max(newest_subdir_time, subdir_mtime)
+            
+            if cache_mtime >= newest_subdir_time:
+                logger.info(f"Loading file mapping from cache: {cache_file}")
+                with open(cache_file, 'rb') as f:
+                    file_mapping = pickle.load(f)
+                logger.info(f"Loaded file mapping for {len(file_mapping)} images from cache")
+                return file_mapping
+        except Exception as e:
+            logger.warning(f"Failed to load cache file {cache_file}: {e}. Rebuilding...")
+    
+    logger.info(f"Building comprehensive file mapping cache for {base_dir}...")
+    start_time = time.time()
+    
+    file_mapping = {}
+    total_gaze_files = 0
+    total_person_files = 0
+    total_dirs = 0
+    
+    # Scan all directories once and map all files
+    for image_attn_dir in tqdm(base_dir.glob("*_attn"), desc="Scanning directories"):
+        if not image_attn_dir.is_dir():
+            continue
+            
+        total_dirs += 1
+        image_key = image_attn_dir.name.replace("_attn", "")
+        layer_23_dir = image_attn_dir / "layer_23"
+        
+        # Skip if layer directory doesn't exist
+        if not layer_23_dir.exists():
+            continue
+        
+        # Initialize file lists for this image
+        gaze_files = []
+        person_files = []
+        
+        # Find all gaze files for this image
+        each_person_dir = layer_23_dir / "each_person_attn_maps"
+        if each_person_dir.exists():
+            gaze_files = list(each_person_dir.glob("person_*/gaze_target_*_attn_map_smooth_centers.pt"))
+            total_gaze_files += len(gaze_files)
+        
+        # Find person segmentation file for this image
+        segmentation_dir = layer_23_dir / "segmentation_results"
+        if segmentation_dir.exists():
+            person_file = segmentation_dir / f"{image_key}_all_segmentation_results.json"
+            if person_file.exists():
+                person_files = [person_file]
+                total_person_files += len(person_files)
+        
+        # Store mapping even if no files (helps with skip logic)
+        file_mapping[image_key] = {
+            'gaze_files': gaze_files,
+            'person_files': person_files,
+            'layer_dir': layer_23_dir
+        }
+    
+    elapsed = time.time() - start_time
+    logger.info(f"Scanned {total_dirs} directories in {elapsed:.2f}s")
+    logger.info(f"Found {total_gaze_files} gaze files and {total_person_files} person files for {len(file_mapping)} images")
+    
+    # Save cache
+    logger.info(f"Saving file mapping cache to: {cache_file}")
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(file_mapping, f)
+        logger.info("File mapping cache saved successfully")
+    except Exception as e:
+        logger.error(f"Failed to save cache file: {e}")
+    
+    return file_mapping
+
+
+def iter_from_file_mapping_cache(file_mapping: Dict[str, Dict[str, List[Path]]], 
+                                skip_gaze_images: Optional[set] = None, 
+                                skip_person_images: Optional[set] = None):
+    """Iterate over cached file mappings with optional skip sets.
+    
+    Args:
+        file_mapping: Pre-built file mapping dictionary
+        skip_gaze_images: Optional set of image keys to skip for gaze processing
+        skip_person_images: Optional set of image keys to skip for person processing
+        
+    Yields:
+        Tuple of (layer_dir, gaze_files, person_files) for each image
+    """
+    # Initialize skip sets if not provided
+    skip_gaze_images = skip_gaze_images or set()
+    skip_person_images = skip_person_images or set()
+    
+    for image_key, file_info in file_mapping.items():
+        layer_dir = file_info['layer_dir']
+        
+        # Apply skip logic
+        gaze_files = [] if image_key in skip_gaze_images else file_info['gaze_files']
+        person_files = [] if image_key in skip_person_images else file_info['person_files']
+        
+        # Yield if we have any files for this image
+        if gaze_files or person_files:
+            yield layer_dir, gaze_files, person_files
 
 
 def process_gaze_file(gaze_points_path: Path) -> Optional[Tuple[str, str, torch.Tensor]]:
@@ -347,10 +487,8 @@ class DataValidator:
         """Validate that image path exists and return error message if not."""
         if not image_path:
             return "Empty image path"
-            
-        # Convert path format
-        normalized_path = image_path.replace("\\", os.sep).replace("D:", str(base_data_dir))
-        full_path = Path(normalized_path)
+                   
+        full_path = Path(base_data_dir) / image_path
         
         if not full_path.exists():
             return f"Image file not found: {full_path}"
@@ -380,8 +518,9 @@ class GazeFollowDatasetProcessor:
     """Main processor for GazeFollow dataset with LLaVA gaze prediction results."""
     
     def __init__(self, annot_path: str, base_data_dir_path: str, llava_results_dir: str, 
-                 resume_from_csv: Optional[str] = None, num_workers: Optional[int] = None, 
-                 save_interval: int = 1000):
+                 resume_from_csv: Optional[str] = None, resume_from_pickle: bool = False,
+                 num_workers: Optional[int] = None, save_interval: int = 1000,
+                 use_file_cache: bool = True, force_rebuild_cache: bool = False):
         """Initialize the processor with required paths.
         
         Args:
@@ -389,8 +528,11 @@ class GazeFollowDatasetProcessor:
             base_data_dir_path: Base directory for image data
             llava_results_dir: Directory containing LLaVA results
             resume_from_csv: Optional path to previous CSV file to resume from
+            resume_from_pickle: Whether to resume from saved pickle files (default: False)
             num_workers: Number of parallel workers (None for auto-detect)
             save_interval: Number of processed rows between temporary saves (default: 1000)
+            use_file_cache: Whether to use file mapping cache (default: True)
+            force_rebuild_cache: Whether to force rebuilding the file cache (default: False)
         """
         self.annot_path = fix_wsl_paths(annot_path)
         self.base_data_dir_path = Path(fix_wsl_paths(base_data_dir_path))
@@ -398,6 +540,12 @@ class GazeFollowDatasetProcessor:
         self.results_path = self.llava_results_dir.parent / f"{self.llava_results_dir.name}_results.csv"
         self.temp_results_path = self.llava_results_dir.parent / f"{self.llava_results_dir.name}_results_temp.csv"
         self.resume_from_csv = fix_wsl_paths(resume_from_csv) if resume_from_csv else None
+        self.resume_from_pickle = resume_from_pickle
+        self.temp_gaze_path = self.llava_results_dir.parent / f"{self.llava_results_dir.name}_gaze_temp.pkl"
+        self.temp_person_path = self.llava_results_dir.parent / f"{self.llava_results_dir.name}_person_temp.pkl"
+        self.use_file_cache = use_file_cache
+        self.force_rebuild_cache = force_rebuild_cache
+        self.file_cache_path = self.llava_results_dir.parent / f"{self.llava_results_dir.name}_file_mapping_cache.pkl"
         self.num_workers = num_workers if num_workers else max(1, cpu_count() - 1)
         self.batch_size = self.num_workers * 500  # Larger batches for better throughput
         self.save_interval = save_interval
@@ -412,8 +560,16 @@ class GazeFollowDatasetProcessor:
         logger.info(f"  LLaVA results dir: {self.llava_results_dir}")
         logger.info(f"  Number of workers: {self.num_workers}")
         logger.info(f"  Save interval: {self.save_interval} rows")
+        logger.info(f"  Use file cache: {self.use_file_cache}")
+        if self.use_file_cache:
+            logger.info(f"    File cache path: {self.file_cache_path}")
+            logger.info(f"    Force rebuild cache: {self.force_rebuild_cache}")
         if self.resume_from_csv:
             logger.info(f"  Resume from CSV: {self.resume_from_csv}")
+        if self.resume_from_pickle:
+            logger.info(f"  Resume from pickle files: enabled")
+            logger.info(f"    Gaze pickle: {self.temp_gaze_path}")
+            logger.info(f"    Person pickle: {self.temp_person_path}")
     
     def load_annotations(self) -> pd.DataFrame:
         """Load and process annotation file."""
@@ -508,6 +664,46 @@ class GazeFollowDatasetProcessor:
             logger.info(f"Found {len(processed_rows)} already processed rows")
 
         return previous_df
+    
+    def _load_pickle_data(self) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """Load previously saved gaze and person pickle files.
+        
+        Returns:
+            Tuple of (gaze_data, person_data) or (None, None) if files don't exist or are corrupted
+        """
+        import pickle
+        
+        if not self.resume_from_pickle:
+            return None, None
+            
+        gaze_data = None
+        person_data = None
+        
+        # Try to load gaze data
+        if self.temp_gaze_path.exists():
+            try:
+                with open(self.temp_gaze_path, 'rb') as f:
+                    gaze_data = pickle.load(f)
+                logger.info(f"Successfully loaded gaze data from {self.temp_gaze_path} ({len(gaze_data)} images)")
+            except Exception as e:
+                logger.warning(f"Failed to load gaze pickle file {self.temp_gaze_path}: {e}")
+                gaze_data = None
+        else:
+            logger.info(f"Gaze pickle file not found: {self.temp_gaze_path}")
+            
+        # Try to load person data
+        if self.temp_person_path.exists():
+            try:
+                with open(self.temp_person_path, 'rb') as f:
+                    person_data = pickle.load(f)
+                logger.info(f"Successfully loaded person data from {self.temp_person_path} ({len(person_data)} images)")
+            except Exception as e:
+                logger.warning(f"Failed to load person pickle file {self.temp_person_path}: {e}")
+                person_data = None
+        else:
+            logger.info(f"Person pickle file not found: {self.temp_person_path}")
+            
+        return gaze_data, person_data
     
     def _filter_gaze_points(self, gaze_points_dict: Dict[str, Dict[str, Union[torch.Tensor, np.ndarray]]]) -> Dict[str, Dict[str, Dict]]:
         """Apply outlier filtering to raw gaze points and compute statistics."""
@@ -716,26 +912,66 @@ class GazeFollowDatasetProcessor:
 
     def load_gaze_and_person_data(self, compact_df: pd.DataFrame) -> Tuple[Dict[str, Dict[str, Dict]], Dict[str, Dict]]:
         """Load gaze points and person segmentation data in a single pass over result directories."""
-        logger.info("Loading gaze points and person segmentation data together...")
+        
+        # Try to load from pickle files first if resuming
+        raw_gaze_points, person_bboxes = self._load_pickle_data()
+        
+        # Initialize with loaded data or empty dicts
+        if raw_gaze_points is None:
+            raw_gaze_points = {}
+        if person_bboxes is None:
+            person_bboxes = {}
+            
+        # Track what we loaded from pickle
+        initial_gaze_count = len(raw_gaze_points)
+        initial_person_count = len(person_bboxes)
+        
+        # Create skip sets for files already in pickle data
+        skip_gaze_images = set(raw_gaze_points.keys()) if raw_gaze_points else set()
+        skip_person_images = set(person_bboxes.keys()) if person_bboxes else set()
+        
+        if initial_gaze_count > 0 or initial_person_count > 0:
+            logger.info(f"Loaded from pickle files - gaze: {initial_gaze_count} images, person: {initial_person_count} images")
+            logger.info(f"Will skip {len(skip_gaze_images)} gaze images and {len(skip_person_images)} person images already in pickle data")
 
-        raw_gaze_points: Dict[str, Dict[str, Union[torch.Tensor, np.ndarray]]] = {}
-        person_bboxes: Dict[str, Dict] = {}
+        # Create or load file mapping cache
+        if self.use_file_cache:
+            logger.info("Using file mapping cache for improved performance...")
+            file_mapping = create_file_mapping_cache(
+                self.llava_results_dir, 
+                self.file_cache_path, 
+                self.force_rebuild_cache
+            )
+            file_iterator = iter_from_file_mapping_cache(file_mapping, skip_gaze_images, skip_person_images)
+        else:
+            logger.info("Using direct directory iteration (cache disabled)...")
+            file_iterator = iter_gaze_and_person_files_optimized(
+                self.llava_results_dir, skip_gaze_images, skip_person_images
+            )
+
+        logger.info("Processing gaze points and person segmentation data...")
         total_dirs = 0
         total_gaze_files = 0
         total_person_files = 0
         start_time = time.time()
         last_save_time = start_time
         
-        # Save paths for intermediate data
-        temp_gaze_path = self.llava_results_dir.parent / f"{self.llava_results_dir.name}_gaze_temp.pkl"
-        temp_person_path = self.llava_results_dir.parent / f"{self.llava_results_dir.name}_person_temp.pkl"
+        # Timing variables
+        process_time = 0.0
+        gaze_executor_time = 0.0
+        person_executor_time = 0.0
+        save_time = 0.0
 
         def _process_gaze(files):
             for result in map(process_gaze_file, files):
                 if result is None:
                     continue
                 image_name, person_id, gaze_point = result
-                raw_gaze_points.setdefault(image_name, {})[person_id] = gaze_point
+                # Only add if not already present in loaded data
+                if image_name not in raw_gaze_points:
+                    raw_gaze_points[image_name] = {}
+                if person_id not in raw_gaze_points[image_name]:
+                    raw_gaze_points[image_name][person_id] = gaze_point
 
         def _process_person(files):
             info_iter = ((person_file, compact_df, self.base_data_dir_path) for person_file in files)
@@ -743,7 +979,9 @@ class GazeFollowDatasetProcessor:
                 if result is None:
                     continue
                 image_id, person_data = result
-                person_bboxes[image_id] = person_data
+                # Only add if not already present in loaded data
+                if image_id not in person_bboxes:
+                    person_bboxes[image_id] = person_data
 
         use_parallel = self.num_workers > 1
         gaze_executor = None
@@ -753,68 +991,137 @@ class GazeFollowDatasetProcessor:
             gaze_executor = ProcessPoolExecutor(max_workers=self.num_workers)
             person_executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
-        for _directory, gaze_files, person_files in iter_gaze_and_person_files(self.llava_results_dir):
+        # Process files from the iterator (either cached or direct)
+        process_start_time = time.time()
+        
+        for _directory, gaze_files, person_files in file_iterator:
+            # Measure time for processing
+            dir_process_start = time.time()
+            
             total_dirs += 1
 
             if total_dirs % 1000 == 0:
-                logger.info(
-                    "Scanned %d directories (gaze files: %d, person files: %d)",
-                    total_dirs,
-                    total_gaze_files,
-                    total_person_files,
-                )
+                logger.info(f"Processed {total_dirs} entries (gaze files: {total_gaze_files}, person files: {total_person_files})")
                 
                 # Periodic save every 250 directories
-                current_time = time.time()
-                save_duration = current_time - last_save_time
-                self._save_intermediate_data(raw_gaze_points, person_bboxes, temp_gaze_path, temp_person_path, total_dirs)
-                save_time = time.time() - current_time
-                logger.info(f"Periodic data save completed in {save_time:.2f}s (processing time since last save: {save_duration:.2f}s)")
-                last_save_time = current_time
+                if total_dirs % 250 == 0:
+                    save_start = time.time()
+                    current_time = time.time()
+                    save_duration = current_time - last_save_time
+                    self._save_intermediate_data(raw_gaze_points, person_bboxes, self.temp_gaze_path, self.temp_person_path, total_dirs)
+                    save_elapsed = time.time() - save_start
+                    save_time += save_elapsed
+                    logger.info(f"Periodic data save completed in {save_elapsed:.2f}s (processing time since last save: {save_duration:.2f}s)")
+                    last_save_time = current_time
 
             if gaze_files:
                 total_gaze_files += len(gaze_files)
+                gaze_exec_start = time.time()
+                
                 if use_parallel and gaze_executor is not None:
                     for result in gaze_executor.map(process_gaze_file, gaze_files):
                         if result is None:
                             continue
                         image_name, person_id, gaze_point = result
-                        raw_gaze_points.setdefault(image_name, {})[person_id] = gaze_point
+                        # Only add if not already present in loaded data
+                        if image_name not in raw_gaze_points:
+                            raw_gaze_points[image_name] = {}
+                        if person_id not in raw_gaze_points[image_name]:
+                            raw_gaze_points[image_name][person_id] = gaze_point
                 else:
                     _process_gaze(gaze_files)
+                
+                gaze_sample_executor_time = time.time() - gaze_exec_start
+                gaze_executor_time += gaze_sample_executor_time
 
             if person_files:
                 total_person_files += len(person_files)
+                person_exec_start = time.time()
+                
                 if use_parallel and person_executor is not None:
                     info_iter = ((person_file, compact_df, self.base_data_dir_path) for person_file in person_files)
                     for result in person_executor.map(process_person_file, info_iter):
                         if result is None:
                             continue
                         image_id, person_data = result
-                        person_bboxes[image_id] = person_data
+                        # Only add if not already present in loaded data
+                        if image_id not in person_bboxes:
+                            person_bboxes[image_id] = person_data
                 else:
                     _process_person(person_files)
 
+                person_sample_executor_time = time.time() - person_exec_start
+                person_executor_time += person_sample_executor_time
+
+            # Add to process timing
+            dir_process_time = time.time() - dir_process_start
+            process_time += dir_process_time
+
+        # Shutdown executors and measure shutdown time
+        shutdown_start = time.time()
         if gaze_executor is not None:
             gaze_executor.shutdown(wait=True, cancel_futures=False)
         if person_executor is not None:
             person_executor.shutdown(wait=True, cancel_futures=False)
+        shutdown_time = time.time() - shutdown_start
 
         elapsed = time.time() - start_time
+        
+        # Calculate new data added during this scan
+        new_gaze_count = len(raw_gaze_points) - initial_gaze_count
+        new_person_count = len(person_bboxes) - initial_person_count
+        
+        # Log detailed timing breakdown
         logger.info(
-            f"Loaded {total_gaze_files} gaze files and {total_person_files} person files "
-            f"across {total_dirs} directories in {elapsed:.2f}s"
+            f"Processed {total_gaze_files} gaze files and {total_person_files} person files "
+            f"across {total_dirs} entries in {elapsed:.2f}s"
         )
+        logger.info(f"Data summary: Initial (gaze: {initial_gaze_count}, person: {initial_person_count}) + "
+                   f"New (gaze: {new_gaze_count}, person: {new_person_count}) = "
+                   f"Total (gaze: {len(raw_gaze_points)}, person: {len(person_bboxes)})")
         
-        # Final save before filtering
-        if total_dirs > 0 and total_dirs % 250 != 0:
-            self._save_intermediate_data(raw_gaze_points, person_bboxes, temp_gaze_path, temp_person_path, total_dirs)
-            logger.info("Final intermediate data save before processing")
+        if new_gaze_count == 0 and new_person_count == 0:
+            logger.info("No new files found - all data was already in pickle files")
+        
+        logger.info("Timing breakdown:")
+        if self.use_file_cache:
+            logger.info(f"  File mapping: Used cached mapping")
+        logger.info(f"  File processing: {process_time:.2f}s ({process_time/elapsed*100:.1f}%)")
+        logger.info(f"  Gaze processing: {gaze_executor_time:.2f}s ({gaze_executor_time/elapsed*100:.1f}%)")
+        logger.info(f"  Person processing: {person_executor_time:.2f}s ({person_executor_time/elapsed*100:.1f}%)")
+        logger.info(f"  Intermediate saves: {save_time:.2f}s ({save_time/elapsed*100:.1f}%)")
+        logger.info(f"  Executor shutdown: {shutdown_time:.2f}s ({shutdown_time/elapsed*100:.1f}%)")
+        
+        # Calculate processing rates
+        if gaze_executor_time > 0:
+            gaze_rate = total_gaze_files / gaze_executor_time
+            logger.info(f"  Gaze processing rate: {gaze_rate:.1f} files/sec")
+        
+        if person_executor_time > 0:
+            person_rate = total_person_files / person_executor_time
+            logger.info(f"  Person processing rate: {person_rate:.1f} files/sec")
+        
+        if process_time > 0:
+            overall_rate = total_dirs / process_time
+            logger.info(f"  Overall processing rate: {overall_rate:.1f} entries/sec")
+        
+        # Final save before filtering (only if we found new data)
+        if (new_gaze_count > 0 or new_person_count > 0) and total_dirs > 0 and total_dirs % 250 != 0:
+            final_save_start = time.time()
+            self._save_intermediate_data(raw_gaze_points, person_bboxes, self.temp_gaze_path, self.temp_person_path, total_dirs)
+            final_save_time = time.time() - final_save_start
+            logger.info(f"Final intermediate data save completed in {final_save_time:.2f}s")
+        elif new_gaze_count == 0 and new_person_count == 0:
+            logger.info("Skipping intermediate save - no new data found")
 
+        # Time the filtering process
+        filter_start = time.time()
         processed_gaze_dict = self._filter_gaze_points(raw_gaze_points)
+        filter_time = time.time() - filter_start
+        logger.info(f"Gaze point filtering completed in {filter_time:.2f}s")
         
-        # Clean up temporary files after successful processing
-        self._cleanup_temp_files([temp_gaze_path, temp_person_path])
+        # Preserve temporary files for future incremental processing
+        logger.info("Preserving temporary pickle files for future incremental processing")
         
         return processed_gaze_dict, person_bboxes
     
@@ -922,8 +1229,8 @@ class GazeFollowDatasetProcessor:
         
         for ind, row in tqdm(result_df.iterrows(), total=len(result_df), desc="Processing rows"):
             # Skip if already processed (has gaze_error and no error_reason)
-            if (pd.notna(row.get('gaze_error')) and pd.isna(row.get('error_reason'))) or \
-               (pd.notna(row.get('error_reason'))):
+            if (pd.notna(row.get('gaze_error')) and pd.isna(row.get('error_reason'))): #or \
+            #    (pd.notna(row.get('error_reason'))):
                 skipped_count += 1
                 if pd.notna(row.get('gaze_error')):
                     processed_count += 1
@@ -934,6 +1241,8 @@ class GazeFollowDatasetProcessor:
                 result_df.at[ind, 'error_reason'] = validation_error
                 error_counts[validation_error] = error_counts.get(validation_error, 0) + 1
                 continue
+            else:
+                result_df.at[ind, 'error_reason'] = None  # Clear previous error if any
             
             image_path = row['image_path']
             image_id = Path(image_path).stem
@@ -944,29 +1253,37 @@ class GazeFollowDatasetProcessor:
                 result_df.at[ind, 'error_reason'] = image_validation_error
                 error_counts[image_validation_error] = error_counts.get(image_validation_error, 0) + 1
                 continue
+            else:
+                result_df.at[ind, 'error_reason'] = None  # Clear previous error if any
             
             # Get LLaVA results
             llava_gaze_result = gaze_points_dict.get(image_id)
             llava_person_result = person_bboxes.get(image_id)
             
-            if llava_gaze_result is None:
-                error_msg = f"No LLaVA gaze results for image {image_id}"
-                result_df.at[ind, 'error_reason'] = error_msg
-                error_counts[error_msg] = error_counts.get(error_msg, 0) + 1
-                continue
+            # if llava_gaze_result is None:
+            #     error_msg = f"No LLaVA gaze results for image {image_id}"
+            #     result_df.at[ind, 'error_reason'] = error_msg
+            #     error_counts[error_msg] = error_counts.get(error_msg, 0) + 1
+            #     continue
+            # else:
+            #     result_df.at[ind, 'error_reason'] = None  # Clear previous error if any
                 
             if llava_person_result is None:
                 error_msg = f"No LLaVA person results for image {image_id}"
                 result_df.at[ind, 'error_reason'] = error_msg
                 error_counts[error_msg] = error_counts.get(error_msg, 0) + 1
                 continue
-            
+            else:
+                result_df.at[ind, 'error_reason'] = None  # Clear previous error if any
+
             # Get image dimensions
             if 'image_shape' not in llava_person_result:
                 error_msg = f"No image shape data for {image_id}"
                 result_df.at[ind, 'error_reason'] = error_msg
                 error_counts[error_msg] = error_counts.get(error_msg, 0) + 1
                 continue
+            else:
+                result_df.at[ind, 'error_reason'] = None  # Clear previous error if any
                 
             h, w = llava_person_result['image_shape']
             
@@ -987,6 +1304,8 @@ class GazeFollowDatasetProcessor:
                 result_df.at[ind, 'error_reason'] = error_msg
                 error_counts[error_msg] = error_counts.get(error_msg, 0) + 1
                 continue
+            else:
+                result_df.at[ind, 'error_reason'] = None  # Clear previous error if any
             
             # Validate gaze data (but continue processing even if validation fails)
             gaze_validation_error = self.validator.validate_gaze_data(llava_gaze_result, matched_person_id)
@@ -1125,6 +1444,13 @@ def main():
     # Set to None to start fresh processing
     # resume_from_csv = None
     
+    # Resume from pickle files (faster than reprocessing all files)
+    resume_from_pickle = True  # Set to False to reprocess all gaze and person files
+    
+    # File cache configuration (NEW)
+    use_file_cache = True  # Use file mapping cache for improved performance
+    force_rebuild_cache = False  # Set to True to force rebuilding the file cache
+    
     # Parallel processing configuration
     num_workers = 12  # None for auto-detect, or specify number like 4, 8, etc.
     
@@ -1137,8 +1463,11 @@ def main():
         base_data_dir_path=base_data_dir_path,
         llava_results_dir=llava_results_dir,
         resume_from_csv=resume_from_csv,
+        resume_from_pickle=resume_from_pickle,
         num_workers=num_workers,
-        save_interval=save_interval
+        save_interval=save_interval,
+        use_file_cache=use_file_cache,
+        force_rebuild_cache=force_rebuild_cache
     )
     
     results = processor.process()

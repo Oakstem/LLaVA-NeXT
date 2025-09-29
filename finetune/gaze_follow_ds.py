@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from docs.research_utils import fix_wsl_paths
 import time
+from PIL import Image
 
 
 # annot_path = r"D:\Projects\data\gazefollow\test_annotations_release.txt"
@@ -227,7 +228,7 @@ for gaze_points_path in tqdm(llava_gaze_points):
     if image_name not in gaze_points_dd:
         gaze_points_dd[image_name] = {}
     gaze_points_dd[image_name][person_id] = gaze_point
-    # if len(gaze_points_dd.keys()) > 10:
+    # if len(gaze_points_dd.keys()) > 100:
     #     break
         
 
@@ -266,13 +267,26 @@ for ind, row in enumerate(tqdm(llava_persons_segment)):
     
     # load the image
     image_path = Path(base_data_dir_path) / Path(compact_df[compact_df['image_key'] == image_id]['image_path'].values[0])
-    img = cv2.imread(str(image_path))
-    # get the image dimensions
-    h, w, _ = img.shape
+    # Option 1: Using PIL/Pillow (most efficient)
+    with Image.open(str(image_path)) as img:
+        w, h = img.size
+
+    # Option 2: Using OpenCV without loading pixel data
+    # import cv2
+    # cap = cv2.VideoCapture(str(image_path))
+    # w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    # h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # cap.release()
+
+    # Option 3: Using imageio (if you have it)
+    # import imageio
+    # reader = imageio.get_reader(str(image_path))
+    # h, w = reader.get_meta_data()['shape'][:2]
+    # reader.close()
     person_data['image_shape'] = (h, w)
     person_bboxes[image_id] = person_data
 
-    # if ind > 10:
+    # if ind > 100:
     #     break
 
 
@@ -327,6 +341,7 @@ compact_df['llava_gaze_points'] = None
 compact_df['gaze_error'] = None
 compact_df['angular_gaze_error'] = None
 compact_df['llava_person_bb_iou'] = None
+compact_df['num_people'] = None
 
 # reset index
 compact_df.reset_index(inplace=True)
@@ -336,9 +351,9 @@ for ind, row in tqdm(compact_df.iterrows()):
     image_id = Path(image_path).stem
     llava_gaze_result = gaze_points_dd_extra.get(image_id)
     llava_person_result = person_bboxes.get(image_id)
-    if llava_gaze_result is None or llava_person_result is None:
-        print(f"no llava gaze result found for {image_id}")
-        continue
+    # if llava_gaze_result is None or llava_person_result is None:
+    #     print(f"no llava gaze result found for {image_id}")
+    #     continue
     h, w = llava_person_result['image_shape']
     gt_person_bbox = [w*row['body_bbox_x'], h*row['body_bbox_y'],
                       w*(row['body_bbox_x']+row['body_bbox_width']), h*(row['body_bbox_y']+row['body_bbox_height'])]
@@ -346,6 +361,7 @@ for ind, row in tqdm(compact_df.iterrows()):
     if llava_matched_person_id is None:
         print(f"no matched person found for {image_id}")
         continue
+    row['num_people'] = len([key for key, val_dd in llava_person_result.items() if 'person' in val_dd])
     row['llava_matched_person_id'] = llava_matched_person_id
     row['llava_person_bb_iou'] = llava_person_bb_iou
     # row['llava_person_bbox'] = llava_person_result.get(llava_matched_person_id, {}).get('person')['boxes'][0]
