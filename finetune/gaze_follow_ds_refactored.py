@@ -519,7 +519,7 @@ class GazeFollowDatasetProcessor:
     
     def __init__(self, annot_path: str, base_data_dir_path: str, llava_results_dir: str, 
                  resume_from_csv: Optional[str] = None, resume_from_pickle: bool = False,
-                 num_workers: Optional[int] = None, save_interval: int = 1000,
+                 num_workers: Optional[int] = None, save_interval: int = 10000,
                  use_file_cache: bool = True, force_rebuild_cache: bool = False):
         """Initialize the processor with required paths.
         
@@ -1455,7 +1455,7 @@ def main():
     num_workers = 12  # None for auto-detect, or specify number like 4, 8, etc.
     
     # Temporary save configuration
-    save_interval = 1000  # Save every 1000 processed rows
+    save_interval = 10000  # Save every 10000 processed rows
     
     # Create processor and run
     processor = GazeFollowDatasetProcessor(
