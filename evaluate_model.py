@@ -204,18 +204,6 @@ def compute_ground_truth_loss(
 
         labels = input_ids.clone()
 
-        # Mask out image placeholder tokens so they do not participate in the loss
-        labels = labels.to(model.device)
-        invalid_label_mask = labels < 0
-        if invalid_label_mask.any():
-            labels = labels.masked_fill(invalid_label_mask, IGNORE_INDEX)
-
-        vocab_size = getattr(model.config, "vocab_size", None)
-        if vocab_size is not None:
-            overflow_mask = labels >= vocab_size
-            if overflow_mask.any():
-                labels = labels.masked_fill(overflow_mask, IGNORE_INDEX)
-
         prompt_conv = conv_templates[conv_template].copy()
         prompt_conv.tokenizer = tokenizer
         prompt_conv.append_message(prompt_conv.roles[0], user_content)
@@ -228,9 +216,22 @@ def compute_ground_truth_loss(
         )
 
         prompt_length = prompt_only_ids.size(-1)
-        labels[:, :prompt_length] = IGNORE_INDEX
+        labels = labels.to(model.device)
+        # Mask out image placeholder tokens so they do not participate in the loss
+        invalid_label_mask = labels < 0
+        if invalid_label_mask.any():
+            labels = labels.masked_fill(invalid_label_mask, IGNORE_INDEX)
 
-        with torch.inference_mode():
+        # ensure we ignore sequence regions beyond the language tokens
+        if prompt_length > 0:
+            labels[:, :prompt_length] = IGNORE_INDEX
+
+        vocab_size = getattr(model.config, "vocab_size", None)
+        if vocab_size is not None:
+            overflow_mask = labels >= vocab_size
+            if overflow_mask.any():
+                labels = labels.masked_fill(overflow_mask, IGNORE_INDEX)
+        with torch.no_grad():
             outputs = model(
                 input_ids=input_ids,
                 labels=labels,
