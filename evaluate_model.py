@@ -212,7 +212,7 @@ def compute_ground_truth_loss(
 
         vocab_size = getattr(model.config, "vocab_size", None)
         if vocab_size is not None:
-            overflow_mask = labels >= vocab_sizeg
+            overflow_mask = labels >= vocab_size
             if overflow_mask.any():
                 labels = labels.masked_fill(overflow_mask, IGNORE_INDEX)
 
