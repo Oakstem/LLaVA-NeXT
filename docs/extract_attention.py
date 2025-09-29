@@ -378,7 +378,7 @@ def save_raw_attention_tensor(
 
     # Save using torch.save
     torch.save(data, file_path)
-    print(f"Saved raw attention tensor to {file_path}")
+    # print(f"Saved raw attention tensor to {file_path}")
 
 # --- Helper functions for the generation loop ---
 def prepare_model_inputs(step_idx, curr_input_ids, past_kvs, attn_inds, img_tens=None, img_szs=None):
@@ -718,7 +718,7 @@ def process_image_and_prompt(
                     return resulted_description
             else:
                 resulted_description = tokenizer.decode(next_token_id.item())
-            print(f"Resulted words from mask: {resulted_description}")
+            # print(f"Resulted words from mask: {resulted_description}")
 
             # 6. Process and save attention map if valid
             if attention_map is not None:
@@ -742,7 +742,7 @@ def process_image_and_prompt(
                 initial_token_length = past_key_values[0][0].shape[2]
             input_token_length = past_key_values[0][0].shape[2]
             atten_indices = atten_indices + [input_token_length-1]
-            print(f"Total token length: {input_token_length}")
+            # print(f"Total token length: {input_token_length}")
             # print(f"Current Attention indices: {atten_indices}")
 
     # After the generation loop, create collages from the collected maps
