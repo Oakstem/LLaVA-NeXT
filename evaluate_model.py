@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 import time
 import os
-from collections import defaultdict
+import math
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -182,14 +182,38 @@ def calculate_loss(
     Calculate cross-entropy loss between predicted logits and target labels.
     This matches the loss calculation used during training.
     """
+    if logits.ndim != 3 or labels.ndim != 2 and labels.ndim != 3:
+        raise ValueError("Expected logits with shape [batch, seq, vocab] and labels with matching batch/seq dimensions")
+
+    # Ensure labels live on the same device/dtype as logits before mutation
+    labels = labels.to(logits.device)
+
+    # Align rank of labels with logits if needed (e.g. squeeze batch dim)
+    if labels.ndim == 2 and logits.size(0) == 1:
+        labels = labels.unsqueeze(0)
+
+    # Replace any invalid target IDs (e.g. IMAGE_TOKEN_INDEX) with ignore_index to avoid CUDA assertions
+    vocab_size = logits.size(-1)
+    invalid_mask = (labels >= vocab_size) | (labels < 0)
+    if invalid_mask.any():
+        labels = labels.clone()
+        labels[invalid_mask] = ignore_index
+
     # Simple cross-entropy loss calculation
-    loss_fct = F.cross_entropy
-    # Flatten the tokens
-    shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
-    shift_labels = labels[..., 1:].contiguous().view(-1)
-    # Move labels to same device as logits
-    shift_labels = shift_labels.to(shift_logits.device)
-    loss = loss_fct(shift_logits, shift_labels, ignore_index=ignore_index)
+    shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab_size)
+    shift_labels = labels[..., 1:].contiguous().view(-1).long()
+
+    valid_mask = shift_labels != ignore_index
+    if not valid_mask.any():
+        return float('nan')
+
+    loss = F.cross_entropy(
+        shift_logits.float(),
+        shift_labels,
+        ignore_index=ignore_index,
+        reduction='mean',
+    )
+
     return loss.item()
 
 
@@ -572,7 +596,7 @@ def main():
         
         image_tensor, image_size = image_result
         
-        # Generate prediction (loss calculation temporarily disabled due to CUDA assertion errors)
+        # Generate prediction and optionally compute loss against ground truth
         try:
             # Generate prediction normally
             prediction = generate_response(
@@ -584,16 +608,30 @@ def main():
                 conv_template,
                 generation_kwargs,
             )
-            
-            # Temporarily disable loss calculation to avoid CUDA assertion errors
-            # TODO: Fix loss calculation with proper token ID validation
+
             sample_loss = None
+            if not args.no_loss:
+                loss_value = compute_ground_truth_loss(
+                    prompt,
+                    ground_truth,
+                    tokenizer,
+                    model,
+                    conv_template,
+                    image_tensor,
+                    image_size,
+                )
+                if loss_value is not None and math.isfinite(loss_value):
+                    sample_loss = loss_value
+                    losses.append(sample_loss)
+                    if args.verbose:
+                        print(f"Sample {sample_id} loss: {sample_loss:.6f}")
+                else:
+                    if args.verbose:
+                        reason = "None" if loss_value is None else "non-finite"
+                        print(f"Loss calculation skipped for {sample_id}: returned {reason} value")
+
             predictions.append(prediction)
             ground_truths.append(ground_truth)
-            if sample_loss is not None:
-                losses.append(sample_loss)
-                if args.verbose:
-                    print(f"Sample {sample_id} loss: {sample_loss:.4f}")
             
             # Store detailed result
             result = {
@@ -799,7 +837,7 @@ def main():
     
     # Print loss summary
     if losses:
-        print(f"\n� Loss Summary: Calculated loss for {len(losses)}/{len(predictions)} successful predictions")
+        print(f"\n📉 Loss Summary: Calculated loss for {len(losses)}/{len(predictions)} successful predictions")
         print(f"   Average Loss: {sum(losses)/len(losses):.6f}")
         print(f"   Loss Range: {min(losses):.6f} - {max(losses):.6f}")
     else:
