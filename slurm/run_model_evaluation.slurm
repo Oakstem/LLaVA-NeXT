@@ -20,7 +20,7 @@ QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 # Dataset parameters
 DATASET_JSON="${DATASET_JSON:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/sgl_conversation_data_20250928_172112/val.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-LIMIT="${LIMIT:-10}"  # Set to a number to limit samples for testing (e.g., 100)
+LIMIT="${LIMIT:-}"  # Set to a number to limit samples for testing (e.g., 100)
 
 # Generation parameters
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"

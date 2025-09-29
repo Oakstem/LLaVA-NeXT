@@ -575,15 +575,15 @@ def main():
         # Generate prediction and optionally compute loss against ground truth
         try:
             # Generate prediction normally
-            # prediction = generate_response(
-            #     prompt,
-            #     image_tensor,
-            #     image_size,
-            #     tokenizer,
-            #     model,
-            #     conv_template,
-            #     generation_kwargs,
-            # )
+            prediction = generate_response(
+                prompt,
+                image_tensor,
+                image_size,
+                tokenizer,
+                model,
+                conv_template,
+                generation_kwargs,
+            )
 
             sample_loss = None
             if not args.no_loss:
