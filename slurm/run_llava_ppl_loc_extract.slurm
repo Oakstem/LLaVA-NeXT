@@ -45,7 +45,7 @@ python docs/llava_extract_ppl_loc_and_gaze.py \
     --gazefollow_dataset "/galitylab/students/alonmardi/gazefollow" \
     --base-output-dir "/galitylab/students/alonmardi/gazefollow/results/ppl_dec_loc/llava_attention_results" \
     --layer 23 \
-    --start-from "00000000" \
+    --start-from "00000001" \
     --skip-processed "ppl_loc_processed.txt"
 
 echo "Job completed at: $(date)"

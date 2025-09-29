@@ -163,7 +163,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 raise ValueError(f"Model {model_name} not supported")
 
             mm_projector_weights = torch.load(os.path.join(model_path, "mm_projector.bin"), map_location="cpu")
-            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+            # Use the same dtype as specified in kwargs, defaulting to bfloat16
+            target_dtype = kwargs.get('torch_dtype', torch.bfloat16)
+            mm_projector_weights = {k: v.to(target_dtype) for k, v in mm_projector_weights.items()}
             model.load_state_dict(mm_projector_weights, strict=False)
         else:
             rank0_print(f"Loaded LLaVA model: {model_path}")
@@ -301,8 +303,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if not vision_tower.is_loaded:
             vision_tower.load_model(device_map=device_map)
         if device_map != "auto":
+            # Use the same dtype as specified in kwargs for consistency
+            target_dtype = kwargs.get('torch_dtype', torch.bfloat16)
             if torch.cuda.is_available():
-                vision_tower.to(device="cuda", dtype=torch.float16)
+                vision_tower.to(device="cuda", dtype=target_dtype)
             else:
                 vision_tower.to(device="cpu")
         image_processor = vision_tower.image_processor

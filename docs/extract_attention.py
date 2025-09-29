@@ -99,15 +99,31 @@ def load_model(attn_implementation="sdpa", load_4bit=False, load_8bit=False, att
     # Transformers might handle this internally, but good practice to be aware
     print(f"Attempting to load model with attn_implementation='{attn_implementation}', load_4bit={load_4bit}, load_8bit={load_8bit}")
 
+    # Explicitly set torch_dtype to bfloat16 for consistency unless using quantization
+    torch_dtype = "bfloat16" if not (load_4bit or load_8bit) else "auto"
+    
     tokenizer, model, image_processor, max_length = load_pretrained_model(
         pretrained, None, model_name,
         load_8bit=load_8bit,
         load_4bit=load_4bit,
         device_map=device_map,
+        torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         overwrite_config=custom_config,
         **llava_model_args
     )
+    
+    # Ensure consistent dtype for the entire model when not using quantization
+    if not (load_4bit or load_8bit):
+        print("Setting model to bfloat16 for consistent dtype...")
+        model = model.to(torch.bfloat16)
+        
+        # Also ensure vision tower uses the same dtype
+        if hasattr(model, 'get_vision_tower'):
+            vision_tower = model.get_vision_tower()
+            if vision_tower is not None:
+                vision_tower = vision_tower.to(torch.bfloat16)
+    
     return tokenizer, model, image_processor, max_length
 
 
@@ -414,21 +430,11 @@ def extract_attention_map(step_idx, tokenizer, outputs, token_idx, attn_indices,
     elif expected_elements < n_patches:
         return None, None
 
-    # Convert to numpy for visualization
-    attention_map = token_attention_to_image.reshape(grid_sz, grid_sz).cpu().numpy()
-
-    # # Extract token text for debugging
-    # token_text = None
-    # if len(attn_indices) > 0:
-    #     txt_ids = torch.argmax(outputs.logits, dim=-1)[0]
-    #     if step_idx == 0:  # First token
-    #         txt_np = np.array([tokenizer.decode(val).strip() for val in txt_ids])
-    #         resulted_description = ",".join(txt_np[attn_indices])
-    #         token_text = resulted_description
-    #     else:
-    #         token_text = tokenizer.decode(txt_ids[0])
-
-    return attention_map        #, token_text
+    # Return reshaped tensor for further processing
+    # Keep as tensor to preserve dtype information for saving
+    attention_map_tensor = token_attention_to_image.reshape(grid_sz, grid_sz)
+    
+    return attention_map_tensor
 
 def save_attention_visualizations(attention_map, image, token_id, token_text, step_idx,
                                  vis_raw_dir, vis_processed_dir, tensor_dir,
@@ -436,9 +442,24 @@ def save_attention_visualizations(attention_map, image, token_id, token_text, st
                                  min_avg_attention, show_highest_blob, dilate_kernel_size,
                                  visualize_overlays=True, create_collage_maps=False):
     """Save attention visualizations and tensors."""
-    # Skip if attention map is invalid
-    if not isinstance(attention_map, np.ndarray) or attention_map.ndim != 2:
-        print(f"[ERROR] Invalid attention map for step {step_idx}, skipping visualization.")
+    
+    # Handle both tensor and numpy array inputs
+    if torch.is_tensor(attention_map):
+        # Save the raw tensor (with original dtype)
+        raw_tensor = attention_map.detach()
+        # Convert to numpy for visualization (convert to float32 since NumPy doesn't support BFloat16)
+        attention_map_np = attention_map.cpu().float().numpy()
+    elif isinstance(attention_map, np.ndarray):
+        # Already numpy array, create a tensor version for saving
+        raw_tensor = torch.from_numpy(attention_map)
+        attention_map_np = attention_map
+    else:
+        print(f"[ERROR] Invalid attention map type {type(attention_map)} for step {step_idx}, skipping visualization.")
+        return None
+    
+    # Skip if attention map is invalid shape
+    if attention_map_np.ndim != 2:
+        print(f"[ERROR] Invalid attention map shape {attention_map_np.shape} for step {step_idx}, skipping visualization.")
         return None
 
     # Generate safe token text for filenames
@@ -454,7 +475,7 @@ def save_attention_visualizations(attention_map, image, token_id, token_text, st
     # Save raw visualization if requested
     if visualize_overlays:
         # Convert map to image and resize to match original image
-        map_img = Image.fromarray(attention_map.astype(np.float32))
+        map_img = Image.fromarray(attention_map_np.astype(np.float32))
         resized_map = np.array(map_img.resize(image.size, Image.Resampling.LANCZOS))
 
         # Normalize the map for visualization
@@ -471,7 +492,7 @@ def save_attention_visualizations(attention_map, image, token_id, token_text, st
 
     # Save raw tensor
     save_raw_attention_tensor(
-        attention_map=attention_map,
+        attention_map=raw_tensor,
         output_path=tensor_dir,
         token_id=token_id,
         token_text=token_text,
@@ -482,7 +503,7 @@ def save_attention_visualizations(attention_map, image, token_id, token_text, st
     overlay_img = None
     if visualize_overlays:
         overlay_img = visualize_processed_attention(
-            attention_map=attention_map,
+            attention_map=attention_map_np,
             original_image=image,
             output_path=processed_path,
             threshold_value=attn_threshold,
@@ -533,10 +554,13 @@ def process_image_and_prompt(
     # Load and process image
     image = load_image(image_path)
     image_tensor, _, _, _ = process_images([image], image_processor, model.config) # Returns tensor directly
+    
+    # Use the same dtype as the model for consistency
+    model_dtype = next(model.parameters()).dtype
     if type(image_tensor) is list:
-        image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
+        image_tensor = [image.to(model.device, dtype=model_dtype) for image in image_tensor]
     else:
-        image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+        image_tensor = image_tensor.to(model.device, dtype=model_dtype)
 
     # Prepare conversation input - Use the correct conv template based on model
     model_name = get_model_name_from_path(model.config._name_or_path)
