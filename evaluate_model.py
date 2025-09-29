@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate trained LLaVA model on custom JSON dataset.")
     
     # Model arguments
-    parser.add_argument("--model-path", required=True, help="Path to trained model or checkpoint to evaluate.")
+    parser.add_argument("--model-path", default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Path to trained model or checkpoint to evaluate.")
     parser.add_argument("--model-base", default=None, help="Optional base model path when loading LoRA adapters.")
     parser.add_argument("--adapter-path", default=None, help="Optional LoRA adapter path to merge at inference time.")
     parser.add_argument("--attn-implementation", default="sdpa", help="Attention implementation (e.g. 'sdpa', 'flash_attention_2').")
@@ -227,6 +227,8 @@ def compute_ground_truth_loss(
             labels[:, :prompt_length] = IGNORE_INDEX
 
         vocab_size = getattr(model.config, "vocab_size", None)
+        # tokenizer_vocab_size = getattr(tokenizer, "vocab_size", None)
+        # vocab_size = min(vocab_size, tokenizer_vocab_size) if vocab_size and tokenizer_vocab_size else vocab_size or tokenizer_vocab_size
         if vocab_size is not None:
             overflow_mask = labels >= vocab_size
             if overflow_mask.any():
@@ -573,15 +575,15 @@ def main():
         # Generate prediction and optionally compute loss against ground truth
         try:
             # Generate prediction normally
-            prediction = generate_response(
-                prompt,
-                image_tensor,
-                image_size,
-                tokenizer,
-                model,
-                conv_template,
-                generation_kwargs,
-            )
+            # prediction = generate_response(
+            #     prompt,
+            #     image_tensor,
+            #     image_size,
+            #     tokenizer,
+            #     model,
+            #     conv_template,
+            #     generation_kwargs,
+            # )
 
             sample_loss = None
             if not args.no_loss:

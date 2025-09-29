@@ -1536,6 +1536,10 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
+            # fix negative labels
+            valid_labels = shift_labels >= 0
+            shift_labels = shift_labels[valid_labels]
+            shift_logits = shift_logits[valid_labels, :]
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
