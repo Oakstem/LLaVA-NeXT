@@ -43,6 +43,10 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from gazefollow.focus_loss_utils import (
+    prepare_focus_phrase_sequences,
+    compute_focus_loss_after_phrase,
+)
 import time
 from pathlib import Path
 import numpy as np
@@ -1502,6 +1506,17 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        focus_loss_after_phrase = kwargs.pop("focus_loss_after_phrase", False)
+        focus_loss_phrase_token_ids = kwargs.pop("focus_loss_phrase_token_ids", None)
+        focus_loss_missing_value = kwargs.pop("focus_loss_missing_value", None)
+
+        if focus_loss_phrase_token_ids is None:
+            focus_loss_phrase_token_ids = getattr(self.config, "focus_loss_phrase_token_ids", None)
+        if focus_loss_missing_value is None:
+            focus_loss_missing_value = getattr(self.config, "focus_loss_missing_value", None)
+        if not focus_loss_after_phrase:
+            focus_loss_after_phrase = getattr(self.config, "focus_loss_after_phrase", False)
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1530,17 +1545,33 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            # fix negative labels
-            valid_labels = shift_labels >= 0
-            shift_labels = shift_labels[valid_labels]
-            shift_logits = shift_logits[valid_labels, :]
-            loss = loss_fct(shift_logits, shift_labels)
+            labels = labels.to(shift_logits.device)
+            loss_fct = CrossEntropyLoss()
+
+            if focus_loss_after_phrase:
+                phrase_sequences = prepare_focus_phrase_sequences(
+                    focus_loss_phrase_token_ids, labels.device
+                )
+                loss = compute_focus_loss_after_phrase(
+                    shift_logits=shift_logits,
+                    shift_labels=shift_labels,
+                    full_labels=labels,
+                    loss_fct=loss_fct,
+                    candidate_sequences=phrase_sequences,
+                    missing_value=focus_loss_missing_value,
+                )
+            else:
+                # Flatten the tokens
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                # fix negative labels
+                valid_labels = shift_labels >= 0
+                shift_labels = shift_labels[valid_labels]
+                shift_logits = shift_logits[valid_labels, :]
+                loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

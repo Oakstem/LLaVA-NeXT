@@ -83,7 +83,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Print detailed progress information.")
     parser.add_argument("--safe-mode", action="store_true", help="Enable safe mode with more aggressive memory cleanup and smaller batches.")
     parser.add_argument("--no-loss", action="store_true", help="Disable loss calculation entirely to avoid CUDA errors.")
-    
+    parser.add_argument(
+        "--focus-loss-after-looking",
+        action="store_true",
+        help="Compute loss only on tokens after the 'looking at' phrase and clamp missing cases to a threshold.",
+    )
+    parser.add_argument(
+        "--focus-loss-threshold",
+        type=float,
+        default=5.0,
+        help="Maximum loss value to apply when the focus phrase is not found.",
+    )
+    parser.add_argument(
+        "--focus-loss-phrase",
+        type=str,
+        default="looking at",
+        help="Target phrase used to locate the start of focused loss computation.",
+    )
+    parser.add_argument(
+        "--use-iterative-generation",
+        action="store_true",
+        help="Use iterative token-by-token generation method instead of standard model.generate().",
+    )
+
     return parser.parse_args()
 
 
@@ -121,6 +143,36 @@ def determine_template(model_name: str, override: Optional[str]) -> str:
     if "mpt" in lowered:
         return "mpt"
     return "qwen_1_5"  # Default fallback
+
+
+def build_focus_phrase_token_ids(tokenizer, phrase: str) -> List[List[int]]:
+    """Generate candidate token id sequences for the focus phrase."""
+    if not phrase:
+        return []
+
+    stripped = phrase.strip()
+    candidates = {phrase}
+    if stripped:
+        candidates.add(stripped)
+        candidates.add(stripped.lower())
+        candidates.add(stripped.capitalize())
+        candidates.add(f" {stripped}")
+        candidates.add(f" {stripped.lower()}")
+
+    token_sequences: List[List[int]] = []
+    seen: set = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        ids = tokenizer.encode(candidate, add_special_tokens=False)
+        if not ids:
+            continue
+        key = tuple(ids)
+        if key not in seen:
+            seen.add(key)
+            token_sequences.append(ids)
+
+    return token_sequences
 
 
 def prepare_image_tensor(image_path: str, image_processor, model) -> Optional[Tuple[torch.Tensor, Tuple[int, int]]]:
@@ -180,6 +232,9 @@ def compute_ground_truth_loss(
     conv_template: str,
     image_tensor: torch.Tensor,
     image_size: Tuple[int, int],
+    focus_loss_after_phrase: bool = False,
+    focus_loss_phrase_token_ids: Optional[List[List[int]]] = None,
+    focus_loss_missing_value: Optional[float] = None,
 ) -> Optional[float]:
     """Teacher-force the ground truth response to compute language modeling loss."""
     try:
@@ -233,16 +288,30 @@ def compute_ground_truth_loss(
             overflow_mask = labels >= vocab_size
             if overflow_mask.any():
                 labels = labels.masked_fill(overflow_mask, IGNORE_INDEX)
-        with torch.no_grad():
-            outputs = model(
-                input_ids=input_ids,
-                labels=labels,
-                images=image_tensor,
-                image_sizes=[list(image_size)],
-                modalities=["image"],
-                use_cache=False,
-                return_dict=True,
+        model_kwargs = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "images": image_tensor,
+            "image_sizes": [list(image_size)],
+            "modalities": ["image"],
+            "use_cache": False,
+            "return_dict": True,
+        }
+
+        if focus_loss_after_phrase:
+            if not focus_loss_phrase_token_ids:
+                raise ValueError("Focus loss is enabled but no phrase token ids were provided.")
+            model_kwargs.update(
+                {
+                    "focus_loss_after_phrase": True,
+                    "focus_loss_phrase_token_ids": focus_loss_phrase_token_ids,
+                }
             )
+            if focus_loss_missing_value is not None:
+                model_kwargs["focus_loss_missing_value"] = focus_loss_missing_value
+
+        with torch.no_grad():
+            outputs = model(**model_kwargs)
 
         loss_tensor = getattr(outputs, "loss", None)
         if loss_tensor is None:
@@ -478,7 +547,7 @@ def main():
     model_name = get_model_name_from_path(model_name_source)
     conv_template = determine_template(model_name, args.conv_template)
     print(f"Using conversation template: {conv_template}")
-    
+
     # Prepare generation kwargs
     generation_kwargs = {
         "do_sample": args.do_sample,
@@ -489,11 +558,31 @@ def main():
         "use_cache": True,
         "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
     }
-    
+
     if not args.do_sample:
         generation_kwargs.pop("temperature", None)
         generation_kwargs.pop("top_p", None)
-    
+
+    focus_loss_kwargs = {}
+    focus_phrase_token_ids: List[List[int]] = []
+    if args.focus_loss_after_looking:
+        focus_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, args.focus_loss_phrase)
+        if not focus_phrase_token_ids:
+            print(
+                "Warning: focus loss requested but tokenizer produced no token ids for the target phrase. "
+                "Falling back to standard loss."
+            )
+        else:
+            focus_loss_kwargs = {
+                "focus_loss_after_phrase": True,
+                "focus_loss_phrase_token_ids": focus_phrase_token_ids,
+                "focus_loss_missing_value": args.focus_loss_threshold,
+            }
+            # Persist configuration for downstream utilities that may use the model directly.
+            model.config.focus_loss_after_phrase = True
+            model.config.focus_loss_phrase_token_ids = focus_phrase_token_ids
+            model.config.focus_loss_missing_value = args.focus_loss_threshold
+
     # Load dataset
     print("\n2. Loading dataset...")
     dataset = load_dataset(args.dataset_json, args.limit)
@@ -510,7 +599,7 @@ def main():
     start_time = time.time()
     
     # Process in smaller batches to prevent memory issues
-    batch_size = 1 if args.safe_mode else 5  # Process 1 sample at a time in safe mode, 5 otherwise
+    batch_size = 1 if args.safe_mode else args.batch_size  # Process 1 sample at a time in safe mode, 5 otherwise
     
     for batch_start in range(0, len(dataset), batch_size):
         batch_end = min(batch_start + batch_size, len(dataset))
@@ -574,16 +663,18 @@ def main():
         
         # Generate prediction and optionally compute loss against ground truth
         try:
-            # Generate prediction normally
-            prediction = generate_response(
-                prompt,
-                image_tensor,
-                image_size,
-                tokenizer,
-                model,
-                conv_template,
-                generation_kwargs,
-            )
+            prediction = None
+            # Generate prediction only if iterative generation is enabled
+            if args.use_iterative_generation:
+                prediction = generate_response(
+                    prompt,
+                    image_tensor,
+                    image_size,
+                    tokenizer,
+                    model,
+                    conv_template,
+                    generation_kwargs,
+                )
 
             sample_loss = None
             if not args.no_loss:
@@ -595,6 +686,7 @@ def main():
                     conv_template,
                     image_tensor,
                     image_size,
+                    **focus_loss_kwargs,
                 )
                 if loss_value is not None and math.isfinite(loss_value):
                     sample_loss = loss_value
@@ -606,7 +698,9 @@ def main():
                         reason = "None" if loss_value is None else "non-finite"
                         print(f"Loss calculation skipped for {sample_id}: returned {reason} value")
 
-            predictions.append(prediction)
+            # Only add to predictions list if we actually generated a prediction
+            if prediction is not None:
+                predictions.append(prediction)
             ground_truths.append(ground_truth)
             
             # Store detailed result
@@ -615,9 +709,10 @@ def main():
                 "image_path": str(full_image_path),
                 "prompt": prompt,
                 "ground_truth": ground_truth,
-                "prediction": prediction,
                 "success": True
             }
+            if prediction is not None:
+                result["prediction"] = prediction
             if sample_loss is not None:
                 result["loss"] = sample_loss
             evaluation_results.append(result)
@@ -625,7 +720,10 @@ def main():
             if args.verbose:
                 print(f"Prompt: {prompt}")
                 print(f"Ground truth: {ground_truth}")
-                print(f"Prediction: {prediction}")
+                if prediction is not None:
+                    print(f"Prediction: {prediction}")
+                else:
+                    print("Prediction: [skipped - iterative generation not enabled]")
                 if sample_loss is not None:
                     print(f"Loss: {sample_loss:.6f}")
                 print("-" * 40)
@@ -661,7 +759,16 @@ def main():
     
     # Calculate metrics
     print("\n4. Calculating metrics...")
-    
+    # Calculate loss metrics if available
+    loss_metrics = {}
+    if losses:
+        loss_metrics.update({
+            "average_loss": sum(losses) / len(losses),
+            "min_loss": min(losses),
+            "max_loss": max(losses),
+            "samples_with_loss": len(losses),
+        })
+
     if predictions:
         basic_metrics = calculate_basic_metrics(predictions, ground_truths)
         
@@ -673,40 +780,43 @@ def main():
             except Exception as e:
                 print(f"Warning: Could not calculate advanced metrics: {e}")
         
-        # Calculate loss metrics if available
-        loss_metrics = {}
-        if losses:
-            loss_metrics.update({
-                "average_loss": sum(losses) / len(losses),
-                "min_loss": min(losses),
-                "max_loss": max(losses),
-                "samples_with_loss": len(losses),
-            })
         
         # Combine all metrics
         final_metrics = {**basic_metrics, **advanced_metrics, **loss_metrics}
         
         # Add evaluation statistics
+        total_processed = len(evaluation_results)  # Total samples that were successfully processed (regardless of prediction generation)
         final_metrics.update({
             "total_samples": len(dataset),
             "successful_predictions": len(predictions),
             "failed_samples": len(failed_samples),
-            "success_rate": len(predictions) / len(dataset),
+            "successfully_processed_samples": total_processed,
+            "success_rate": len(predictions) / len(dataset) if len(dataset) > 0 else 0,
+            "processing_rate": total_processed / len(dataset) if len(dataset) > 0 else 0,
             "evaluation_time_seconds": evaluation_time,
-            "average_time_per_sample": evaluation_time / len(predictions) if predictions else 0,
+            "average_time_per_sample": evaluation_time / total_processed if total_processed > 0 else 0,
         })
         
     else:
-        print("No successful predictions to evaluate!")
+        total_processed = len(evaluation_results)
+        if total_processed > 0:
+            print(f"Processed {total_processed} samples but no predictions were generated (--use-iterative-generation not enabled).")
+        else:
+            print("No successful predictions to evaluate!")
         final_metrics = {
             "total_samples": len(dataset),
             "successful_predictions": 0,
             "failed_samples": len(failed_samples),
+            "successfully_processed_samples": total_processed,
             "success_rate": 0.0,
+            "processing_rate": total_processed / len(dataset) if len(dataset) > 0 else 0,
             "evaluation_time_seconds": evaluation_time,
-            "average_loss": None,
-            "samples_with_loss": 0,
+            "average_time_per_sample": evaluation_time / total_processed if total_processed > 0 else 0,
+            "average_loss": sum(losses) / len(losses) if losses else None,
+            "samples_with_loss": len(losses),
         }
+
+        final_metrics.update(loss_metrics)
     
     # Print results
     print("\n" + "=" * 60)
@@ -730,41 +840,43 @@ def main():
                     print(f"  {metric_name}: {value:.4f}")
                 else:
                     print(f"  {metric_name}: {value}")
-        
-        # Print loss metrics prominently
-        if loss_metrics:
-            print("\n📉 LOSS METRICS:")
-            for metric_name, value in loss_metrics.items():
-                if isinstance(value, float):
-                    print(f"  {metric_name}: {value:.6f}")
-                else:
-                    print(f"  {metric_name}: {value}")
-        else:
-            print("\n⚠️  LOSS METRICS: No loss values calculated")
-        
-        # Print evaluation statistics
-        print("\n📈 EVALUATION STATISTICS:")
-        stats_metrics = {
-            "total_samples": final_metrics["total_samples"],
-            "successful_predictions": final_metrics["successful_predictions"],
-            "failed_samples": final_metrics["failed_samples"],
-            "success_rate": final_metrics["success_rate"],
-            "evaluation_time_seconds": final_metrics["evaluation_time_seconds"],
-            "average_time_per_sample": final_metrics["average_time_per_sample"],
-        }
-        for metric_name, value in stats_metrics.items():
-            if isinstance(value, float):
-                print(f"  {metric_name}: {value:.4f}")
-            else:
-                print(f"  {metric_name}: {value}")
-    
     else:
-        print("\n❌ No successful predictions to evaluate!")
-        for metric_name, value in final_metrics.items():
+        print("\n📊 PREDICTION METRICS: No predictions generated (--use-iterative-generation not enabled)")
+    
+    # Print loss metrics prominently (regardless of whether predictions were generated)
+    if loss_metrics:
+        print("\n📉 LOSS METRICS:")
+        for metric_name, value in loss_metrics.items():
             if isinstance(value, float):
-                print(f"  {metric_name}: {value:.4f}")
+                print(f"  {metric_name}: {value:.6f}")
             else:
                 print(f"  {metric_name}: {value}")
+    elif losses:  # Handle case where we have losses but no loss_metrics dict
+        print("\n📉 LOSS METRICS:")
+        print(f"  average_loss: {sum(losses)/len(losses):.6f}")
+        print(f"  min_loss: {min(losses):.6f}")
+        print(f"  max_loss: {max(losses):.6f}")
+        print(f"  samples_with_loss: {len(losses)}")
+    else:
+        print("\n⚠️  LOSS METRICS: No loss values calculated")
+        
+    # Print evaluation statistics
+    print("\n📈 EVALUATION STATISTICS:")
+    stats_metrics = {
+        "total_samples": final_metrics["total_samples"],
+        "successfully_processed_samples": final_metrics["successfully_processed_samples"],
+        "successful_predictions": final_metrics["successful_predictions"],
+        "failed_samples": final_metrics["failed_samples"],
+        "processing_rate": final_metrics["processing_rate"],
+        "success_rate": final_metrics["success_rate"],
+        "evaluation_time_seconds": final_metrics["evaluation_time_seconds"],
+        "average_time_per_sample": final_metrics["average_time_per_sample"],
+    }
+    for metric_name, value in stats_metrics.items():
+        if isinstance(value, float):
+            print(f"  {metric_name}: {value:.4f}")
+        else:
+            print(f"  {metric_name}: {value}")
     
     # Save results
     print(f"\n5. Saving results to {output_dir}...")
@@ -813,7 +925,7 @@ def main():
     
     # Print loss summary
     if losses:
-        print(f"\n📉 Loss Summary: Calculated loss for {len(losses)}/{len(predictions)} successful predictions")
+        print(f"\n📉 Loss Summary: Calculated loss for {len(losses)}/{total_processed} successful predictions")
         print(f"   Average Loss: {sum(losses)/len(losses):.6f}")
         print(f"   Loss Range: {min(losses):.6f} - {max(losses):.6f}")
     else:
