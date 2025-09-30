@@ -39,7 +39,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     # Helper function to get model loading kwargs with current context
     def get_model_kwargs(**extra_kwargs):
         return get_model_loading_kwargs(
-            device_map=device_map,
+            # device_map=device_map,
             is_deepspeed_zero3=is_deepspeed_zero3,
             **kwargs,
             **extra_kwargs
