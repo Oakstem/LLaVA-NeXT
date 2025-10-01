@@ -25,7 +25,7 @@ from llava.utils import rank0_print
 from llava.train.finetune_utils import check_deepspeed_compatibility, get_model_loading_kwargs
 
 
-def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
+def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="bfloat16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
     # Check if DeepSpeed is being used
     is_deepspeed_zero3 = check_deepspeed_compatibility()
     
@@ -96,11 +96,21 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             else:
-                from llava.model.language_model.llava_llama import LlavaConfig
+                # from llava.model.language_model.llava_llama import LlavaConfig
 
+                # lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
+                # tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                # model = LlavaLlamaForCausalLM.from_pretrained(model_base, **get_model_kwargs(attn_implementation=attn_implementation))
+                from llava.model.language_model.llava_qwen import LlavaQwenConfig
+                print("model_base:", model_base)
                 lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
+                llava_cfg2 = LlavaQwenConfig.from_pretrained('lmms-lab/llava-onevision-qwen2-7b-ov-chat')
+                # update the lora config with llava_cfg2
+                for k, v in llava_cfg2.__dict__.items():
+                    if not k.startswith("_") and not hasattr(lora_cfg_pretrained, k) or 'vision' in k:
+                        setattr(lora_cfg_pretrained, k, v)
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_base, **get_model_kwargs(attn_implementation=attn_implementation))
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
 
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
             if model.lm_head.weight.shape[0] != token_num:
@@ -171,7 +181,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 raise ValueError(f"Model {model_name} not supported")
 
             mm_projector_weights = torch.load(os.path.join(model_path, "mm_projector.bin"), map_location="cpu")
-            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+            # Use the same dtype as specified in kwargs, defaulting to bfloat16
+            target_dtype = kwargs.get('torch_dtype', torch.bfloat16)
+            mm_projector_weights = {k: v.to(target_dtype) for k, v in mm_projector_weights.items()}
             model.load_state_dict(mm_projector_weights, strict=False)
         else:
             rank0_print(f"Loaded LLaVA model: {model_path}")
@@ -241,9 +253,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         rank0_print(f"Overwriting config with {overwrite_config}")
                         for k, v in overwrite_config.items():
                             setattr(llava_cfg, k, v)
-                        model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
+                        # model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
+                        model = LlavaQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
                     else:
-                        model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation))
+                        # model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation))
+                        model = LlavaQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, **kwargs)
 
             elif "gemma" in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -265,7 +279,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         rank0_print(f"Overwriting config with {overwrite_config}")
                         for k, v in overwrite_config.items():
                             setattr(llava_cfg, k, v)
-                    model = LlavaLlamaForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
+                    # model = LlavaLlamaForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
+                    model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
                 except:
                     raise ValueError(f"Model {model_name} not supported")
 
@@ -311,7 +326,12 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if not vision_tower.is_loaded:
             vision_tower.load_model(device_map=device_map)
         if device_map != "auto":
-            vision_tower.to(device="cuda", dtype=torch.float16)
+            # Use the same dtype as specified in kwargs for consistency
+            target_dtype = kwargs.get('torch_dtype', torch.bfloat16)
+            if torch.cuda.is_available():
+                vision_tower.to(device="cuda", dtype=target_dtype)
+            else:
+                vision_tower.to(device="cpu")
         image_processor = vision_tower.image_processor
 
     if hasattr(model.config, "max_sequence_length"):
