@@ -96,21 +96,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             else:
-                # from llava.model.language_model.llava_llama import LlavaConfig
+                from llava.model.language_model.llava_llama import LlavaConfig
 
-                # lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
-                # tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                # model = LlavaLlamaForCausalLM.from_pretrained(model_base, **get_model_kwargs(attn_implementation=attn_implementation))
-                from llava.model.language_model.llava_qwen import LlavaQwenConfig
-                print("model_base:", model_base)
                 lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
-                llava_cfg2 = LlavaQwenConfig.from_pretrained('lmms-lab/llava-onevision-qwen2-7b-ov-chat')
-                # update the lora config with llava_cfg2
-                for k, v in llava_cfg2.__dict__.items():
-                    if not k.startswith("_") and not hasattr(lora_cfg_pretrained, k) or 'vision' in k:
-                        setattr(lora_cfg_pretrained, k, v)
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, **get_model_kwargs(attn_implementation=attn_implementation))
 
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
             if model.lm_head.weight.shape[0] != token_num:
@@ -253,11 +243,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         rank0_print(f"Overwriting config with {overwrite_config}")
                         for k, v in overwrite_config.items():
                             setattr(llava_cfg, k, v)
-                        # model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
-                        model = LlavaQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
+                        model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
                     else:
-                        # model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation))
-                        model = LlavaQwenForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, **kwargs)
+                        model = LlavaQwenForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation))
 
             elif "gemma" in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -279,8 +267,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         rank0_print(f"Overwriting config with {overwrite_config}")
                         for k, v in overwrite_config.items():
                             setattr(llava_cfg, k, v)
-                    # model = LlavaLlamaForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
-                    model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
+                    model = LlavaLlamaForCausalLM.from_pretrained(model_path, **get_model_kwargs(attn_implementation=attn_implementation, config=llava_cfg))
                 except:
                     raise ValueError(f"Model {model_name} not supported")
 
