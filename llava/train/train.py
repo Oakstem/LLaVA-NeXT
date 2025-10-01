@@ -48,6 +48,17 @@ from llava.utils import rank0_print, process_video_with_pyav, process_video_with
 from llava.model.builder import load_pretrained_model
 from typing import Dict, Optional, Sequence, List, Any
 
+# Import custom evaluation functions
+try:
+    from evaluate_model import (
+        evaluate_dataset_for_training,
+        determine_template,
+    )
+    CUSTOM_EVAL_AVAILABLE = True
+except ImportError:
+    CUSTOM_EVAL_AVAILABLE = False
+    print("Warning: evaluate_model not available for custom evaluation")
+
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -179,6 +190,14 @@ class TrainingArguments(transformers.TrainingArguments):
     eval_steps: Optional[int] = field(default=5000, metadata={"help": "Number of training steps between evaluations. If None, uses evaluation_strategy."})
     evaluation_strategy: str = field(default="steps", metadata={"help": "Evaluation strategy: 'no', 'steps', 'epoch'."})
     eval_accumulation_steps: Optional[int] = field(default=None, metadata={"help": "Number of predictions steps to accumulate before moving tensors to CPU."})
+    
+    # Custom evaluation parameters (from evaluate_model.py)
+    use_custom_eval: bool = field(default=False, metadata={"help": "Use custom evaluation from evaluate_model.py"})
+    eval_max_new_tokens: int = field(default=128, metadata={"help": "Max new tokens for evaluation generation"})
+    no_loss: bool = field(default=False, metadata={"help": "Disable loss calculation in evaluation"})
+    focus_loss_after_looking: bool = field(default=True, metadata={"help": "Focus loss on tokens after 'looking at' phrase"})
+    focus_loss_phrase: str = field(default="looking at", metadata={"help": "Phrase to focus loss calculation"})
+    focus_loss_threshold: float = field(default=5.0, metadata={"help": "Maximum loss when focus phrase not found"})
 
 
 # @dataclass
@@ -1862,6 +1881,9 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     
+    # Determine conversation template for evaluation
+    conv_template = determine_template(model_name, model_args.version) if CUSTOM_EVAL_AVAILABLE else "qwen_1_5"
+    
     # Configure evaluation settings before creating trainer
     if data_args.enable_evaluation and data_module["eval_dataset"] is not None:
         # Set evaluation strategy if not already set
@@ -1874,13 +1896,74 @@ def train(attn_implementation=None):
         
         rank0_print(f"Evaluation enabled: strategy={training_args.evaluation_strategy}, eval_steps={training_args.eval_steps}")
         rank0_print(f"Eval dataset size: {len(data_module['eval_dataset'])}")
+        
+        if training_args.use_custom_eval:
+            rank0_print(f"Custom evaluation enabled with template: {conv_template}")
     else:
         # Explicitly disable evaluation when no eval dataset is available
         training_args.evaluation_strategy = "no"
         training_args.eval_steps = None
         rank0_print("Evaluation disabled")
     
+    # Create custom callback for evaluation if enabled
+    custom_callback = None
+    if training_args.use_custom_eval and CUSTOM_EVAL_AVAILABLE and data_module["eval_dataset"] is not None:
+        class CustomEvalCallback(transformers.TrainerCallback):
+            """Callback to run custom evaluation from evaluate_model.py during training"""
+            
+            def on_evaluate(self, args, state, control, model, **kwargs):
+                """Run custom evaluation after standard evaluation"""
+                if state.is_world_process_zero:
+                    rank0_print("\n" + "="*60)
+                    rank0_print("Running Custom Evaluation")
+                    rank0_print("="*60)
+                    
+                    eval_dataset = data_module.get("eval_dataset")
+                    if eval_dataset is None:
+                        rank0_print("No eval dataset available for custom evaluation")
+                        return
+                    
+                    # Run custom evaluation
+                    custom_metrics = evaluate_dataset_for_training(
+                        model=model,
+                        tokenizer=tokenizer,
+                        image_processor=image_processor,
+                        eval_dataset=eval_dataset,
+                        conv_template=conv_template,
+                        max_new_tokens=args.eval_max_new_tokens,
+                        focus_loss_after_looking=args.focus_loss_after_looking,
+                        focus_loss_phrase=args.focus_loss_phrase,
+                        focus_loss_threshold=args.focus_loss_threshold,
+                        no_loss=args.no_loss,
+                        verbose=args.verbose_logging,
+                    )
+                    
+                    # Log custom metrics
+                    if custom_metrics:
+                        rank0_print("\nCustom Evaluation Metrics:")
+                        for key, value in custom_metrics.items():
+                            if isinstance(value, float):
+                                rank0_print(f"  {key}: {value:.4f}")
+                            else:
+                                rank0_print(f"  {key}: {value}")
+                        
+                        # Save to file
+                        output_dir = pathlib.Path(args.output_dir)
+                        metrics_file = output_dir / f"custom_eval_step_{state.global_step}.json"
+                        with open(metrics_file, 'w') as f:
+                            json.dump(custom_metrics, f, indent=2)
+                        rank0_print(f"\nCustom metrics saved to: {metrics_file}")
+                        rank0_print("="*60 + "\n")
+        
+        custom_callback = CustomEvalCallback()
+        rank0_print("Custom evaluation callback created")
+    
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    
+    # Add custom callback if available
+    if custom_callback is not None:
+        trainer.add_callback(custom_callback)
+        rank0_print("Custom evaluation callback added to trainer")
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

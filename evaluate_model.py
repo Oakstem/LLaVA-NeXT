@@ -507,6 +507,188 @@ def calculate_basic_metrics(predictions: List[str], ground_truths: List[str]) ->
     return metrics
 
 
+def evaluate_dataset_for_training(
+    model,
+    tokenizer,
+    image_processor,
+    eval_dataset,
+    conv_template: str = "qwen_1_5",
+    max_new_tokens: int = 512,
+    focus_loss_after_looking: bool = False,
+    focus_loss_phrase: str = "looking at",
+    focus_loss_threshold: float = 5.0,
+    no_loss: bool = False,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Custom evaluation function for training-time evaluation.
+    
+    This function is designed to be called during training to evaluate the model
+    on a validation dataset using the same logic as evaluate_model.py.
+    
+    Args:
+        model: The model to evaluate
+        tokenizer: Tokenizer
+        image_processor: Image processor
+        eval_dataset: Evaluation dataset (LazySupervisedDataset)
+        conv_template: Conversation template to use
+        max_new_tokens: Maximum tokens to generate
+        focus_loss_after_looking: Whether to focus loss on tokens after phrase
+        focus_loss_phrase: Target phrase for focused loss
+        focus_loss_threshold: Maximum loss when focus phrase not found
+        no_loss: Disable loss calculation
+        verbose: Print detailed progress
+        
+    Returns:
+        Dictionary of evaluation metrics
+    """
+    from tqdm import tqdm
+    
+    model.eval()
+    predictions = []
+    ground_truths = []
+    losses = []
+    failed_samples = []
+    
+    # Build focus phrase token IDs if needed
+    focus_phrase_token_ids = []
+    if focus_loss_after_looking:
+        focus_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, focus_loss_phrase)
+    
+    # Get dataset samples
+    total_samples = len(eval_dataset)
+    if verbose:
+        print(f"Running custom evaluation on {total_samples} samples...")
+    
+    with torch.no_grad():
+        iterator = tqdm(range(total_samples), desc="Evaluating") if verbose else range(total_samples)
+        for idx in iterator:
+            try:
+                # Get sample from dataset
+                sample = eval_dataset.list_data_dict[idx]
+                
+                # Extract conversations
+                conversations = sample.get("conversations", [])
+                prompt = extract_prompt_from_conversation(conversations)
+                ground_truth = extract_ground_truth_from_conversation(conversations)
+                
+                if not prompt or not ground_truth:
+                    failed_samples.append({"index": idx, "reason": "Missing prompt or ground truth"})
+                    continue
+                
+                # Get image path
+                image_file = sample.get("image", "")
+                if isinstance(image_file, list):
+                    image_file = image_file[0]
+                
+                # Handle relative paths from dataset
+                if not os.path.isabs(image_file):
+                    # Try to resolve relative to dataset's data_path if available
+                    data_path = getattr(eval_dataset, 'data_path', None)
+                    if data_path:
+                        base_dir = Path(data_path).parent
+                        image_file = str(base_dir / image_file)
+                
+                # Process image
+                image_result = prepare_image_tensor(
+                    image_file,
+                    image_processor,
+                    model
+                )
+                
+                if image_result is None:
+                    failed_samples.append({"index": idx, "reason": f"Failed to load image: {image_file}"})
+                    continue
+                
+                image_tensor, image_size = image_result
+                
+                # Generate response
+                generation_kwargs = {
+                    "do_sample": False,
+                    "max_new_tokens": max_new_tokens,
+                    "use_cache": True,
+                    "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+                }
+                
+                prediction = generate_response(
+                    prompt_text=prompt,
+                    image_tensor=image_tensor,
+                    image_size=image_size,
+                    tokenizer=tokenizer,
+                    model=model,
+                    conv_template=conv_template,
+                    generation_kwargs=generation_kwargs,
+                    return_loss_data=False,
+                )
+                
+                predictions.append(prediction)
+                ground_truths.append(ground_truth)
+                
+                # Compute loss if enabled
+                if not no_loss:
+                    loss = compute_ground_truth_loss(
+                        prompt_text=prompt,
+                        ground_truth=ground_truth,
+                        tokenizer=tokenizer,
+                        model=model,
+                        conv_template=conv_template,
+                        image_tensor=image_tensor,
+                        image_size=image_size,
+                        focus_loss_after_phrase=focus_loss_after_looking,
+                        focus_loss_phrase_token_ids=focus_phrase_token_ids if focus_phrase_token_ids else None,
+                        focus_loss_missing_value=focus_loss_threshold,
+                    )
+                    
+                    if loss is not None and math.isfinite(loss):
+                        losses.append(loss)
+                
+            except Exception as e:
+                if verbose:
+                    print(f"Error evaluating sample {idx}: {e}")
+                failed_samples.append({"index": idx, "reason": str(e)})
+                continue
+            
+            # Clear cache periodically
+            if (idx + 1) % 10 == 0 and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass
+    
+    # Calculate metrics
+    metrics = {}
+    
+    if predictions:
+        basic_metrics = calculate_basic_metrics(predictions, ground_truths)
+        metrics.update(basic_metrics)
+        
+        # Try advanced metrics if available
+        if METRICS_AVAILABLE:
+            try:
+                advanced_metrics = calculate_metrics(predictions, ground_truths)
+                metrics.update(advanced_metrics)
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: Could not calculate advanced metrics: {e}")
+    
+    if losses:
+        metrics.update({
+            "eval_loss": sum(losses) / len(losses),
+            "eval_min_loss": min(losses),
+            "eval_max_loss": max(losses),
+        })
+    
+    metrics.update({
+        "eval_samples": total_samples,
+        "eval_successful": len(predictions),
+        "eval_failed": len(failed_samples),
+        "eval_success_rate": len(predictions) / total_samples if total_samples > 0 else 0.0,
+    })
+    
+    model.train()
+    return metrics
+
+
 def main():
     args = parse_args()
     
