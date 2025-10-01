@@ -3,6 +3,9 @@ import inspect
 import torch
 import torch.nn as nn
 import datetime
+import json
+import pathlib
+from collections import OrderedDict
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
@@ -16,8 +19,18 @@ from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, h
 from transformers.trainer_utils import seed_worker
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import timedelta
+
+# Import custom evaluation functions
+try:
+    from evaluate_model import (
+        evaluate_dataset_for_training,
+        determine_template,
+    )
+    CUSTOM_EVAL_AVAILABLE = True
+except ImportError:
+    CUSTOM_EVAL_AVAILABLE = False
 
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs
@@ -239,6 +252,107 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Override evaluate method to use custom evaluation from evaluate_model.py
+        when use_custom_eval is enabled.
+        """
+        # Check if custom evaluation is enabled
+        if hasattr(self.args, 'use_custom_eval') and self.args.use_custom_eval and CUSTOM_EVAL_AVAILABLE:
+            rank0_print("\n" + "="*60)
+            rank0_print("Running Custom Evaluation (Overridden)")
+            rank0_print("="*60)
+            
+            # Pick dataset
+            eval_ds = eval_dataset if eval_dataset is not None else self.eval_dataset
+            
+            if eval_ds is None:
+                rank0_print("No eval dataset available")
+                return {}
+            
+            # Get required components
+            try:
+                # Get image processor from model or data_args
+                if hasattr(self.model, 'get_vision_tower') and self.model.get_vision_tower() is not None:
+                    image_processor = self.model.get_vision_tower().image_processor
+                elif hasattr(self, 'data_args') and hasattr(self.data_args, 'image_processor'):
+                    image_processor = self.data_args.image_processor
+                else:
+                    rank0_print("Warning: No image processor found, falling back to standard evaluation")
+                    return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+                
+                # Determine conversation template
+                model_name = getattr(self.model.config, '_name_or_path', 'llava_qwen')
+                if hasattr(self, 'model_args') and hasattr(self.model_args, 'version'):
+                    version = self.model_args.version
+                else:
+                    version = getattr(self.model.config, 'version', 'qwen_1_5')
+                
+                conv_template = determine_template(model_name, version)
+                
+                # Run custom evaluation
+                custom_metrics = evaluate_dataset_for_training(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    image_processor=image_processor,
+                    eval_dataset=eval_ds,
+                    conv_template=conv_template,
+                    max_new_tokens=getattr(self.args, 'eval_max_new_tokens', 128),
+                    focus_loss_after_looking=getattr(self.args, 'focus_loss_after_looking', False),
+                    focus_loss_phrase=getattr(self.args, 'focus_loss_phrase', 'looking at'),
+                    focus_loss_threshold=getattr(self.args, 'focus_loss_threshold', 5.0),
+                    no_loss=getattr(self.args, 'no_loss', False),
+                    verbose=getattr(self.args, 'verbose_logging', False),
+                    limit=getattr(self.args, 'eval_limit', None),
+                )
+                
+                # Add metric prefix and log
+                metrics = OrderedDict()
+                if custom_metrics:
+                    for key, value in custom_metrics.items():
+                        # Add prefix to metrics
+                        prefixed_key = f"{metric_key_prefix}_{key}" if not key.startswith(metric_key_prefix) else key
+                        metrics[prefixed_key] = value
+                    
+                    # Log metrics
+                    rank0_print("\nCustom Evaluation Metrics:")
+                    for key, value in metrics.items():
+                        if isinstance(value, float):
+                            rank0_print(f"  {key}: {value:.4f}")
+                        else:
+                            rank0_print(f"  {key}: {value}")
+                    
+                    # Save to file
+                    output_dir = pathlib.Path(self.args.output_dir)
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    metrics_file = output_dir / f"custom_eval_step_{self.state.global_step}.json"
+                    with open(metrics_file, 'w') as f:
+                        json.dump(dict(metrics), f, indent=2)
+                    rank0_print(f"\nCustom metrics saved to: {metrics_file}")
+                    rank0_print("="*60 + "\n")
+                    
+                    # Log to trainer
+                    self.log(metrics)
+                    self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+                    
+                return metrics
+                
+            except Exception as e:
+                rank0_print(f"Error in custom evaluation: {e}")
+                rank0_print("Falling back to standard evaluation")
+                import traceback
+                traceback.print_exc()
+                return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+        
+        else:
+            # Use standard HF evaluation
+            return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
