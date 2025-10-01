@@ -436,6 +436,8 @@ class LlavaMetaForCausalLM(ABC):
             position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
+            # insert the image token labels
+            labels = torch.where(input_ids == IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, labels)
 
         # remove the padding using attention_mask -- FIXME
         _input_ids = input_ids
@@ -477,11 +479,13 @@ class LlavaMetaForCausalLM(ABC):
                 if i < num_images:
                     try:
                         cur_image_features = image_features[cur_image_idx]
+                        label_type = IMAGE_TOKEN_INDEX
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
+                        label_type = IGNORE_INDEX
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), label_type, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
