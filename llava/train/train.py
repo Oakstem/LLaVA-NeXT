@@ -192,8 +192,9 @@ class TrainingArguments(transformers.TrainingArguments):
     eval_accumulation_steps: Optional[int] = field(default=None, metadata={"help": "Number of predictions steps to accumulate before moving tensors to CPU."})
     
     # Custom evaluation parameters (from evaluate_model.py)
-    use_custom_eval: bool = field(default=False, metadata={"help": "Use custom evaluation from evaluate_model.py"})
+    use_custom_eval: bool = field(default=True, metadata={"help": "Use custom evaluation from evaluate_model.py"})
     eval_max_new_tokens: int = field(default=128, metadata={"help": "Max new tokens for evaluation generation"})
+    eval_limit: Optional[int] = field(default=5, metadata={"help": "Limit number of samples for custom evaluation (None for no limit)"})
     no_loss: bool = field(default=False, metadata={"help": "Disable loss calculation in evaluation"})
     focus_loss_after_looking: bool = field(default=True, metadata={"help": "Focus loss on tokens after 'looking at' phrase"})
     focus_loss_phrase: str = field(default="looking at", metadata={"help": "Phrase to focus loss calculation"})
@@ -1936,6 +1937,7 @@ def train(attn_implementation=None):
                         focus_loss_threshold=args.focus_loss_threshold,
                         no_loss=args.no_loss,
                         verbose=args.verbose_logging,
+                        limit=args.eval_limit,
                     )
                     
                     # Log custom metrics

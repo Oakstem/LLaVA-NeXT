@@ -519,6 +519,7 @@ def evaluate_dataset_for_training(
     focus_loss_threshold: float = 5.0,
     no_loss: bool = False,
     verbose: bool = False,
+    limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Custom evaluation function for training-time evaluation.
@@ -538,6 +539,7 @@ def evaluate_dataset_for_training(
         focus_loss_threshold: Maximum loss when focus phrase not found
         no_loss: Disable loss calculation
         verbose: Print detailed progress
+        limit: Optional limit on number of samples to evaluate (for testing)
         
     Returns:
         Dictionary of evaluation metrics
@@ -557,7 +559,11 @@ def evaluate_dataset_for_training(
     
     # Get dataset samples
     total_samples = len(eval_dataset)
-    if verbose:
+    if limit is not None and limit > 0:
+        total_samples = min(total_samples, limit)
+        if verbose:
+            print(f"Running custom evaluation on {total_samples} samples (limited from {len(eval_dataset)})...")
+    elif verbose:
         print(f"Running custom evaluation on {total_samples} samples...")
     
     with torch.no_grad():
