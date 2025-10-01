@@ -1900,6 +1900,9 @@ def train(attn_implementation=None):
         
         if training_args.use_custom_eval:
             rank0_print(f"Custom evaluation enabled with template: {conv_template}")
+            # Disable standard HF evaluation to use only custom evaluation
+            rank0_print("Disabling standard HF evaluation (using custom eval only)")
+            training_args.evaluation_strategy = "no"
     else:
         # Explicitly disable evaluation when no eval dataset is available
         training_args.evaluation_strategy = "no"
@@ -1912,53 +1915,58 @@ def train(attn_implementation=None):
         class CustomEvalCallback(transformers.TrainerCallback):
             """Callback to run custom evaluation from evaluate_model.py during training"""
             
-            def on_evaluate(self, args, state, control, model, **kwargs):
-                """Run custom evaluation after standard evaluation"""
-                if state.is_world_process_zero:
-                    rank0_print("\n" + "="*60)
-                    rank0_print("Running Custom Evaluation")
-                    rank0_print("="*60)
-                    
-                    eval_dataset = data_module.get("eval_dataset")
-                    if eval_dataset is None:
-                        rank0_print("No eval dataset available for custom evaluation")
-                        return
-                    
-                    # Run custom evaluation
-                    custom_metrics = evaluate_dataset_for_training(
-                        model=model,
-                        tokenizer=tokenizer,
-                        image_processor=image_processor,
-                        eval_dataset=eval_dataset,
-                        conv_template=conv_template,
-                        max_new_tokens=args.eval_max_new_tokens,
-                        focus_loss_after_looking=args.focus_loss_after_looking,
-                        focus_loss_phrase=args.focus_loss_phrase,
-                        focus_loss_threshold=args.focus_loss_threshold,
-                        no_loss=args.no_loss,
-                        verbose=args.verbose_logging,
-                        limit=args.eval_limit,
-                    )
-                    
-                    # Log custom metrics
-                    if custom_metrics:
-                        rank0_print("\nCustom Evaluation Metrics:")
-                        for key, value in custom_metrics.items():
-                            if isinstance(value, float):
-                                rank0_print(f"  {key}: {value:.4f}")
-                            else:
-                                rank0_print(f"  {key}: {value}")
-                        
-                        # Save to file
-                        output_dir = pathlib.Path(args.output_dir)
-                        metrics_file = output_dir / f"custom_eval_step_{state.global_step}.json"
-                        with open(metrics_file, 'w') as f:
-                            json.dump(custom_metrics, f, indent=2)
-                        rank0_print(f"\nCustom metrics saved to: {metrics_file}")
-                        rank0_print("="*60 + "\n")
+            def on_step_end(self, args, state, control, model, **kwargs):
+                """Check if it's time to run custom evaluation"""
+                # Check if we should run evaluation at this step
+                if args.evaluation_strategy == "steps" and args.eval_steps is not None:
+                    if state.global_step > 0 and state.global_step % args.eval_steps == 0:
+                        if state.is_world_process_zero:
+                            rank0_print("\n" + "="*60)
+                            rank0_print("Running Custom Evaluation")
+                            rank0_print("="*60)
+                            
+                            eval_dataset = data_module.get("eval_dataset")
+                            if eval_dataset is None:
+                                rank0_print("No eval dataset available for custom evaluation")
+                                return control
+                            
+                            # Run custom evaluation
+                            custom_metrics = evaluate_dataset_for_training(
+                                model=model,
+                                tokenizer=tokenizer,
+                                image_processor=image_processor,
+                                eval_dataset=eval_dataset,
+                                conv_template=conv_template,
+                                max_new_tokens=args.eval_max_new_tokens,
+                                focus_loss_after_looking=args.focus_loss_after_looking,
+                                focus_loss_phrase=args.focus_loss_phrase,
+                                focus_loss_threshold=args.focus_loss_threshold,
+                                no_loss=args.no_loss,
+                                verbose=args.verbose_logging,
+                                limit=args.eval_limit,
+                            )
+                            
+                            # Log custom metrics
+                            if custom_metrics:
+                                rank0_print("\nCustom Evaluation Metrics:")
+                                for key, value in custom_metrics.items():
+                                    if isinstance(value, float):
+                                        rank0_print(f"  {key}: {value:.4f}")
+                                    else:
+                                        rank0_print(f"  {key}: {value}")
+                                
+                                # Save to file
+                                output_dir = pathlib.Path(args.output_dir)
+                                metrics_file = output_dir / f"custom_eval_step_{state.global_step}.json"
+                                with open(metrics_file, 'w') as f:
+                                    json.dump(custom_metrics, f, indent=2)
+                                rank0_print(f"\nCustom metrics saved to: {metrics_file}")
+                                rank0_print("="*60 + "\n")
+                
+                return control
         
         custom_callback = CustomEvalCallback()
-        rank0_print("Custom evaluation callback created")
+        rank0_print("Custom evaluation callback created (will run at eval steps)")
     
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     
