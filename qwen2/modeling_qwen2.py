@@ -1370,7 +1370,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # query_indices = kwargs.get("query_indices", None)
 
         for layer_ind, decoder_layer in enumerate(self.layers):
-            if layer_ind == getattr(self.config, 'attn_layer_ind', 0):
+            if layer_ind == getattr(self.config, 'attn_layer_ind', -1):
                 output_attentions = True
             else:
                 output_attentions = False
