@@ -119,7 +119,6 @@ def build_command(args: argparse.Namespace, checkpoint: Path, extra_args: List[s
         "--output-dir",
         str(output_dir.resolve()),
         "--focus-loss-after-looking",
-        "--limit", "10"
     ]
     if args.model_base:
         cmd.extend(["--model-base", args.model_base])
