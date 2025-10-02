@@ -192,7 +192,7 @@ class TrainingArguments(transformers.TrainingArguments):
     eval_accumulation_steps: Optional[int] = field(default=None, metadata={"help": "Number of predictions steps to accumulate before moving tensors to CPU."})
     
     # Custom evaluation parameters (from evaluate_model.py)
-    use_custom_eval: bool = field(default=True, metadata={"help": "Use custom evaluation from evaluate_model.py"})
+    use_custom_eval: bool = field(default=False, metadata={"help": "Use custom evaluation from evaluate_model.py"})
     eval_max_new_tokens: int = field(default=128, metadata={"help": "Max new tokens for evaluation generation"})
     eval_limit: Optional[int] = field(default=5, metadata={"help": "Limit number of samples for custom evaluation (None for no limit)"})
     no_loss: bool = field(default=False, metadata={"help": "Disable loss calculation in evaluation"})
@@ -1883,7 +1883,7 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     
     # Determine conversation template for evaluation
-    conv_template = determine_template(model_name, model_args.version) if CUSTOM_EVAL_AVAILABLE else "qwen_1_5"
+    conv_template = "qwen_1_5"
     
     # Configure evaluation settings before creating trainer
     if data_args.enable_evaluation and data_module["eval_dataset"] is not None:
@@ -1897,14 +1897,6 @@ def train(attn_implementation=None):
         
         rank0_print(f"Evaluation enabled: strategy={training_args.evaluation_strategy}, eval_steps={training_args.eval_steps}")
         rank0_print(f"Eval dataset size: {len(data_module['eval_dataset'])}")
-        
-        if training_args.use_custom_eval:
-            rank0_print(f"Custom evaluation enabled (overridden in LLaVATrainer.evaluate())")
-            rank0_print(f"  - Template: {conv_template}")
-            rank0_print(f"  - Max new tokens: {training_args.eval_max_new_tokens}")
-            rank0_print(f"  - Sample limit: {training_args.eval_limit}")
-            if training_args.focus_loss_after_looking:
-                rank0_print(f"  - Focused loss: enabled (phrase='{training_args.focus_loss_phrase}')")
     else:
         # Explicitly disable evaluation when no eval dataset is available
         training_args.evaluation_strategy = "no"

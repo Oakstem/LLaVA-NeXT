@@ -98,7 +98,7 @@ LR_SCHEDULER_TYPE="cosine"
 
 # Evaluation and saving
 EVALUATION_STRATEGY="steps"
-EVAL_STEPS="10"
+EVAL_STEPS="1000000"    # never evaluate during training
 SAVE_STRATEGY="steps"
 SAVE_STEPS="5000"
 SAVE_TOTAL_LIMIT="20"
