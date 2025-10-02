@@ -76,3 +76,5 @@ training_outputs/
 *.png
 attention_output/
 *.csv
+*.json
+*.sh
