@@ -566,6 +566,13 @@ def evaluate_dataset_for_training(
     elif verbose:
         print(f"Running custom evaluation on {total_samples} samples...")
     
+    # Debug: Show image folder configuration
+    if verbose:
+        if hasattr(eval_dataset, 'data_args') and hasattr(eval_dataset.data_args, 'image_folder'):
+            print(f"Image folder: {eval_dataset.data_args.image_folder}")
+        else:
+            print("Warning: No image_folder found in eval_dataset.data_args")
+    
     with torch.no_grad():
         iterator = tqdm(range(total_samples), desc="Evaluating") if verbose else range(total_samples)
         for idx in iterator:
@@ -589,21 +596,42 @@ def evaluate_dataset_for_training(
                 
                 # Handle relative paths from dataset
                 if not os.path.isabs(image_file):
-                    # Try to resolve relative to dataset's data_path if available
-                    data_path = getattr(eval_dataset, 'data_path', None)
-                    if data_path:
-                        base_dir = Path(data_path).parent
-                        image_file = str(base_dir / image_file)
+                    # Try to resolve relative to dataset's image_folder
+                    image_folder = None
+                    if hasattr(eval_dataset, 'data_args') and hasattr(eval_dataset.data_args, 'image_folder'):
+                        image_folder = eval_dataset.data_args.image_folder
+                    
+                    if image_folder:
+                        image_file = os.path.join(image_folder, image_file)
+                    else:
+                        # Fallback: try to resolve relative to data_path
+                        data_path = getattr(eval_dataset, 'data_path', None)
+                        if data_path:
+                            base_dir = Path(data_path).parent
+                            image_file = str(base_dir / image_file)
                 
                 # Process image
-                image_result = prepare_image_tensor(
-                    image_file,
-                    image_processor,
-                    model
-                )
-                
-                if image_result is None:
-                    failed_samples.append({"index": idx, "reason": f"Failed to load image: {image_file}"})
+                try:
+                    image_result = prepare_image_tensor(
+                        image_file,
+                        image_processor,
+                        model
+                    )
+                    
+                    if image_result is None:
+                        failed_samples.append({"index": idx, "reason": f"Failed to load image: {image_file}"})
+                        continue
+                except FileNotFoundError as e:
+                    if verbose:
+                        print(f"Image not found: {image_file}")
+                        if hasattr(eval_dataset, 'data_args') and hasattr(eval_dataset.data_args, 'image_folder'):
+                            print(f"  Image folder: {eval_dataset.data_args.image_folder}")
+                    failed_samples.append({"index": idx, "reason": f"Image not found: {image_file}"})
+                    continue
+                except Exception as e:
+                    if verbose:
+                        print(f"Error loading image {image_file}: {e}")
+                    failed_samples.append({"index": idx, "reason": f"Error loading image: {str(e)}"})
                     continue
                 
                 image_tensor, image_size = image_result
