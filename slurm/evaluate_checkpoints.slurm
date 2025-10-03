@@ -42,7 +42,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
 export ACCELERATE_DISABLE_NUMA=1
 
-CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-training_outputs/llava-20250926_145244}"
+CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/selected}"
 DATASET_JSON="${DATASET_JSON:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/sgl_conversation_data_20250928_172112/val.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-evaluation_results/multi_checkpoint}"

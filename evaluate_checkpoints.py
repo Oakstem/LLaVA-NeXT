@@ -93,13 +93,18 @@ def checkpoint_sort_key(path: Path) -> Tuple[int, Any]:
 
 
 def discover_checkpoints(checkpoints_dir: Path) -> List[Path]:
+    """Recursively discover all directories starting with 'checkpoint-' under checkpoints_dir."""
     if not checkpoints_dir.is_dir():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoints_dir}")
-    candidates = [path for path in checkpoints_dir.iterdir() if path.is_dir()]
-    filtered = [path for path in candidates if path.name.startswith("checkpoint-")]
-    if not filtered:
-        raise FileNotFoundError(f"No checkpoint-* subdirectories found under {checkpoints_dir}")
-    return sorted(filtered, key=checkpoint_sort_key)
+    
+    checkpoints = []
+    for path in checkpoints_dir.rglob("checkpoint-*"):
+        if path.is_dir():
+            checkpoints.append(path)
+    
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoint-* subdirectories found under {checkpoints_dir} (searched recursively)")
+    return sorted(checkpoints, key=checkpoint_sort_key)
 
 
 def build_command(args: argparse.Namespace, checkpoint: Path, extra_args: List[str], output_dir: Path) -> List[str]:
@@ -195,12 +200,15 @@ def main() -> int:
     args.output_root = args.output_root.resolve()
     args.output_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"Discovered {len(checkpoints)} checkpoints under {args.checkpoints_dir}.")
+    print(f"Discovered {len(checkpoints)} checkpoints under {args.checkpoints_dir} (searched recursively).")
     evaluations: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
 
     for checkpoint in checkpoints:
-        output_dir = args.output_root / checkpoint.name
+        # Create output dir name from relative path to preserve parent structure
+        relative_path = checkpoint.relative_to(args.checkpoints_dir)
+        output_dir_name = str(relative_path).replace("/", "_")
+        output_dir = args.output_root / output_dir_name
         metrics_path = output_dir / "metrics.json"
         if args.skip_existing and metrics_path.is_file():
             print(f"Skipping {checkpoint.name}: metrics.json already exists.")
