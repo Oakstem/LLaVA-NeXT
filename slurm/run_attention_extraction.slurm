@@ -2,7 +2,7 @@
 #SBATCH --job-name=attention_extraction
 #SBATCH --output=logs/attention_extraction_%j.out
 #SBATCH --error=logs/attention_extraction_%j.err
-#SBATCH --time=22:00:00
+#SBATCH --time=24:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -10,7 +10,7 @@
 #SBATCH --nodes=1
 
 # Configuration variables - modify these as needed
-MODE="${MODE:-sweep}"  # Options: single, batch, sweep
+MODE="${MODE:-batch}"  # Options: single, batch, sweep
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 ATTN_LAYER_IND="${ATTN_LAYER_IND:-23}"
@@ -18,8 +18,8 @@ ATTN_LAYER_IND="${ATTN_LAYER_IND:-23}"
 # Single mode arguments
 IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000000/00000032.jpg}"
 MASK_PATH="${MASK_PATH:-$(echo "$IMAGE_PATH" | sed 's|.*/\([^/]*\)\.[^.]*$|/galitylab/students/alonmardi/gazefollow/train_gaze_segmentations/small_masks/small_masks/gaze__\1_masks.npy|')}"
-#PROMPT="${PROMPT:-You are provided with embeddings representing people or objects in an image. Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.}"
-PROMPT="${PROMPT:-The _ is looking at _ . Where is the person looking?}"
+PROMPT="${PROMPT:-You are provided with embeddings representing people or objects in an image. Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.}"
+# PROMPT="${PROMPT:-The _ is looking at _ . Where is the person looking?}"
 
 # Batch mode arguments
 JSON_PATH="${JSON_PATH:-}"
@@ -28,7 +28,8 @@ BASE_MASK_DIR="${BASE_MASK_DIR:-/galitylab/students/alonmardi/gazefollow/train_g
 LIMIT_ITEMS="${LIMIT_ITEMS:-}"
 RESUME_FROM_DIR="${RESUME_FROM_DIR:-}"
 USE_PERSON_DESCRIPTIONS="${USE_PERSON_DESCRIPTIONS:-false}"
-START_FROM="${START_FROM:-00102212}"
+START_FROM="${START_FROM:-00000001}"
+SGL_CONVERSATION_PATH="${SGL_CONVERSATION_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/datasets/sgl_conversation_data.json}"
 
 # Bias sweep arguments
 BIAS_MIN="${BIAS_MIN:-1.0}"
@@ -137,6 +138,7 @@ elif [ "$MODE" = "batch" ]; then
     ARGS+=("--base_image_dir" "$BASE_IMAGE_DIR")
     ARGS+=("--base_mask_dir" "$BASE_MASK_DIR")
     ARGS+=("--prompt" "$PROMPT")
+    ARGS+=("--sgl_conversation_path" "$SGL_CONVERSATION_PATH")
     
     if [ -n "$JSON_PATH" ]; then
         ARGS+=("--json_path" "$JSON_PATH")
