@@ -7,6 +7,7 @@ import pandas as pd
 import os
 import numpy as np
 from tqdm import tqdm
+from datetime import datetime
 from generation_utils import fix_wsl_paths
 
 # Define file paths
@@ -17,7 +18,13 @@ from generation_utils import fix_wsl_paths
 COMBINED_CSV_PATH = r"D:\Projects\data\gazefollow\results\valid_runs\combined_description_results.csv"
 # COMBINED_CSV_PATH = r"/mnt/d/Projects/data/gazefollow/results/valid_runs/combined_ppl_desc_results.csv"
 COMBINED_CSV_PATH = fix_wsl_paths(COMBINED_CSV_PATH)
-OUTPUT_FILE_PATH = Path(COMBINED_CSV_PATH).parent / "sgl_conversation_data.json"
+
+# Create output directory with timestamp
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_dir = Path(COMBINED_CSV_PATH).parent / f"sgl_conversations_files"
+output_dir.mkdir(parents=True, exist_ok=True)
+OUTPUT_FILE_PATH = output_dir / f"{timestamp}_sgl_conversation_data.json"
+
 # Base path for the image field in the output JSON
 IMAGE_BASE_PREFIX = "train/" # Using escaped backslashes for JSON string
 
@@ -168,7 +175,8 @@ def create_conversational_data():
 
 
         target_entry = row["steered_target_description"]
-
+        if row['in_or_out'] == 0:
+            target_entry = row['target_description']
         if not isinstance(target_entry, str):
             print(f"Warning: Unexpected format for target_entry in image_key '{image_key}'. Skipping.")
             skipped_due_to_target_format += 1
@@ -177,8 +185,8 @@ def create_conversational_data():
         # --- Data Extraction ---
         # For subjects_data: image_key maps directly to the subject string.
         # e.g., subjects_data["train/00000041/00041904.jpg"] is "hairdresser"
-        subject_text = subject_entry
-        target_text = target_entry
+        subject_text = subject_entry.strip()
+        target_text = target_entry.strip()
 
         # strip of any symbols such as quotes, periods, etc.
         if isinstance(subject_text, str):
@@ -242,9 +250,17 @@ def create_conversational_data():
             full_image_path = Path(IMAGE_BASE_PREFIX) / folder_name_str / image_key
 
 
+        # Extract num_people from the row
+        num_people = row.get("num_people", None)
+        if pd.isna(num_people):
+            num_people = None
+        elif isinstance(num_people, (int, float)):
+            num_people = int(num_people)
+        
         conversation_item = {
             "id": image_key,  # using image_key as ID for easier traceability
             "image": str(full_image_path),
+            "num_people": num_people,
             "conversations": [
                 {
                     "from": "human",

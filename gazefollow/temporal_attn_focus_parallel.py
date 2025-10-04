@@ -80,9 +80,9 @@ def process_task_wrapper(task: ProcessingTask) -> Tuple[bool, str, Optional[str]
     
     try:
         # # Check if already processed
-        # each_person_attn_maps_dir = task.attn_dir / f'layer_{task.layer}' / 'each_person_attn_maps'
-        # if each_person_attn_maps_dir.exists():
-        #     return True, task_id, None
+        each_person_attn_maps_dir = task.attn_dir / f'layer_{task.layer}' / 'each_person_attn_maps'
+        if each_person_attn_maps_dir.exists():
+            return True, task_id, None
             
         # Convert to namespace and process
         args = task.to_args_namespace()
@@ -90,7 +90,7 @@ def process_task_wrapper(task: ProcessingTask) -> Tuple[bool, str, Optional[str]
         return True, task_id, None
         
     except Exception as e:
-        error_msg = f"Error processing {task_id}: {str(e)}"
+        error_msg = f"Error processing {task_id}: {str(e)}\n{traceback.format_exc()}"
         return False, task_id, error_msg
 
 

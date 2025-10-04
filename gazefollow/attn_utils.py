@@ -180,12 +180,12 @@ def average_attention_maps(person_attn, gaze_target_attn):
     for person_ind, attn_maps in person_attn.items():
         if attn_maps:
             all_attn = [data['attention_map'] for data in attn_maps]
-            person_attn_avg[person_ind] = np.mean(np.stack(all_attn, axis=0), axis=0)
+            person_attn_avg[person_ind] = torch.stack(all_attn, dim=0).mean(dim=0).float().cpu().numpy()
 
     for person_ind, attn_maps in gaze_target_attn.items():
         if attn_maps:
             all_gaze_attn = [data['attention_map'] for data in attn_maps]
-            gaze_target_attn_avg[person_ind] = np.mean(np.stack(all_gaze_attn, axis=0), axis=0)
+            gaze_target_attn_avg[person_ind] = torch.stack(all_gaze_attn, dim=0).mean(dim=0).float().cpu().numpy()
 
     return person_attn_avg, gaze_target_attn_avg
 

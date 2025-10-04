@@ -39,7 +39,7 @@ class ProcessingConfig:
         'sigma': 2,
         'pattern': '*attn',
         'log_level': 'INFO',
-        'skip_completed': False,
+        'skip_completed': True,
         'visualize_attention_maps': False
     }
     

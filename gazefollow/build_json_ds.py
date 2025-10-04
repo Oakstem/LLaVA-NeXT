@@ -24,7 +24,7 @@ import threading
 """
 
 
-
+override_existing = False  # Set to True to force reload all description files
 #%% Relevant paths
 steered_generated_results = r"D:\Projects\data\gazefollow\results\steered_attention_runs\json_results\combined.json"
 # gazefollowing_results_csv = r"D:\Projects\data\gazefollow\results\valid_runs\20250902_015248_You_are_an_expert_vision_assis_results.csv"
@@ -34,7 +34,7 @@ person_description_data_dir = r"D:\Projects\data\gazefollow\results\valid_runs\c
 steered_generated_results = fix_wsl_paths(steered_generated_results)
 gazefollowing_results_csv = fix_wsl_paths(gazefollowing_results_csv)
 person_description_data_dir = fix_wsl_paths(person_description_data_dir)
-
+periodic_save_path = os.path.join(os.path.dirname(gazefollowing_results_csv), "gazefollowing_results_periodic.csv")
 #%% Load the results csv
 gazefollowing_results_df = pd.read_csv(gazefollowing_results_csv)
 steered_results_df = pd.read_json(steered_generated_results).T
@@ -82,11 +82,13 @@ def load_all_description_files(gazefollowing_results_df, person_description_data
 
 # first check if the the person description json already exists
 desc_data_json_path = os.path.join(os.path.dirname(gazefollowing_results_csv), "all_person_description_text_data.json")
-if os.path.exists(desc_data_json_path):
+if os.path.exists(desc_data_json_path) and not override_existing:
     with open(desc_data_json_path, "r") as f:
         desc_data = json.load(f)
     print(f"Loaded existing description data from {desc_data_json_path}")
 else:
+    if override_existing:
+        print(f"Override flag set, reloading all description files...")
     desc_data = load_all_description_files(gazefollowing_results_df, person_description_data_dir)
 print(f"Loaded {len(desc_data)} description files.")
 #%% Store the desc_data to a json file for future reference
@@ -113,7 +115,7 @@ def _print_missed_summary():
 atexit.register(_print_missed_summary)
 
 periodic_save_every = 5000  # Save every N iterations
-periodic_save_path = os.path.join(os.path.dirname(gazefollowing_results_csv), "gazefollowing_results_periodic.csv")
+
 
 for image_id, row in tqdm(gazefollowing_results_df.iterrows(), total=len(gazefollowing_results_df), desc="Processing gazefollowing results"):
     if image_id not in gazefollowing_results_df.index:
@@ -124,7 +126,6 @@ for image_id, row in tqdm(gazefollowing_results_df.iterrows(), total=len(gazefol
     result_row = gazefollowing_results_df.loc[image_id]
     person_desc_index = result_row["llava_matched_person_id"] - 1 # convert to 0-based index
     if np.isnan(person_desc_index):
-        print(f"Person description index for image id {image_id} is NaN, skipping.")
         missed_summary['nan_index'].add(image_id)
         continue
 
@@ -143,28 +144,35 @@ for image_id, row in tqdm(gazefollowing_results_df.iterrows(), total=len(gazefol
     full_person_desc = img_desc_data["person_descriptions"][person_desc_index]
     # split the full_person_desc into source and target based on the first occurrence of "looking at"
     if "looking at" in full_person_desc:
-        source_desc = full_person_desc.split("looking at")[0]
-        target_desc = full_person_desc.split("looking at")[1]
+        if row['in_or_out'] == 0:
+            source_desc = full_person_desc.split("looking at")[0]
+            target_desc = "someone or something outside the image"
+        else:
+            source_desc = full_person_desc.split("looking at")[0]
+            target_desc = full_person_desc.split("looking at")[1]
         gazefollowing_results_df.at[image_id, "source_description"] = source_desc
         gazefollowing_results_df.at[image_id, "target_description"] = target_desc
 
     gazefollowing_results_df.at[image_id, "full_description"] = full_person_desc
+    # gazefollowing_results_df.at[image_id, "num_people"] = 
     ind += 1
 
     # Periodic saving
     if ind % periodic_save_every == 0:
-        gazefollowing_results_df.to_csv(periodic_save_path, index=False)
+        gazefollowing_results_df.to_csv(periodic_save_path, index=True)
         print(f"Periodic save at iteration {ind} to {periodic_save_path}")
 
     # if ind >= 100:     # testing
     #     break   
-gazefollowing_results_df.to_csv(periodic_save_path, index=False)
+gazefollowing_results_df.to_csv(periodic_save_path, index=True)
 print(f"Final save to {periodic_save_path}")
 
 # %% Lets combine the dataframes, prefering the gazefollowing_results_df person descriptions if available
 # join on the index (image id)
 gazefollowing_results_df = pd.read_csv(periodic_save_path, index_col=0)
-gazefollowing_results_df.index = gazefollowing_results_df['image_path'].str.split("/").str[-1].str.split(".").str[0]
+# zfill the index to 8 digits
+gazefollowing_results_df.index = gazefollowing_results_df.index.astype(str).str.zfill(8)
+# gazefollowing_results_df.index = gazefollowing_results_df['image_path'].str.split("/").str[-1].str.split(".").str[0]
 steered_prefixed = steered_results_df[["source_description", "target_description"]].add_prefix("steered_")
 combined_df = gazefollowing_results_df.merge(
     steered_prefixed, left_index=True, right_index=True, how="left"

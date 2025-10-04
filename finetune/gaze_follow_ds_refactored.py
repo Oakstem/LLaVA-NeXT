@@ -620,6 +620,7 @@ class GazeFollowDatasetProcessor:
             'body_bbox_y': 'mean',
             'body_bbox_width': 'mean',
             'body_bbox_height': 'mean',
+            'in_or_out': 'first',  # Assuming in_or_out is consistent per image
         }).reset_index()
         
         compact_df['image_key'] = compact_df['image_path'].apply(lambda x: Path(x).stem)

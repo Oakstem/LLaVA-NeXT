@@ -280,7 +280,7 @@ def process_single_image(args):
         p_results_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(person_results, str(p_results_path))
 
-        print(f"Person {person_id} has {len(p_centers)} attention centers saved to {p_results_path}")
+        # print(f"Person {person_id} has {len(p_centers)} attention centers saved to {p_results_path}")
 
         # Process gaze attention maps if available
         if person_id in gaze_target_attn_avg:
@@ -310,7 +310,7 @@ def process_single_image(args):
             g_results_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(gaze_results, str(g_results_path))
 
-            print(f"Gaze target for person {person_id} has {len(g_centers)} attention centers saved to {g_results_path}")
+            # print(f"Gaze target for person {person_id} has {len(g_centers)} attention centers saved to {g_results_path}")
 
 def process_directory(args):
     """Process all images in a directory"""
