@@ -63,13 +63,13 @@ CKPT_PATH="lmms-lab/llava-onevision-qwen2-7b-ov-chat"
 
 # ===== TRAINING PARAMETERS =====
 # Data configuration
-DATA_PATH="/galitylab/students/alonmardi/gazefollow/results/json_results/sgl_conversation_data.json"
+DATA_PATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT/datasets/splits/20251004_172624_sgl_conversation_data_20251005_003422/train.json"
 IMAGE_FOLDER="/galitylab/students/alonmardi/gazefollow"
 OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs"
 DEEPSPEED_CONFIG="scripts/zero3.json"
 
 # Model architecture parameters
-MM_TUNABLE_PARTS="mm_mlp_adapter,mm_vision_resampler,mm_language_model"
+MM_TUNABLE_PARTS="mm_vision_resampler"
 MM_VISION_TOWER_LR="1e-6"
 MM_PROJECTOR_TYPE="mlp2x_gelu"
 MM_VISION_SELECT_LAYER="-2"
