@@ -13,12 +13,12 @@
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
 # ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20250922_124635/checkpoint-12000}"
-ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20250926_145244/checkpoint-15000}"
+ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/evaluated/llava-20250926_144813/checkpoint-10000}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 
 # Inference parameters
-IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/baseline_images/11865.jpg}"
+IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/baseline_images/39740.png}"
 # if [ -z "$PROMPT" ]; then
 #     read -r -d '' PROMPT <<'EOF'
 # You are an expert vision assistant.
@@ -47,7 +47,8 @@ IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/base
 # • Do not output your reasoning or any extra text.
 # EOF
 # fi
-PROMPT="${PROMPT:-Describe where every person in the image is looking and whats their interaction.}"
+# PROMPT="${PROMPT:-Describe the scene and then where every person in the image is looking.}"
+PROMPT="${PROMPT:-Describe where every person in the image is looking.}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.9}"
