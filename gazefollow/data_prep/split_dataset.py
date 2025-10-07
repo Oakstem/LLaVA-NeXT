@@ -167,7 +167,7 @@ def main():
     parser = argparse.ArgumentParser(description="Split LLaVA-NeXT dataset into train/val splits")
     parser.add_argument("--input_path", type=str, required=True,
                        help="Path to input dataset (JSON or JSONL)")
-    parser.add_argument("--output_dir", type=str, default="./datasets/splits",
+    parser.add_argument("--output_dir", type=str, default="./training_datasets",
                        help="Output directory for split datasets")
     parser.add_argument("--dataset_name", type=str, default=None,
                        help="Name for the dataset (defaults to input filename + timestamp)")

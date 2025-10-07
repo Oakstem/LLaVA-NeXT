@@ -9,8 +9,13 @@ import json
 import re
 import argparse
 from pathlib import Path
+import sys
 from typing import List, Any
 import logging
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    
+from generation_utils import fix_wsl_paths
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -167,6 +172,10 @@ def process_json_file(file_path: Path, backup: bool = True, min_people: int = 0)
         logger.error(f"Error loading {file_path}: {e}")
         return 0, 0
     
+    # Log original sample count
+    original_count = len(data)
+    logger.info(f"Original sample count in {file_path.name}: {original_count} samples")
+    
     # Fix duplicated words
     fixed_data, num_fixes, num_removed, num_people_filtered = fix_conversation_data(data, min_people)
 
@@ -197,7 +206,7 @@ def process_json_file(file_path: Path, backup: bool = True, min_people: int = 0)
 def main():
     parser = argparse.ArgumentParser(description='Fix duplicated words in JSON conversation data')
     parser.add_argument('path', nargs='?', 
-                       default='/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/sgl_conversation_data_20250928_172112',
+                       default=r'D:\Projects\data\gazefollow\results\valid_runs\sgl_conversations_files\20251007_165818_sgl_conversation_data.json',
                        help='Path to directory containing JSON files or specific JSON file')
     parser.add_argument('--no-backup', action='store_true', 
                        help='Do not create backup files')
@@ -213,7 +222,7 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    path = Path(args.path)
+    path = Path(fix_wsl_paths(args.path))
     
     # Determine files to process
     json_files = []
