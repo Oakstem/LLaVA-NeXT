@@ -34,12 +34,13 @@ Person 5: A man in a dark suit, clapping, looking at the crowd.
 For every image, we save the generated text + attention map on the image coordinates of every generated word. 
 
 2. [old single core script]`gazefollow/temporal_attn_focus_refactored.py`  
-[new parallel proc script] `launch_parallel.py "/mnt/d/Projects/data/gazefollow/results/valid_runs/20250902_015248_00000001_00030291" "/mnt/d/Projects/data/gazefollow/train" --config default --workers 8`
+[new parallel proc script] `python gazefollow/launch_parallel.py "/mnt/d/Projects/data/gazefollow/results/valid_runs/20250929_195104_You_are_an_expert_vision_assis" "/mnt/d/Projects/data/gazefollow/train" --config default --workers 8`
 Based on the given attention maps, create centered locations for every person & and it's gaze target
-3. In Grounded_SAM repo, run:  
+3. To generate the Gaze source&target masks, do:
+In Grounded_SAM repo, run:  
 `/home/alonz/gd_sam/bin/python /mnt/d/Projects/Grounded-SAM-2/process_auto.py --attn-base-dir "D:\Projects\data\gazefollow\results\valid_runs\20250902_015248_You_are_an_expert_vision_assis" --images-base-dir "D:\Projects\data\gazefollow\train"`
 This generates segmentation masks for every described person + it's target gaze based on the centered locations from the previous step
-4. `finetune/gaze_follow_ds.py`  
+4. `finetune/gaze_follow_ds_refactored.py`  
 Final script that goes over all the results, finds the actual person that is closest to the GT location, and check's it's error from the GT gaze target location.
 We're using 2 metrics to define the error:
     1. Normalized l2 distance
@@ -48,3 +49,9 @@ We're using 2 metrics to define the error:
 %% Conversation dataset preparing
 1. `build_json_ds.py` - combines both the 'baseline' llava run with full descriptions (using only people description here) and the steered attention llava results, saves the result to `combined_description_results.csv`  
 2. `create_sgl_conversations.py` - builds a conversation json dataset from the results, prefers original llava person descriptions and adds the generated target descriptions
+3. `fix_duplicated_words.py` - fixing and filtering the resulted json by removing duplicate words, ('the the'), 'man1/man2' words etc. Also filtering images with less than set threshold of people.
+4. `split_dataset.py` - split the resulted json to train and val. 
+
+
+## Running the train script
+`cd /mnt/d/Projects/LLaVA-NeXT && export PYTHONPATH="${PYTHONPATH}:/mnt/d/Projects/LLaVA-NeXT" && ~/llava/bin/python llava/train/train.py   --model_name_or_path "lmms-lab/llava-onevision-qwen2-7b-ov-chat"   --data_path "/mnt/d/Projects/data/gazefollow/results/valid_runs/sgl_conversation_data.json"   --output_dir "/mnt/d/Projects/LLaVA-NeXT/training_outputs"   --lora_enable True   --lora_r 4   --lora_alpha 16   --lora_target_modules "lm_head"   --num_train_epochs 1   --per_device_train_batch_size 1   --save_steps 100   --logging_steps 10 --image_folder "/mnt/d/Projects/data/gazefollow"`
