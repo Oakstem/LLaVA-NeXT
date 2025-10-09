@@ -16,6 +16,7 @@ import torch
 import time
 import os
 import math
+import re
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -47,6 +48,53 @@ try:
 except ImportError:
     METRICS_AVAILABLE = False
     print("Warning: generation_metrics module not available. Only basic evaluation will be performed.")
+
+
+def load_wandb_config_from_checkpoint(model_path: str) -> Dict[str, Any]:
+    """
+    Try to load wandb configuration from training output directory.
+    Looks for trainer_state.json or wandb config files.
+    """
+    path = Path(model_path).resolve()
+    
+    # Navigate to run directory
+    if path.name.startswith("checkpoint-"):
+        run_dir = path.parent
+    else:
+        run_dir = path
+    
+    # Try to find trainer_state.json in parent directory
+    trainer_state_file = run_dir / "trainer_state.json"
+    if trainer_state_file.exists():
+        try:
+            with open(trainer_state_file, 'r') as f:
+                trainer_state = json.load(f)
+                # Extract wandb info if available
+                return {
+                    "best_model_checkpoint": trainer_state.get("best_model_checkpoint"),
+                    "log_history": trainer_state.get("log_history", []),
+                }
+        except Exception as e:
+            print(f"Warning: Could not load trainer_state.json: {e}")
+    
+    # Try to find wandb directory
+    wandb_dir = run_dir / "wandb"
+    if wandb_dir.exists():
+        # Look for latest run directory
+        run_dirs = sorted([d for d in wandb_dir.iterdir() if d.is_dir() and d.name.startswith("run-")])
+        if run_dirs:
+            latest_run = run_dirs[-1]
+            config_file = latest_run / "files" / "config.yaml"
+            if config_file.exists():
+                try:
+                    import yaml
+                    with open(config_file, 'r') as f:
+                        config = yaml.safe_load(f)
+                        return config
+                except Exception as e:
+                    print(f"Warning: Could not load wandb config.yaml: {e}")
+    
+    return {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +131,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Print detailed progress information.")
     parser.add_argument("--safe-mode", action="store_true", help="Enable safe mode with more aggressive memory cleanup and smaller batches.")
     parser.add_argument("--no-loss", action="store_true", help="Disable loss calculation entirely to avoid CUDA errors.")
+    parser.add_argument("--log-to-wandb", action="store_true", help="Log evaluation results to wandb using the same run_id as training.")
+    parser.add_argument("--wandb-project", default="llava-gazefollow-finetune", help="Wandb project name (optional, will try to infer from training config).")
+    parser.add_argument("--wandb-entity", default="gylab", help="Wandb entity name (optional, will try to infer from training config).")
     parser.add_argument(
         "--focus-loss-after-looking",
         action="store_true",
@@ -743,6 +794,57 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Initialize wandb if requested
+    wandb_run = None
+    if args.log_to_wandb:
+        try:
+            import wandb
+            # Extract run_id from adapter path
+            run_id = Path(args.adapter_path).resolve().parent.name
+            if not run_id:
+                print("Warning: Could not extract run_id from model path. Will create a new wandb run.")
+            else:
+                print(f"Extracted run_id: {run_id}")
+            
+            # Load wandb config from checkpoint if available
+            wandb_config = load_wandb_config_from_checkpoint(args.model_path)
+            
+            # Determine project and entity
+            project = args.wandb_project or wandb_config.get("wandb_project") or "llava-evaluation"
+            entity = args.wandb_entity or wandb_config.get("wandb_entity")
+            
+            # Resume the run with the extracted run_id
+            wandb_run = wandb.init(
+                project=project,
+                entity=entity,
+                id=run_id,
+                resume="allow",  # Allow resuming if run exists, create new if not
+                name=f"{run_id}" if run_id else "evaluation",
+                job_type="evaluation",
+                config={
+                    "model_path": args.model_path,
+                    "dataset_json": args.dataset_json,
+                    "images_dir": args.images_dir,
+                    "max_new_tokens": args.max_new_tokens,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "num_beams": args.num_beams,
+                    "do_sample": args.do_sample,
+                    "limit": args.limit,
+                    "focus_loss_after_looking": args.focus_loss_after_looking,
+                    "focus_loss_phrase": args.focus_loss_phrase if args.focus_loss_after_looking else None,
+                    "focus_loss_threshold": args.focus_loss_threshold if args.focus_loss_after_looking else None,
+                }
+            )
+            print(f"Initialized wandb run: {wandb_run.name} (project: {project})")
+            
+        except ImportError:
+            print("Warning: wandb not available. Install with: pip install wandb")
+            args.log_to_wandb = False
+        except Exception as e:
+            print(f"Warning: Could not initialize wandb: {e}")
+            args.log_to_wandb = False
+    
     print("=" * 60)
     print("LLaVA Model Evaluation")
     print("=" * 60)
@@ -1133,6 +1235,41 @@ def main():
     with open(config_file, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     print(f"Evaluation configuration saved to: {config_file}")
+    
+    # Log to wandb if enabled
+    if args.log_to_wandb and wandb_run is not None:
+        try:
+            import wandb
+            
+            # Prepare metrics for wandb with eval/ prefix
+            wandb_metrics = {f"eval/{k}": v for k, v in final_metrics.items() if isinstance(v, (int, float, bool))}
+            
+            # Log metrics
+            wandb.log(wandb_metrics)
+            
+            # Save artifacts (metrics, predictions, failed samples)
+            artifact = wandb.Artifact(
+                name=f"evaluation_results_{wandb_run.id}",
+                type="evaluation",
+                description=f"Evaluation results for {args.model_path}"
+            )
+            
+            artifact.add_file(str(metrics_file), name="metrics.json")
+            if args.save_predictions and predictions_file.exists():
+                artifact.add_file(str(predictions_file), name="predictions.json")
+            if failed_samples and failed_file.exists():
+                artifact.add_file(str(failed_file), name="failed_samples.json")
+            artifact.add_file(str(config_file), name="evaluation_config.json")
+            
+            wandb.log_artifact(artifact)
+            
+            print(f"\n✅ Logged evaluation results to wandb run: {wandb_run.name}")
+            
+            # Finish the run
+            wandb.finish()
+            
+        except Exception as e:
+            print(f"\n⚠️  Warning: Could not log to wandb: {e}")
     
     print("\nEvaluation completed successfully!")
     
