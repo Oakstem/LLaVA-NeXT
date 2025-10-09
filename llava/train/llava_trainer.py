@@ -5,6 +5,7 @@ import torch.nn as nn
 import datetime
 import json
 import pathlib
+import time
 from collections import OrderedDict
 
 from accelerate import Accelerator
@@ -19,6 +20,18 @@ from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, h
 from transformers.trainer_utils import seed_worker
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
+
+# Import sagemaker functions if available
+try:
+    from transformers.trainer_pt_utils import smp_forward_backward
+except ImportError:
+    smp_forward_backward = None
+
+# Import apex if available
+try:
+    from apex import amp
+except ImportError:
+    amp = None
 from typing import List, Optional, Dict
 from datetime import timedelta
 
@@ -39,6 +52,21 @@ if is_datasets_available():
     import datasets
 
 from llava.utils import rank0_print
+
+
+def safe_wandb_log(args, metrics_dict, step=None):
+    """Safely log metrics to wandb if available and initialized."""
+    if not (args.report_to and "wandb" in args.report_to):
+        return
+    
+    try:
+        import wandb
+        if wandb.run is not None:
+            if step is not None:
+                metrics_dict["step"] = step
+            wandb.log(metrics_dict)
+    except Exception as e:
+        rank0_print(f"Warning: Could not log to wandb: {e}")
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -253,6 +281,18 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize timing counters
+        self.step_times = {
+            "data_loading": [],
+            "forward_pass": [],
+            "backward_pass": [],
+            "optimizer_step": [],
+            "total_step": []
+        }
+        self.last_log_step = 0
+
     def evaluate(
         self,
         eval_dataset=None,
@@ -462,7 +502,7 @@ class LLaVATrainer(Trainer):
 
     def get_train_dataloader(self) -> DataLoader:
         """
-        Returns the training [`~torch.utils.data.DataLoader`].
+        Returns the training [`~torch.utils.data.DataLoader`] with timing instrumentation.
 
         Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
         training if necessary) otherwise.
@@ -471,6 +511,9 @@ class LLaVATrainer(Trainer):
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
+
+        dataloader_creation_start = time.time()
+        rank0_print("Creating train dataloader...")
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
@@ -495,7 +538,230 @@ class LLaVATrainer(Trainer):
 
         dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
+        dataloader_creation_time = time.time() - dataloader_creation_start
+        rank0_print(f"Train dataloader created in {dataloader_creation_time:.2f} seconds")
+        
+        # Log to wandb if available and initialized
+        safe_wandb_log(self.args, {"timing/dataloader_creation_seconds": dataloader_creation_time})
+
         return dataloader
+    
+    def training_step(self, model, inputs):
+        """Override training step with detailed timing."""
+        step_start = time.time()
+        
+        model.train()
+        
+        # Time input preparation (data movement to GPU, etc.)
+        input_prep_start = time.time()
+        inputs = self._prepare_inputs(inputs)
+        input_prep_time = time.time() - input_prep_start
+
+        if is_sagemaker_mp_enabled() and smp_forward_backward:
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        # Forward pass timing
+        forward_start = time.time()
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        forward_time = time.time() - forward_start
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        # Backward pass timing  
+        backward_start = time.time()
+        if self.use_apex and amp:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+        backward_time = time.time() - backward_start
+        
+        total_step_time = time.time() - step_start
+        
+        # Store timing data
+        self.step_times["data_loading"].append(input_prep_time)  # Input prep is part of data loading overhead
+        self.step_times["forward_pass"].append(forward_time)
+        self.step_times["backward_pass"].append(backward_time)
+        self.step_times["total_step"].append(total_step_time)
+        
+        # Debug: Print timing details for first few steps
+        if self.state.global_step <= 3:
+            rank0_print(f"[DEBUG] Step {self.state.global_step}: input_prep={input_prep_time:.4f}s, "
+                       f"forward={forward_time:.4f}s, backward={backward_time:.4f}s, total={total_step_time:.4f}s")
+            rank0_print(f"[DEBUG] data_loading list has {len(self.step_times['data_loading'])} entries, "
+                       f"last value: {self.step_times['data_loading'][-1]:.4f}s")
+
+        # Log timing every 50 steps to avoid overhead
+        if self.state.global_step % 50 == 0 and self.state.global_step > self.last_log_step:
+            self._log_step_timings()
+            self.log_memory_usage()
+            self.last_log_step = self.state.global_step
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+    
+    def _log_step_timings(self):
+        """Log average timing for the last batch of steps."""
+        if not self.step_times["total_step"]:
+            return
+            
+        # Calculate averages for the last 10 steps
+        recent_steps = min(10, len(self.step_times["total_step"]))
+        
+        avg_forward = sum(self.step_times["forward_pass"][-recent_steps:]) / recent_steps
+        avg_backward = sum(self.step_times["backward_pass"][-recent_steps:]) / recent_steps  
+        avg_total = sum(self.step_times["total_step"][-recent_steps:]) / recent_steps
+        
+        # Calculate data loading average if we have data
+        avg_data_loading = 0
+        if self.step_times["data_loading"]:
+            recent_data_steps = min(recent_steps, len(self.step_times["data_loading"]))
+            if recent_data_steps > 0:
+                recent_data_values = self.step_times["data_loading"][-recent_data_steps:]
+                avg_data_loading = sum(recent_data_values) / recent_data_steps
+                
+                # Debug first few logging calls
+                if self.state.global_step <= 30:
+                    rank0_print(f"[DEBUG] Data loading timing - recent {recent_data_steps} steps: "
+                               f"{[f'{v:.4f}' for v in recent_data_values]}, avg={avg_data_loading:.4f}s")
+        
+        # Log to console
+        rank0_print(f"Step {self.state.global_step} timing - "
+                   f"Data: {avg_data_loading:.3f}s, Forward: {avg_forward:.3f}s, "
+                   f"Backward: {avg_backward:.3f}s, Total: {avg_total:.3f}s")
+        
+        # Log to wandb if available and initialized
+        metrics = {
+            "timing/avg_forward_pass_seconds": avg_forward,
+            "timing/avg_backward_pass_seconds": avg_backward,
+            "timing/avg_total_step_seconds": avg_total,
+            "timing/forward_backward_ratio": avg_forward / (avg_backward + 1e-8)
+        }
+        
+        # Only add data loading if we have meaningful data
+        if avg_data_loading > 0:
+            metrics["timing/avg_data_loading_seconds"] = avg_data_loading
+            
+        safe_wandb_log(self.args, metrics, step=self.state.global_step)
+        
+        # Keep only recent timing data to avoid memory buildup
+        max_history = 100
+        for key in self.step_times:
+            if len(self.step_times[key]) > max_history:
+                self.step_times[key] = self.step_times[key][-max_history:]
+    
+    def optimizer_step(self, optimizer):
+        """Override optimizer step with timing."""
+        optimizer_start = time.time()
+        
+        # Call the parent optimizer step
+        super().optimizer_step(optimizer)
+        
+        optimizer_time = time.time() - optimizer_start
+        self.step_times["optimizer_step"].append(optimizer_time)
+        
+        # Log optimizer timing every 10 steps
+        if self.state.global_step % 10 == 0:
+            recent_steps = min(10, len(self.step_times["optimizer_step"]))
+            avg_optimizer = sum(self.step_times["optimizer_step"][-recent_steps:]) / recent_steps
+            
+            safe_wandb_log(self.args, {
+                "timing/avg_optimizer_step_seconds": avg_optimizer
+            }, step=self.state.global_step)
+    
+    def log_memory_usage(self):
+        """Log GPU memory usage if available."""
+        if torch.cuda.is_available() and self.state.global_step % 50 == 0:
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            
+            rank0_print(f"Step {self.state.global_step} - GPU Memory: "
+                       f"Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            
+            safe_wandb_log(self.args, {
+                "memory/gpu_allocated_gb": allocated,
+                "memory/gpu_reserved_gb": reserved
+            }, step=self.state.global_step)
+    
+    def log_training_summary(self):
+        """Log a comprehensive training timing summary."""
+        if not any(self.step_times.values()):
+            return
+            
+        rank0_print("\n" + "="*60)
+        rank0_print("TRAINING TIMING SUMMARY")
+        rank0_print("="*60)
+        
+        total_steps = len(self.step_times["total_step"])
+        if total_steps > 0:
+            # Calculate averages
+            avg_forward = sum(self.step_times["forward_pass"]) / len(self.step_times["forward_pass"]) if self.step_times["forward_pass"] else 0
+            avg_backward = sum(self.step_times["backward_pass"]) / len(self.step_times["backward_pass"]) if self.step_times["backward_pass"] else 0
+            avg_optimizer = sum(self.step_times["optimizer_step"]) / len(self.step_times["optimizer_step"]) if self.step_times["optimizer_step"] else 0
+            avg_data_loading = sum(self.step_times["data_loading"]) / len(self.step_times["data_loading"]) if self.step_times["data_loading"] else 0
+            avg_total = sum(self.step_times["total_step"]) / len(self.step_times["total_step"])
+            
+            rank0_print(f"Total training steps: {total_steps}")
+            rank0_print(f"Average per step:")
+            rank0_print(f"  - Data loading: {avg_data_loading:.3f}s ({avg_data_loading/avg_total*100:.1f}%)")
+            rank0_print(f"  - Forward pass: {avg_forward:.3f}s ({avg_forward/avg_total*100:.1f}%)")
+            rank0_print(f"  - Backward pass: {avg_backward:.3f}s ({avg_backward/avg_total*100:.1f}%)")
+            rank0_print(f"  - Optimizer step: {avg_optimizer:.3f}s ({avg_optimizer/avg_total*100:.1f}%)")
+            rank0_print(f"  - Total step: {avg_total:.3f}s")
+            rank0_print(f"  - Steps per second: {1.0/avg_total:.2f}")
+            
+            # Calculate bottleneck
+            max_component = max([
+                ("Data loading", avg_data_loading),
+                ("Forward pass", avg_forward), 
+                ("Backward pass", avg_backward),
+                ("Optimizer step", avg_optimizer)
+            ], key=lambda x: x[1])
+            
+            rank0_print(f"\nBottleneck: {max_component[0]} ({max_component[1]:.3f}s)")
+            
+            # Log final summary to wandb
+            safe_wandb_log(self.args, {
+                "summary/avg_data_loading_seconds": avg_data_loading,
+                "summary/avg_forward_pass_seconds": avg_forward,
+                "summary/avg_backward_pass_seconds": avg_backward,
+                "summary/avg_optimizer_step_seconds": avg_optimizer,
+                "summary/avg_total_step_seconds": avg_total,
+                "summary/steps_per_second": 1.0/avg_total,
+                "summary/bottleneck_component": max_component[0],
+                "summary/bottleneck_time": max_component[1],
+                "summary/total_training_steps": total_steps
+            })
+        
+        rank0_print("="*60 + "\n")
+    
+    def train(self, *args, **kwargs):
+        """Override train method to add timing summary at the end."""
+        try:
+            result = super().train(*args, **kwargs)
+            self.log_training_summary()
+            return result
+        except Exception as e:
+            self.log_training_summary()
+            raise e
+    
+    def _save_checkpoint(self, model, trial, metrics=None):
+        """Override checkpoint saving with timing."""
+        checkpoint_start = time.time()
+        rank0_print("Starting checkpoint save...")
+        
+        # Call parent save checkpoint method
+        super()._save_checkpoint(model, trial, metrics)
+        
+        checkpoint_time = time.time() - checkpoint_start
+        rank0_print(f"Checkpoint saved in {checkpoint_time:.2f} seconds")
+        
+        # Log to wandb if available and initialized
+        safe_wandb_log(self.args, {
+            "timing/checkpoint_save_seconds": checkpoint_time
+        }, step=self.state.global_step)
 
     def create_optimizer(self):
         """

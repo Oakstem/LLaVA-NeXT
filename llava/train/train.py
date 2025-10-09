@@ -48,6 +48,22 @@ from llava.utils import rank0_print, process_video_with_pyav, process_video_with
 from llava.model.builder import load_pretrained_model
 from typing import Dict, Optional, Sequence, List, Any
 
+
+def safe_wandb_log(training_args, metrics_dict, step=None):
+    """Safely log metrics to wandb if available and initialized."""
+    if not (training_args.report_to and "wandb" in training_args.report_to):
+        return
+    
+    try:
+        import wandb
+        if wandb.run is not None:
+            if step is not None:
+                metrics_dict["step"] = step
+            wandb.log(metrics_dict)
+    except Exception as e:
+        rank0_print(f"Warning: Could not log to wandb: {e}")
+
+
 # Import custom evaluation functions
 try:
     from evaluate_model import (
@@ -147,7 +163,7 @@ class DataArguments:
     image_processor: Optional[Any] = field(default=None, metadata={"help": "Image processor for processing images"})
     
     # Evaluation parameters
-    eval_split_ratio: float = field(default=0.1, metadata={"help": "Ratio of data to use for evaluation (e.g., 0.2 for 20%)"})
+    eval_split_ratio: float = field(default=0.0, metadata={"help": "Ratio of data to use for evaluation (e.g., 0.2 for 20%)"})
     enable_evaluation: bool = field(default=True, metadata={"help": "Whether to enable evaluation during training"})
     eval_data_path: Optional[str] = field(default=None, metadata={"help": "Optional separate evaluation data path. If not provided, will split from training data."})
 
@@ -274,20 +290,48 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
-def find_all_linear_names(model):
+def find_all_linear_names(model, mm_tunable_parts=None):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
-    # multimodal_keywords = ["mm_projector"]
+    
+    # Parse mm_tunable_parts to determine which modules to include
+    tunable_parts_list = mm_tunable_parts.split(",") if mm_tunable_parts else []
+    include_mm_projector = "mm_projector" in tunable_parts_list or "mm_mlp_adapter" in tunable_parts_list
+    include_vision_tower = "mm_vision_tower" in tunable_parts_list
+    include_vision_resampler = "mm_vision_resampler" in tunable_parts_list
+    include_lm_head = "lm_head" in tunable_parts_list
+    include_language_model = "mm_language_model" in tunable_parts_list
+    
+    # Build exclusion list based on what's NOT in tunable_parts
+    multimodal_keywords = []
+    if not include_mm_projector:
+        multimodal_keywords.append("mm_projector")
+    if not include_vision_tower:
+        multimodal_keywords.append("vision_tower")
+    if not include_vision_resampler:
+        multimodal_keywords.append("vision_resampler")
+    
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
         if isinstance(module, cls):
             names = name.split(".")
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+            # For mm_projector layers, use the full path to avoid ambiguous names like "0" or "2"
+            if "mm_projector" in name and include_mm_projector:
+                # Use full path for mm_projector modules
+                lora_module_names.add(name)
+            else:
+                # For other modules, use just the last component as before
+                lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
-    if "lm_head" in lora_module_names:  # needed for 16-bit
+    # Only remove lm_head if it's NOT explicitly requested in tunable_parts
+    if "lm_head" in lora_module_names and not include_lm_head:
         lora_module_names.remove("lm_head")
+    
+    print(f"mm_tunable_parts: {mm_tunable_parts}")
+    print(f"Include mm_projector: {include_mm_projector}")
+    print(f"Include lm_head: {include_lm_head}")
+    print(f"Found these linear module names for LoRA: {lora_module_names}")
     return list(lora_module_names)
 
 
@@ -1064,6 +1108,8 @@ class LazySupervisedDataset(Dataset):
             with open(data_path, "r") as file:
                 cur_data_dict = json.load(file)
                 rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
+                random.shuffle(cur_data_dict)
+                rank0_print(f"Shuffled {len(cur_data_dict)} samples")
                 self.list_data_dict.extend(cur_data_dict)
 
         rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
@@ -1393,6 +1439,45 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
         return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
+def print_model_structure(model, show_params=True, show_gradients=True):
+    """Print comprehensive model structure with parameter counts and gradient status."""
+    rank0_print("=" * 80)
+    rank0_print("MODEL STRUCTURE")
+    rank0_print("=" * 80)
+    
+    total_params = 0
+    trainable_params = 0
+    
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight') and module.weight is not None:
+            param_count = module.weight.numel()
+            total_params += param_count
+            is_trainable = module.weight.requires_grad
+            if is_trainable:
+                trainable_params += param_count
+            
+            if show_params:
+                rank0_print(f"{name:60} | {str(type(module).__name__):20} | {param_count:>10,} params | {'✓' if is_trainable else '✗'} trainable")
+    
+    if show_gradients:
+        rank0_print("\n" + "=" * 60)
+        rank0_print("PARAMETER GRADIENT STATUS")
+        rank0_print("=" * 60)
+        
+        for name, param in model.named_parameters():
+            status = "✓ TRAINABLE" if param.requires_grad else "✗ FROZEN"
+            rank0_print(f"{name:60} | {status}")
+    
+    rank0_print("\n" + "=" * 60)
+    rank0_print("SUMMARY")
+    rank0_print("=" * 60)
+    rank0_print(f"Total parameters: {total_params:,}")
+    rank0_print(f"Trainable parameters: {trainable_params:,}")
+    rank0_print(f"Frozen parameters: {total_params - trainable_params:,}")
+    rank0_print(f"Trainable ratio: {trainable_params/total_params*100:.2f}%")
+    rank0_print("=" * 80)
+
+
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     assert training_args.attn_implementation
     if training_args.attn_implementation == "sdpa" and torch.__version__ < "2.1.2":
@@ -1548,10 +1633,17 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
 def train(attn_implementation=None):
     global local_rank
+    
+    # Initialize overall timing
+    overall_start = time.time()
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     parsed_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     model_args, data_args, training_args = parsed_args[:3]
+    
+    rank0_print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    rank0_print("Starting training setup...")
+    setup_start = time.time()
     
 
     if training_args.verbose_logging:
@@ -1595,9 +1687,20 @@ def train(attn_implementation=None):
         "torch_dtype": "bfloat16" if training_args.bf16 else "float16" if training_args.fp16 else "float32",
         # "attn_implementation": "sdpa",
     }
+    
+    # Time model loading
+    model_load_start = time.time()
+    rank0_print("Starting model loading...")
+    
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
         tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, **llava_model_args)
+    
+    model_load_time = time.time() - model_load_start
+    rank0_print(f"Model loading completed in {model_load_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {"timing/model_load_seconds": model_load_time})
     
     # Store the image processor from the pretrained model
     if image_processor is not None:
@@ -1644,7 +1747,7 @@ def train(attn_implementation=None):
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=find_all_linear_names(model, mm_tunable_parts=model_args.mm_tunable_parts),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
@@ -1703,6 +1806,8 @@ def train(attn_implementation=None):
     rank0_print(f"Using vision tower: {model_args.vision_tower}")
     
     # Only initialize vision modules if they're not already present or if we need to update them
+    vision_init_start = time.time()
+    
     if hasattr(model, 'get_vision_tower') and model.get_vision_tower() is not None:
         rank0_print("Vision modules already initialized from pretrained model")
         vision_tower = model.get_vision_tower()
@@ -1710,6 +1815,12 @@ def train(attn_implementation=None):
         rank0_print("Initializing vision modules")
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
         vision_tower = model.get_vision_tower()
+    
+    vision_init_time = time.time() - vision_init_start
+    rank0_print(f"Vision initialization completed in {vision_init_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {"timing/vision_init_seconds": vision_init_time})
     
     # Ensure vision tower is moved to the correct device and dtype
     # vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
@@ -1802,7 +1913,7 @@ def train(attn_implementation=None):
             if training_args.lora_enable:
                 # Only enable LoRA adapters for mm_projector
                 for name, param in model.named_parameters():
-                    if "mm_projector" in name and "lora_" in name:
+                    if "mlp" in name and "lora_" in name:
                         param.requires_grad_(True)
             else:
                 # Enable all mm_projector parameters
@@ -1829,6 +1940,30 @@ def train(attn_implementation=None):
                 for name, param in model.named_parameters():
                     if "vision_tower" in name:
                         param.requires_grad_(True)
+        if "mm_projector" in tunable_parts:
+            print("Enabling mm_projector parameters")
+            if training_args.lora_enable:
+                # Only enable LoRA adapters for mm_projector
+                for name, param in model.named_parameters():
+                    if "mm_projector" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
+                # Enable all mm_projector parameters
+                for name, param in model.named_parameters():
+                    if "mm_projector" in name:
+                        param.requires_grad_(True)
+        if "lm_head" in tunable_parts:
+            print("Enabling lm_head parameters")
+            if training_args.lora_enable:
+                # Only enable LoRA adapters for lm_head
+                for name, param in model.named_parameters():
+                    if "lm_head" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
+                # Enable all lm_head parameters
+                for name, param in model.named_parameters():
+                    if "lm_head" in name:
+                        param.requires_grad_(True)
         if "mm_language_model" in tunable_parts:
             if training_args.lora_enable:
                 # When LoRA is enabled, the language model training is handled by LoRA adapters
@@ -1837,7 +1972,7 @@ def train(attn_implementation=None):
                 # Re-enable gradients for LoRA adapter parameters
                 language_model_params = []
                 for name, param in model.named_parameters():
-                    if "lora_" in name or param.requires_grad:
+                    if "lora_" in name and "model.model.layers" in name:
                         param.requires_grad_(True)
                         language_model_params.append(name)
             else:
@@ -1856,6 +1991,13 @@ def train(attn_implementation=None):
     trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
     rank0_print(f"Total parameters: {total_params:,}")
     rank0_print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Add comprehensive model structure print
+    print_model_structure(model, show_params=True, show_gradients=True)
+    
+    # Clear any cached memory after model setup
+    torch.cuda.empty_cache()
+    
     if training_args.bits in [4, 8]:
         model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -1880,7 +2022,17 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    # Time data module creation
+    data_module_start = time.time()
+    rank0_print("Creating data module...")
+    
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    
+    data_module_time = time.time() - data_module_start
+    rank0_print(f"Data module creation completed in {data_module_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {"timing/data_module_creation_seconds": data_module_time})
     
     # Determine conversation template for evaluation
     conv_template = "qwen_1_5"
@@ -1903,12 +2055,61 @@ def train(attn_implementation=None):
         training_args.eval_steps = None
         rank0_print("Evaluation disabled")
     
+    # Time trainer creation
+    trainer_creation_start = time.time()
+    rank0_print("Creating trainer...")
+    
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    
+    trainer_creation_time = time.time() - trainer_creation_start
+    setup_time = time.time() - setup_start
+    
+    rank0_print(f"Trainer creation completed in {trainer_creation_time:.2f} seconds")
+    rank0_print(f"Total setup time: {setup_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {
+        "timing/trainer_creation_seconds": trainer_creation_time,
+        "timing/total_setup_seconds": setup_time
+    })
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    # Time actual training
+    training_start = time.time()
+    rank0_print("Starting training...")
+    
+    # Check for existing checkpoints and resume from the latest one
+    checkpoint_dirs = sorted(pathlib.Path(training_args.output_dir).glob("checkpoint-*"), 
+                            key=lambda x: int(x.name.split("-")[-1]))
+    print(f"Checkpoint dirs: {checkpoint_dirs}")
+    if checkpoint_dirs:
+        latest_checkpoint = str(checkpoint_dirs[-1])
+        rank0_print(f"Found {len(checkpoint_dirs)} checkpoint(s) in {training_args.output_dir}")
+        rank0_print(f"Resuming training from: {latest_checkpoint}")
+        
+        # Verify checkpoint contains trainer_state.json
+        trainer_state_file = pathlib.Path(latest_checkpoint) / "trainer_state.json"
+        if trainer_state_file.exists():
+            rank0_print(f"✓ Trainer state found: {trainer_state_file}")
+        else:
+            rank0_print(f"⚠ Warning: No trainer_state.json found in {latest_checkpoint}")
+        
+        trainer.train(resume_from_checkpoint=latest_checkpoint)
     else:
+        rank0_print("No checkpoints found, starting fresh training")
         trainer.train()
+    
+    training_time = time.time() - training_start
+    total_time = time.time() - overall_start
+    
+    rank0_print(f"Training completed in {training_time:.2f} seconds")
+    rank0_print(f"Total execution time: {total_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {
+        "timing/total_training_seconds": training_time,
+        "timing/total_execution_seconds": total_time
+    })
+        
     trainer.save_state()
 
     model.config.use_cache = True
@@ -1927,6 +2128,7 @@ def train(attn_implementation=None):
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
     rank0_print(f"Model saved to {training_args.output_dir}")
+    rank0_print(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 if __name__ == "__main__":
