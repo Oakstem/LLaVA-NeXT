@@ -235,14 +235,60 @@ class TrainingArguments(transformers.TrainingArguments):
 #     output_path: Optional[str] = field(default="./logs/")
 
 
+def _infer_zero_stage(param) -> Optional[int]:
+    """Best-effort extraction of the ZeRO stage from a parameter."""
+    stage_like = getattr(param, "ds_zero_stage", None)
+    if stage_like is not None:
+        try:
+            return int(stage_like)
+        except (TypeError, ValueError):
+            pass
+
+    for attr_name in ("ds_zero_config",):
+        zero_cfg = getattr(param, attr_name, None)
+        if zero_cfg is not None:
+            if isinstance(zero_cfg, dict):
+                stage_like = zero_cfg.get("stage")
+            else:
+                stage_like = getattr(zero_cfg, "stage", None)
+            if stage_like is not None:
+                try:
+                    return int(stage_like)
+                except (TypeError, ValueError):
+                    pass
+
+    ds_config = getattr(param, "ds_config", None)
+    if ds_config is not None:
+        for attr_name in ("zero_config", "zero_optimization"):
+            zero_cfg = getattr(ds_config, attr_name, None)
+            if zero_cfg is None:
+                continue
+            if isinstance(zero_cfg, dict):
+                stage_like = zero_cfg.get("stage")
+            else:
+                stage_like = getattr(zero_cfg, "stage", None)
+            if stage_like is not None:
+                try:
+                    return int(stage_like)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
-    if hasattr(param, "ds_id"):
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if not ignore_status:
-                logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
+    zero_stage = _infer_zero_stage(param)
+    should_gather = hasattr(param, "ds_id") and (zero_stage is None or zero_stage == 3)
+    if zero_stage in (1, 2):
+        should_gather = False
+
+    warn_unavailable = hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+
+    if should_gather:
+        if warn_unavailable and not ignore_status:
+            logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
         with zero.GatheredParameters([param]):
             param = param.data.detach().cpu().clone()
     else:

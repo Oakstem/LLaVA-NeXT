@@ -800,9 +800,17 @@ def main():
         try:
             import wandb
             # Extract run_id from adapter path
-            run_id = Path(args.adapter_path).resolve().parent.name
+            if not args.adapter_path:
+                run_id = 'Baseline'
+                print("Warning: No adapter path provided, cannot extract run_id. Will create a new wandb run: Baseline.")
+            else:
+                run_id = Path(args.adapter_path).resolve().parent.name
+                # Add the checkpoint name if applicable
+                if Path(args.adapter_path).name.startswith("checkpoint-"):
+                    run_id = f"{run_id}_{Path(args.adapter_path).name}"
             if not run_id:
-                print("Warning: Could not extract run_id from model path. Will create a new wandb run.")
+                print("Warning: Could not extract run_id from adapter path. Will create a new wandb run: Baseline.")
+                run_id = 'Baseline'
             else:
                 print(f"Extracted run_id: {run_id}")
             

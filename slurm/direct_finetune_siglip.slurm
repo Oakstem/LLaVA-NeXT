@@ -36,8 +36,8 @@ export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
 export NCCL_SOCKET_IFNAME=eth0
-export NCCL_DEBUG=INFO
-export NCCL_P2P_LEVEL=NVL  
+# export NCCL_DEBUG=INFO
+export NCCL_P2P_LEVEL=NVL
 export PYTHONPATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT:$PYTHONPATH"
 
 # Fix NUMA affinity issues in SLURM environment
@@ -45,12 +45,13 @@ export ACCELERATE_DISABLE_NUMA=1
 export TOKENIZERS_PARALLELISM=false
 
 # Memory optimization settings
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256,garbage_collection_threshold:0.6
+# export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256,garbage_collection_threshold:0.6
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export CUDA_LAUNCH_BLOCKING=0
 
 # Additional memory optimizations
-export TORCH_CUDNN_V8_API_ENABLED=1
-export CUDA_MEMORY_FRACTION=0.95
+# export TORCH_CUDNN_V8_API_ENABLED=1
+# export CUDA_MEMORY_FRACTION=0.95
 
 PROJECT_NAME="llava-gazefollow-finetune"
 
@@ -65,7 +66,7 @@ PROMPT_VERSION="qwen_1_5"
 # Set to a previous run's output directory name to resume training, e.g., "llava-20241007_123456"
 # The trainer will automatically resume from the latest checkpoint in that directory
 # Leave empty to start a fresh training run with a new output directory
-RESUME_FROM_CHECKPOINT="llava-20251009_014018"
+RESUME_FROM_CHECKPOINT=""
 
 # Set run name based on whether we're resuming or starting fresh
 if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
@@ -84,7 +85,8 @@ CKPT_PATH="lmms-lab/llava-onevision-qwen2-7b-ov-chat"
 DATA_PATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/train.json"
 IMAGE_FOLDER="/galitylab/students/alonmardi/gazefollow"
 OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs"
-DEEPSPEED_CONFIG="scripts/zero3.json"
+# DEEPSPEED_CONFIG="scripts/zero3.json"
+DEEPSPEED_CONFIG="scripts/zero1.json"
 
 # Model architecture parameters
 MM_TUNABLE_PARTS="mm_projector"
@@ -100,8 +102,8 @@ MM_PATCH_MERGE_TYPE="spatial_unpad"
 
 # LoRA parameters
 LORA_ENABLE="True"
-LORA_R="4"
-LORA_ALPHA="16"
+LORA_R="2"
+LORA_ALPHA="8"
 
 # Training hyperparameters
 NUM_TRAIN_EPOCHS="2"
@@ -115,7 +117,7 @@ WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
 
 # Evaluation and saving
-EVALUATION_STRATEGY="steps"
+EVALUATION_STRATEGY="no"
 EVAL_STEPS="1000000"    # never evaluate during training
 SAVE_STRATEGY="steps"
 SAVE_STEPS="2000"
@@ -128,7 +130,7 @@ TF32="True"
 MODEL_MAX_LENGTH="32768"
 
 # Set distributed training variables for single node
-export NUM_GPUS=2
+export NUM_GPUS=1
 export NNODES=1
 export RANK=0
 export ADDR="localhost"
@@ -213,7 +215,6 @@ fi
 
 ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NNODES}" --node_rank="${RANK}" --master_addr="${ADDR}" --master_port="${PORT}" \
     llava/train/train_mem.py \
-    --deepspeed ${DEEPSPEED_CONFIG} \
     --model_name_or_path ${CKPT_PATH} \
     --version ${PROMPT_VERSION} \
     --data_path ${DATA_PATH} \
@@ -252,13 +253,19 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --tf32 ${TF32} \
     --model_max_length ${MODEL_MAX_LENGTH} \
     --gradient_checkpointing ${GRADIENT_CHECKPOINTING} \
-    --attn_implementation flash_attention_2 \
+    --optim "adamw_torch_fused" \
+    --dataloader_num_workers 12 \
+    --dataloader_prefetch_factor 4 \
+    --dataloader_pin_memory True \
+    --persistent_workers=True \
+    # --attn_implementation flash_attention_2 \
+    # --deepspeed ${DEEPSPEED_CONFIG} \
     # --dataloader_num_workers 10 \
     # --lazy_preprocess True \
     # --report_to wandb \
     # --dataloader_drop_last True \
+
     
-    # --optim "adamw_torch_fused" \
     # --max_grad_norm 1.0 \
     # --save_safetensors True
 
