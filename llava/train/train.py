@@ -342,41 +342,21 @@ def find_all_linear_names(model, mm_tunable_parts=None):
     
     # Parse mm_tunable_parts to determine which modules to include
     tunable_parts_list = mm_tunable_parts.split(",") if mm_tunable_parts else []
-    include_mm_projector = "mm_projector" in tunable_parts_list or "mm_mlp_adapter" in tunable_parts_list
-    include_vision_tower = "mm_vision_tower" in tunable_parts_list
-    include_vision_resampler = "mm_vision_resampler" in tunable_parts_list
-    include_lm_head = "lm_head" in tunable_parts_list
-    include_language_model = "mm_language_model" in tunable_parts_list
-    
-    # Build exclusion list based on what's NOT in tunable_parts
-    multimodal_keywords = []
-    if not include_mm_projector:
-        multimodal_keywords.append("mm_projector")
-    if not include_vision_tower:
-        multimodal_keywords.append("vision_tower")
-    if not include_vision_resampler:
-        multimodal_keywords.append("vision_resampler")
-    
+
     for name, module in model.named_modules():
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
+        if not any(tunable_key in name for tunable_key in tunable_parts_list) and tunable_parts_list:
             continue
         if isinstance(module, cls):
             names = name.split(".")
             # For mm_projector layers, use the full path to avoid ambiguous names like "0" or "2"
-            if "mm_projector" in name and include_mm_projector:
+            if "mm_projector" in name:
                 # Use full path for mm_projector modules
                 lora_module_names.add(name)
             else:
                 # For other modules, use just the last component as before
                 lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
-    # Only remove lm_head if it's NOT explicitly requested in tunable_parts
-    if "lm_head" in lora_module_names and not include_lm_head:
-        lora_module_names.remove("lm_head")
-    
     print(f"mm_tunable_parts: {mm_tunable_parts}")
-    print(f"Include mm_projector: {include_mm_projector}")
-    print(f"Include lm_head: {include_lm_head}")
     print(f"Found these linear module names for LoRA: {lora_module_names}")
     return list(lora_module_names)
 
@@ -1679,7 +1659,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
 def train(attn_implementation=None):
     global local_rank
-    
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
     # Initialize overall timing
     overall_start = time.time()
 
@@ -1784,8 +1766,8 @@ def train(attn_implementation=None):
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
         
         # Configure gradient checkpointing with use_reentrant=False
-        if hasattr(model, 'gradient_checkpointing_enable'):
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=training_args.gradient_checkpointing_kwargs)
+        # if hasattr(model, 'gradient_checkpointing_enable'):
+        #     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=training_args.gradient_checkpointing_kwargs)
 
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
@@ -1870,7 +1852,7 @@ def train(attn_implementation=None):
     
     # Ensure vision tower is moved to the correct device and dtype
     # vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
-    vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16)
+    vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
     # Set image processor and multimodal flag regardless of initialization path
     if vision_tower.image_processor is not None:

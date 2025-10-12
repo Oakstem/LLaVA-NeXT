@@ -46,7 +46,7 @@ export TOKENIZERS_PARALLELISM=false
 
 # Memory optimization settings
 # export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256,garbage_collection_threshold:0.6
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+# export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export CUDA_LAUNCH_BLOCKING=0
 
 # Additional memory optimizations
@@ -96,22 +96,23 @@ MM_VISION_SELECT_LAYER="-2"
 MM_USE_IM_START_END="False"
 MM_USE_IM_PATCH_TOKEN="True"
 GROUP_BY_MODALITY_LENGTH="True"
-IMAGE_ASPECT_RATIO="anyres_max_9"
-IMAGE_GRID_PINPOINTS="(1x1),...,(6x6)"
+IMAGE_ASPECT_RATIO="anyres_max_4" #"anyres_max_9"
+IMAGE_GRID_PINPOINTS="(1x1),...,(2x2)"
+#IMAGE_GRID_PINPOINTS="(1x1),...,(6x6)"
 MM_PATCH_MERGE_TYPE="spatial_unpad"
 
 # LoRA parameters
 LORA_ENABLE="True"
-LORA_R="2"
-LORA_ALPHA="8"
+LORA_R="8"
+LORA_ALPHA="16"
 
 # Training hyperparameters
 NUM_TRAIN_EPOCHS="2"
 PER_DEVICE_TRAIN_BATCH_SIZE="1"  # Reduced from 2 to 1
 PER_DEVICE_EVAL_BATCH_SIZE="2"  # Reduced from 4 to 2
-GRADIENT_ACCUMULATION_STEPS="2"  # Increased to maintain effective batch size
-GRADIENT_CHECKPOINTING="True"
-LEARNING_RATE="5e-6"
+GRADIENT_ACCUMULATION_STEPS="6"  # Increased to maintain effective batch size
+GRADIENT_CHECKPOINTING="False"
+LEARNING_RATE="3e-6"
 WEIGHT_DECAY="0.01"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
@@ -127,7 +128,7 @@ LOGGING_STEPS="100"
 # Precision and performance
 BF16="True"
 TF32="True"
-MODEL_MAX_LENGTH="32768"
+MODEL_MAX_LENGTH="6144"   #"32768"
 
 # Set distributed training variables for single node
 export NUM_GPUS=1
@@ -254,12 +255,12 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --model_max_length ${MODEL_MAX_LENGTH} \
     --gradient_checkpointing ${GRADIENT_CHECKPOINTING} \
     --optim "adamw_torch_fused" \
-    --dataloader_num_workers 12 \
-    --dataloader_prefetch_factor 4 \
+    --dataloader_num_workers 8 \
+    --dataloader_prefetch_factor 2 \
     --dataloader_pin_memory True \
     --persistent_workers=True \
-    # --attn_implementation flash_attention_2 \
     # --deepspeed ${DEEPSPEED_CONFIG} \
+    # --attn_implementation flash_attention_2 \
     # --dataloader_num_workers 10 \
     # --lazy_preprocess True \
     # --report_to wandb \

@@ -500,8 +500,27 @@ class LlavaMetaForCausalLM(ABC):
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Finishing Inserting")
 
+        original_seq_lengths = [x.shape[0] for x in new_input_embeds]
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
+        truncated_seq_lengths = [x.shape[0] for x in new_input_embeds]
+
+        target_token_lengths = []
+        for labels_tensor in new_labels:
+            if labels_tensor.numel() == 0:
+                target_token_lengths.append(0)
+            else:
+                target_token_lengths.append(int((labels_tensor != IGNORE_INDEX).sum().item()))
+
+        truncation_flags = [new_len < old_len for new_len, old_len in zip(truncated_seq_lengths, original_seq_lengths)]
+
+        stats_device = new_input_embeds[0].device if truncated_seq_lengths else self.device
+        self._sequence_length_stats = {
+            "total_tokens": torch.tensor(truncated_seq_lengths, device=stats_device, dtype=torch.long),
+            "target_tokens": torch.tensor(target_token_lengths, device=stats_device, dtype=torch.long),
+            "hit_max_length": torch.tensor(truncation_flags, device=stats_device, dtype=torch.bool),
+            "max_length": tokenizer_model_max_length if tokenizer_model_max_length is not None else 0,
+        }
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
         #     new_input_embeds = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
@@ -557,6 +576,11 @@ class LlavaMetaForCausalLM(ABC):
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+
+    def pop_sequence_length_stats(self):
+        stats = getattr(self, "_sequence_length_stats", None)
+        self._sequence_length_stats = None
+        return stats
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

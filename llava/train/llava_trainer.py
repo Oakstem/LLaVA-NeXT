@@ -1,4 +1,5 @@
 import os
+import wandb
 import inspect
 import torch
 import torch.nn as nn
@@ -60,7 +61,6 @@ def safe_wandb_log(args, metrics_dict, step=None):
         return
     
     try:
-        import wandb
         if wandb.run is not None:
             if step is not None:
                 metrics_dict["step"] = step
@@ -292,6 +292,14 @@ class LLaVATrainer(Trainer):
             "total_step": []
         }
         self.last_log_step = 0
+        self.sequence_stats = {
+            "total_tokens": [],
+            "target_tokens": [],
+            "truncations": []
+        }
+        self.sequence_stats_max_length = 0
+        self.sequence_stats_cap = 4096
+        self.sequence_stats_window = 512
 
     def evaluate(
         self,
@@ -567,6 +575,8 @@ class LLaVATrainer(Trainer):
             loss = self.compute_loss(model, inputs)
         forward_time = time.time() - forward_start
 
+        self._collect_sequence_length_metrics(model)
+
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
@@ -598,9 +608,103 @@ class LLaVATrainer(Trainer):
         if self.state.global_step % 50 == 0 and self.state.global_step > self.last_log_step:
             self._log_step_timings()
             self.log_memory_usage()
+            self._log_sequence_length_stats()
             self.last_log_step = self.state.global_step
 
         return loss.detach() / self.args.gradient_accumulation_steps
+
+    def _collect_sequence_length_metrics(self, model):
+        try:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+        except Exception:
+            unwrapped_model = model
+
+        if not hasattr(unwrapped_model, "pop_sequence_length_stats"):
+            return
+
+        stats = unwrapped_model.pop_sequence_length_stats()
+        if not stats:
+            return
+
+        total_tokens = stats.get("total_tokens")
+        if total_tokens is None:
+            return
+        total_tokens = total_tokens.detach()
+
+        target_tokens = stats.get("target_tokens")
+        if target_tokens is not None:
+            target_tokens = target_tokens.detach()
+
+        trunc_flags = stats.get("hit_max_length")
+        if trunc_flags is not None:
+            trunc_flags = trunc_flags.detach()
+
+        max_length = stats.get("max_length", 0) or 0
+
+        gathered_total = self.accelerator.gather(total_tokens)
+        gathered_target = self.accelerator.gather(target_tokens) if target_tokens is not None else None
+        gathered_trunc = self.accelerator.gather(trunc_flags.long()) if trunc_flags is not None else None
+
+        if self.is_world_process_zero():
+            self.sequence_stats["total_tokens"].extend(gathered_total.long().cpu().tolist())
+            if gathered_target is not None:
+                self.sequence_stats["target_tokens"].extend(gathered_target.long().cpu().tolist())
+            else:
+                self.sequence_stats["target_tokens"].extend([0] * gathered_total.numel())
+            if gathered_trunc is not None:
+                self.sequence_stats["truncations"].extend(gathered_trunc.long().cpu().tolist())
+            else:
+                self.sequence_stats["truncations"].extend([0] * gathered_total.numel())
+            self.sequence_stats_max_length = max(self.sequence_stats_max_length, max_length)
+            self._trim_sequence_stats()
+
+    def _trim_sequence_stats(self):
+        for key in ("total_tokens", "target_tokens", "truncations"):
+            if len(self.sequence_stats[key]) > self.sequence_stats_cap:
+                self.sequence_stats[key] = self.sequence_stats[key][-self.sequence_stats_cap:]
+
+    def _log_sequence_length_stats(self):
+        if not self.is_world_process_zero():
+            return
+        if not self.sequence_stats["total_tokens"]:
+            return
+
+        window = min(len(self.sequence_stats["total_tokens"]), self.sequence_stats_window)
+        total_tensor = torch.tensor(self.sequence_stats["total_tokens"][-window:], dtype=torch.float32)
+        target_tensor = torch.tensor(self.sequence_stats["target_tokens"][-window:], dtype=torch.float32)
+        context_tensor = total_tensor - target_tensor
+        trunc_tensor = torch.tensor(self.sequence_stats["truncations"][-window:], dtype=torch.float32)
+
+        full_mean = total_tensor.mean().item()
+        full_max = total_tensor.max().item()
+        full_p95 = torch.quantile(total_tensor, 0.95).item() if total_tensor.numel() > 1 else full_max
+        target_mean = target_tensor.mean().item() if target_tensor.numel() > 0 else 0.0
+        target_max = target_tensor.max().item() if target_tensor.numel() > 0 else 0.0
+        context_mean = context_tensor.mean().item() if context_tensor.numel() > 0 else 0.0
+        context_max = context_tensor.max().item() if context_tensor.numel() > 0 else 0.0
+        trunc_rate = trunc_tensor.mean().item() if trunc_tensor.numel() > 0 else 0.0
+
+        rank0_print(
+            f"Sequence lengths (last {window} samples) - mean: {full_mean:.1f}, p95: {full_p95:.1f}, max: {int(full_max)}, "
+            f"target mean: {target_mean:.1f}, context mean: {context_mean:.1f}, truncation: {trunc_rate * 100:.1f}%"
+        )
+
+        metrics = {
+            "sequence/full_tokens_mean": full_mean,
+            "sequence/full_tokens_max": full_max,
+            "sequence/full_tokens_p95": full_p95,
+            "sequence/context_tokens_mean": context_mean,
+            "sequence/context_tokens_max": context_max,
+            "sequence/target_tokens_mean": target_mean,
+            "sequence/target_tokens_max": target_max,
+            "sequence/truncation_rate": trunc_rate,
+        }
+        if self.sequence_stats_max_length:
+            metrics["sequence/max_config_length"] = self.sequence_stats_max_length
+
+        safe_wandb_log(self.args, metrics, step=self.state.global_step)
+
+
     
     def _log_step_timings(self):
         """Log average timing for the last batch of steps."""
@@ -734,6 +838,40 @@ class LLaVATrainer(Trainer):
                 "summary/bottleneck_time": max_component[1],
                 "summary/total_training_steps": total_steps
             })
+        if self.sequence_stats["total_tokens"] and self.is_world_process_zero():
+            total_tensor = torch.tensor(self.sequence_stats["total_tokens"], dtype=torch.float32)
+            target_tensor = torch.tensor(self.sequence_stats["target_tokens"], dtype=torch.float32)
+            context_tensor = total_tensor - target_tensor
+            trunc_tensor = torch.tensor(self.sequence_stats["truncations"], dtype=torch.float32) if self.sequence_stats["truncations"] else torch.tensor([], dtype=torch.float32)
+
+            full_mean = total_tensor.mean().item()
+            full_max = total_tensor.max().item()
+            full_p95 = torch.quantile(total_tensor, 0.95).item() if total_tensor.numel() > 1 else full_max
+            target_mean = target_tensor.mean().item() if target_tensor.numel() > 0 else 0.0
+            target_max = target_tensor.max().item() if target_tensor.numel() > 0 else 0.0
+            context_mean = context_tensor.mean().item() if context_tensor.numel() > 0 else 0.0
+            context_max = context_tensor.max().item() if context_tensor.numel() > 0 else 0.0
+            trunc_rate = trunc_tensor.mean().item() if trunc_tensor.numel() > 0 else 0.0
+
+            rank0_print("\nSequence length summary:")
+            rank0_print(f"  - Mean full length: {full_mean:.1f}")
+            rank0_print(f"  - 95th percentile full length: {full_p95:.1f}")
+            rank0_print(f"  - Max full length: {int(full_max)}")
+            rank0_print(f"  - Mean context length: {context_mean:.1f}")
+            rank0_print(f"  - Mean target length: {target_mean:.1f}")
+            rank0_print(f"  - Truncation rate: {trunc_rate * 100:.2f}% (max config {self.sequence_stats_max_length})")
+
+            safe_wandb_log(self.args, {
+                "summary/sequence_full_mean": full_mean,
+                "summary/sequence_full_p95": full_p95,
+                "summary/sequence_full_max": full_max,
+                "summary/sequence_context_mean": context_mean,
+                "summary/sequence_context_max": context_max,
+                "summary/sequence_target_mean": target_mean,
+                "summary/sequence_target_max": target_max,
+                "summary/sequence_truncation_rate": trunc_rate,
+            }, step=self.state.global_step)
+
         
         rank0_print("="*60 + "\n")
     
