@@ -336,30 +336,231 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
+
+PREDEFINED_TUNABLE_PARTS = {
+    "mm_mlp_adapter",
+    "mm_vision_resampler",
+    "mm_vision_tower",
+    "mm_projector",
+    "mm_language_model",
+    "lm_head",
+}
+
+
+def _split_tunable_specs(parts: Optional[str]) -> List[str]:
+    if not parts:
+        return []
+    tokens: List[str] = []
+    current: List[str] = []
+    depth_brace = depth_bracket = depth_paren = 0
+    for char in parts:
+        if char == ',' and depth_brace == depth_bracket == depth_paren == 0:
+            token = ''.join(current).strip()
+            if token:
+                tokens.append(token)
+            current = []
+            continue
+        if char == '{':
+            depth_brace += 1
+        elif char == '}':
+            depth_brace = max(depth_brace - 1, 0)
+        elif char == '[':
+            depth_bracket += 1
+        elif char == ']':
+            depth_bracket = max(depth_bracket - 1, 0)
+        elif char == '(':
+            depth_paren += 1
+        elif char == ')':
+            depth_paren = max(depth_paren - 1, 0)
+        current.append(char)
+    token = ''.join(current).strip()
+    if token:
+        tokens.append(token)
+    return tokens
+
+
+def _expand_index_selector(selector: str, length: int) -> List[int]:
+    selector = selector.strip()
+    if ':' not in selector:
+        index = int(selector)
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            raise IndexError(f"Index {selector} out of bounds for length {length}")
+        return [index]
+
+    parts = selector.split(':')
+    if len(parts) > 3:
+        raise ValueError(f"Unsupported slice selector '{selector}'")
+    while len(parts) < 3:
+        parts.append('')
+    start_str, stop_str, step_str = parts
+    start = int(start_str) if start_str else None
+    stop = int(stop_str) if stop_str else None
+    step = int(step_str) if step_str else None
+
+    full_range = list(range(length))
+    indices = full_range[slice(start, stop, step)]
+    if not isinstance(indices, list):
+        indices = list(indices)
+    if not indices:
+        raise ValueError(f"Slice '{selector}' resolved to empty selection for length {length}")
+    return [int(i) for i in indices]
+
+
+def _expand_module_spec(model: torch.nn.Module, spec: str, module_map: Dict[str, torch.nn.Module]) -> List[str]:
+    pending = [spec.strip()]
+    expanded: List[str] = []
+
+    while pending:
+        current = pending.pop()
+        if not current:
+            continue
+
+        brace_match = re.search(r"\{([^{}]+)\}", current)
+        if brace_match:
+            choices = [option.strip() for option in brace_match.group(1).split(',') if option.strip()]
+            prefix = current[: brace_match.start()]
+            suffix = current[brace_match.end() :]
+            if not choices:
+                rank0_print(f"Warning: Empty brace expansion in spec '{spec}'")
+            for choice in choices:
+                pending.append(f"{prefix}{choice}{suffix}")
+            continue
+
+        bracket_match = re.search(r"\[([^\[\]]+)\]", current)
+        if bracket_match:
+            prefix = current[: bracket_match.start()]
+            selector = bracket_match.group(1)
+            suffix = current[bracket_match.end() :]
+
+            base_path = prefix.rstrip('.')
+            suffix = suffix.lstrip('.')
+
+            container = module_map.get(base_path)
+            length = None
+            available_indices = None
+            if container is not None and hasattr(container, '__len__'):
+                try:
+                    length = len(container)
+                    available_indices = set(range(length))
+                except TypeError:
+                    length = None
+
+            if length is None:
+                prefix_key = f"{base_path}." if base_path else ""
+                child_indices = set()
+                for name in module_map.keys():
+                    if not prefix_key and name == "":
+                        continue
+                    if not name.startswith(prefix_key):
+                        continue
+                    remainder = name[len(prefix_key):]
+                    if not remainder:
+                        continue
+                    child = remainder.split('.', 1)[0]
+                    if child.isdigit():
+                        child_indices.add(int(child))
+                if not child_indices:
+                    rank0_print(f"Warning: Unable to resolve module path '{base_path}' in spec '{spec}'")
+                    continue
+                length = max(child_indices) + 1
+                available_indices = child_indices
+
+            try:
+                indices = _expand_index_selector(selector, length)
+            except Exception as exc:
+                rank0_print(f"Warning: Unable to resolve selector '{selector}' in spec '{spec}': {exc}")
+                continue
+
+            valid_indices = []
+            for index in indices:
+                if index not in available_indices:
+                    rank0_print(f"Warning: Index {index} not available under '{base_path}' in spec '{spec}'")
+                    continue
+                valid_indices.append(index)
+
+            if not valid_indices:
+                rank0_print(f"Warning: Selector '{selector}' produced no valid indices for '{base_path}' in spec '{spec}'")
+                continue
+
+            for index in valid_indices:
+                parts = []
+                if base_path:
+                    parts.append(base_path)
+                parts.append(str(index))
+                if suffix:
+                    parts.append(suffix)
+                pending.append('.'.join(parts))
+            continue
+
+        expanded.append(current)
+
+    return sorted(set(expanded))
+
+
+def resolve_custom_tunable_modules(model: torch.nn.Module, tunable_parts: Sequence[str]) -> List[str]:
+    custom_specs = [part for part in tunable_parts if part not in PREDEFINED_TUNABLE_PARTS]
+    if not custom_specs:
+        return []
+    module_map = dict(model.named_modules())
+    module_map.setdefault('', model)
+    resolved: List[str] = []
+    for spec in custom_specs:
+        resolved.extend(_expand_module_spec(model, spec, module_map))
+    return sorted(set(resolved))
+
+
 def find_all_linear_names(model, mm_tunable_parts=None):
     cls = torch.nn.Linear
     lora_module_names = set()
-    
-    # Parse mm_tunable_parts to determine which modules to include
-    tunable_parts_list = mm_tunable_parts.split(",") if mm_tunable_parts else []
+
+    tunable_parts_list = _split_tunable_specs(mm_tunable_parts)
+
+    if not tunable_parts_list:
+        print("No mm_tunable_parts specified, will tune all linear layers in the model.")
+        for name, module in model.named_modules():
+            if isinstance(module, cls):
+                if "mm_projector" in name:
+                    lora_module_names.add(name)
+                else:
+                    names = name.split('.')
+                    lora_module_names.add(names[-1])
+        print(f"mm_tunable_parts: {mm_tunable_parts}")
+        print(f"Found these linear module names for LoRA: {lora_module_names}")
+        return list(lora_module_names)
+
+    custom_module_targets = resolve_custom_tunable_modules(model, tunable_parts_list)
+    substring_filters = [part for part in tunable_parts_list if part in PREDEFINED_TUNABLE_PARTS]
 
     for name, module in model.named_modules():
-        if not any(tunable_key in name for tunable_key in tunable_parts_list) and tunable_parts_list:
+        if not isinstance(module, cls):
             continue
-        if isinstance(module, cls):
-            names = name.split(".")
-            # For mm_projector layers, use the full path to avoid ambiguous names like "0" or "2"
-            if "mm_projector" in name:
-                # Use full path for mm_projector modules
+
+        matched = False
+        for target in custom_module_targets:
+            if target == name or name.startswith(f"{target}."):
                 lora_module_names.add(name)
-            else:
-                # For other modules, use just the last component as before
-                lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+                matched = True
+                break
+        if matched:
+            continue
+
+        if substring_filters and not any(filter_key in name for filter_key in substring_filters):
+            continue
+
+        if not substring_filters and custom_module_targets:
+            continue
+
+        if "mm_projector" in name:
+            lora_module_names.add(name)
+        else:
+            names = name.split('.')
+            lora_module_names.add(names[-1])
 
     print(f"mm_tunable_parts: {mm_tunable_parts}")
     print(f"Found these linear module names for LoRA: {lora_module_names}")
     return list(lora_module_names)
-
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -1927,94 +2128,99 @@ def train(attn_implementation=None):
         else:
             vision_tower.requires_grad_(False)
 
+
     else:
         rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
-        model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+        tunable_parts = _split_tunable_specs(model_args.mm_tunable_parts)
+        sanitized_parts = ','.join(tunable_parts)
+        model.config.mm_tunable_parts = training_args.mm_tunable_parts = sanitized_parts or model_args.mm_tunable_parts
+        custom_module_targets = resolve_custom_tunable_modules(model, tunable_parts)
+        model.config.resolved_custom_tunable_modules = custom_module_targets
         # Set the entire model to not require gradients by default
         model.requires_grad_(False)
         vision_tower.requires_grad_(False)
         model.get_model().mm_projector.requires_grad_(False)
         model.get_model().vision_resampler.requires_grad_(False)
-        # Parse the mm_tunable_parts to decide which parts to unfreeze
-        tunable_parts = model_args.mm_tunable_parts.split(",")
         if "mm_mlp_adapter" in tunable_parts:
             if training_args.lora_enable:
-                # Only enable LoRA adapters for mm_projector
                 for name, param in model.named_parameters():
                     if "mlp" in name and "lora_" in name:
                         param.requires_grad_(True)
             else:
-                # Enable all mm_projector parameters
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = True
         if "mm_vision_resampler" in tunable_parts:
             if training_args.lora_enable:
-                # Only enable LoRA adapters for vision_resampler
                 for name, param in model.named_parameters():
                     if "vision_resampler" in name and "lora_" in name:
                         param.requires_grad_(True)
             else:
-                # Enable all vision_resampler parameters
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = True
         if "mm_vision_tower" in tunable_parts:
             if training_args.lora_enable:
-                # Only enable LoRA adapters for vision_tower
                 for name, param in model.named_parameters():
                     if "vision_tower" in name and "lora_" in name:
                         param.requires_grad_(True)
             else:
-                # Enable all vision_tower parameters
                 for name, param in model.named_parameters():
                     if "vision_tower" in name:
                         param.requires_grad_(True)
         if "mm_projector" in tunable_parts:
             print("Enabling mm_projector parameters")
             if training_args.lora_enable:
-                # Only enable LoRA adapters for mm_projector
                 for name, param in model.named_parameters():
                     if "mm_projector" in name and "lora_" in name:
                         param.requires_grad_(True)
             else:
-                # Enable all mm_projector parameters
                 for name, param in model.named_parameters():
                     if "mm_projector" in name:
                         param.requires_grad_(True)
         if "lm_head" in tunable_parts:
             print("Enabling lm_head parameters")
             if training_args.lora_enable:
-                # Only enable LoRA adapters for lm_head
                 for name, param in model.named_parameters():
                     if "lm_head" in name and "lora_" in name:
                         param.requires_grad_(True)
             else:
-                # Enable all lm_head parameters
                 for name, param in model.named_parameters():
                     if "lm_head" in name:
                         param.requires_grad_(True)
         if "mm_language_model" in tunable_parts:
             if training_args.lora_enable:
-                # When LoRA is enabled, the language model training is handled by LoRA adapters
-                # Need to explicitly enable gradients for LoRA parameters after global freeze
                 rank0_print("Language model training enabled via LoRA adapters (base model parameters remain frozen)")
-                # Re-enable gradients for LoRA adapter parameters
                 language_model_params = []
                 for name, param in model.named_parameters():
                     if "lora_" in name and "model.model.layers" in name:
                         param.requires_grad_(True)
                         language_model_params.append(name)
             else:
-                # Traditional fine-tuning: set language model parameters to require gradients
                 language_model_params = []
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         param.requires_grad_(True)
                         language_model_params.append(name)
-                
+
             rank0_print(f"Language model parameters set to require gradients ({len(language_model_params)} parameters):")
             for param_name in language_model_params:
                 rank0_print(f"  {param_name}")
 
+        if custom_module_targets:
+            rank0_print(f"Enabling custom tunable modules: {custom_module_targets}")
+            custom_params = set()
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "lora_" in name and any(name.startswith(target) for target in custom_module_targets):
+                        param.requires_grad_(True)
+                        custom_params.add(name)
+            else:
+                for name, param in model.named_parameters():
+                    if any(name.startswith(target) for target in custom_module_targets):
+                        param.requires_grad_(True)
+                        custom_params.add(name)
+            rank0_print(f"Custom module parameters set to require gradients ({len(custom_params)} parameters):")
+            for param_name in sorted(custom_params):
+                rank0_print(f"  {param_name}")
     total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
     trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
     rank0_print(f"Total parameters: {total_params:,}")
