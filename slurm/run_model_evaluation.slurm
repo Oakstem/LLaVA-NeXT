@@ -25,10 +25,10 @@ LIMIT="${LIMIT:-}"  # Set to a number to limit samples for testing (e.g., 100)
 # Generation parameters
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
-TEMPERATURE="${TEMPERATURE:-0.7}"
+TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.9}"
 NUM_BEAMS="${NUM_BEAMS:-1}"
-DO_SAMPLE="${DO_SAMPLE:-true}"  # Set to true to enable sampling
+DO_SAMPLE="${DO_SAMPLE:-false}"  # Set to true to enable sampling
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
 
 # Output parameters
