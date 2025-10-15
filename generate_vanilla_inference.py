@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Model or checkpoint path to load (defaults to LLaVA-OneVision 7B).")
     parser.add_argument("--model-base", default=None, help="Optional base model path when loading LoRA adapters.")
     parser.add_argument("--adapter-path", default=None, help="Optional LoRA adapter path to merge at inference time.")
+    parser.add_argument("--select-adapter", action="store_true", help="Interactively select adapter from recent checkpoints.")
     parser.add_argument("--attn-implementation", default="sdpa", help="Attention implementation passed to the loader (e.g. 'sdpa', 'flash_attention_2').")
     parser.add_argument("--load-4bit", action="store_true", help="Load the model with 4-bit quantization.")
     parser.add_argument("--load-8bit", action="store_true", help="Load the model with 8-bit quantization.")

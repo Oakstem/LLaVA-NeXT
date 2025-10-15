@@ -99,7 +99,7 @@ NUM_BEAMS="${NUM_BEAMS:-1}"
 DO_SAMPLE="${DO_SAMPLE:-false}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
 SAVE_OUTPUT="${SAVE_OUTPUT:-}"
-CHAT_MODE="${CHAT_MODE:-true}"
+CHAT_MODE="${CHAT_MODE:-false}"
 NO_STREAM="${NO_STREAM:-false}"
 
 # Create logs directory if it doesn't exist
