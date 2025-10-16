@@ -25,10 +25,12 @@ DEFAULT_DO_SAMPLE="true"
 DEFAULT_TIME="00:10:00"
 DEFAULT_MEM="20G"
 DEFAULT_GDINO_MODEL_ID="IDEA-Research/grounding-dino-base"
-DEFAULT_GDINO_BOX_THRESHOLD=0.3
-DEFAULT_GDINO_TEXT_THRESHOLD=0.25
+DEFAULT_GDINO_BOX_THRESHOLD=0.25
+DEFAULT_GDINO_TEXT_THRESHOLD=0.2
 DEFAULT_GDINO_DEVICE="auto"
 DEFAULT_RUN_GDINO="true"
+IMAGE_ASPECT_RATIO_FALLBACK="${IMAGE_ASPECT_RATIO_FALLBACK:-anyres_max_4}"
+IMAGE_GRID_PINPOINTS_FALLBACK="${IMAGE_GRID_PINPOINTS_FALLBACK:-(1x1),...,(2x2)}"  # "(1x1),...,(6x6)"
 
 # Initialize variables
 TEMP_START="${TEMP_START:-$DEFAULT_TEMP_START}"
@@ -173,16 +175,6 @@ select_adapter_interactive() {
         echo "Selected: $ADAPTER_PATH"
     fi
 }
-# Extract checkpoint name for output directory
-# if [ -z "$ADAPTER_PATH" ]; then
-# Extract checkpoint name from path (e.g., checkpoint-12000 from /path/to/checkpoint-12000)
-checkpoint_name=$(basename "$ADAPTER_PATH")
-# Extract training run name (e.g., llava-20251013_201208 from /path/to/llava-20251013_201208/checkpoint-12000)
-training_run=$(basename "$(dirname "$ADAPTER_PATH")")
-dir_suffix="${training_run}_${checkpoint_name}"
-# else
-#     dir_suffix="base_model"
-# fi
 # Parse arguments
 INTERACTIVE=true
 while [[ $# -gt 0 ]]; do
@@ -212,6 +204,25 @@ done
 # Interactive adapter selection if requested
 if [ "$INTERACTIVE" = true ] && [ -z "$ADAPTER_PATH" ]; then
     select_adapter_interactive
+fi
+
+# Determine output directory suffix based on adapter selection
+if [ -n "$ADAPTER_PATH" ]; then
+    checkpoint_name=$(basename "$ADAPTER_PATH")
+    parent_dir=$(dirname "$ADAPTER_PATH")
+    training_run=$(basename "$parent_dir")
+
+    if [ -z "$training_run" ] || [ "$training_run" = "." ]; then
+        training_run="adapter"
+    fi
+
+    if [ -z "$checkpoint_name" ] || [ "$checkpoint_name" = "." ]; then
+        checkpoint_name="checkpoint"
+    fi
+
+    dir_suffix="${training_run}_${checkpoint_name}"
+else
+    dir_suffix="base_model"
 fi
 
 # Change to project directory
@@ -348,6 +359,8 @@ ARGS=(
     "--top-p" "$TOP_P"
     "--num-beams" "$NUM_BEAMS"
     "--save-output" "$output_file"
+    "--image-aspect-ratio" "$IMAGE_ASPECT_RATIO_FALLBACK"
+    "--image-grid-pinpoints" "$IMAGE_GRID_PINPOINTS_FALLBACK"
 )
 
 RUN_GDINO="$RUN_GDINO"

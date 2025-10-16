@@ -102,6 +102,8 @@ SAVE_OUTPUT="${SAVE_OUTPUT:-true}"
 CHAT_MODE="${CHAT_MODE:-false}"
 NO_STREAM="${NO_STREAM:-false}"
 DETECT_GAZE_BBOXES="${DETECT_GAZE_BBOXES:-true}"
+IMAGE_ASPECT_RATIO_FALLBACK="${IMAGE_ASPECT_RATIO_FALLBACK:-anyres_max_4}"
+IMAGE_GRID_PINPOINTS_FALLBACK="${IMAGE_GRID_PINPOINTS_FALLBACK:-(1x1),...,(2x2)}"  # "(1x1),...,(6x6)"
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
@@ -129,6 +131,8 @@ echo "Do Sample: $DO_SAMPLE"
 echo "Chat Mode: $CHAT_MODE"
 echo "Save Output: $SAVE_OUTPUT"
 echo "Detect Gaze Bboxes: $DETECT_GAZE_BBOXES"
+echo "Fallback Image Aspect Ratio: $IMAGE_ASPECT_RATIO_FALLBACK"
+echo "Fallback Image Grid Pinpoints: $IMAGE_GRID_PINPOINTS_FALLBACK"
 echo "=========================================="
 
 # Load any required modules (uncomment and modify as needed)
@@ -163,6 +167,8 @@ ARGS=(
     "--model-path" "$MODEL_PATH"
     "--attn-implementation" "$ATTN_IMPLEMENTATION"
     "--image-path" "$IMAGE_PATH"
+    "--image-aspect-ratio" "$IMAGE_ASPECT_RATIO_FALLBACK"
+    "--image-grid-pinpoints" "$IMAGE_GRID_PINPOINTS_FALLBACK"
     "--prompt" "$PROMPT"
     "--max-new-tokens" "$MAX_NEW_TOKENS"
     "--temperature" "$TEMPERATURE"

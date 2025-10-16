@@ -10,8 +10,10 @@ import json
 import sys
 from pathlib import Path
 from threading import Thread
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from copy import deepcopy
 
+import re
 import torch
 # Patch PyTorch pytree for older torch versions used with newer Transformers
 if hasattr(torch, 'utils') and hasattr(torch.utils, '_pytree'):
@@ -114,6 +116,143 @@ from llava.constants import (  # noqa: E402
 from llava.conversation import conv_templates  # noqa: E402
 
 
+DEFAULT_IMAGE_ASPECT_RATIO = "anyres_max_9"
+DEFAULT_IMAGE_GRID_PINPOINTS_EXPR = "(1x1),...,(2x2)"
+
+
+def _normalize_absolute_grid_pinpoints(pairs: List[Any]) -> List[List[int]]:
+    normalized: List[List[int]] = []
+    for index, pair in enumerate(pairs):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError("image_grid_pinpoints must contain [width, height] pairs.")
+        try:
+            width = int(pair[0])
+            height = int(pair[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("image_grid_pinpoints pairs must be integers.") from exc
+        normalized.append([width, height])
+    return normalized
+
+
+def determine_base_image_resolution(model) -> int:
+    config = getattr(model, "config", None)
+    if config is not None:
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is not None:
+            size = getattr(vision_config, "image_size", None)
+            if isinstance(size, (list, tuple)):
+                size = size[0]
+            if isinstance(size, int):
+                return size
+        size = getattr(config, "image_crop_resolution", None)
+        if isinstance(size, int):
+            return size
+        size = getattr(config, "image_size", None)
+        if isinstance(size, int):
+            return size
+    return 384
+
+
+def resolve_image_grid_pinpoints(value: Any, base_resolution: int) -> Optional[List[List[int]]]:
+    if value is None:
+        return None
+
+    effective_base = int(base_resolution) if base_resolution else 0
+    if effective_base <= 0:
+        effective_base = 384
+
+    if isinstance(value, (list, tuple)):
+        return _normalize_absolute_grid_pinpoints(list(value))
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if parsed is not None:
+            return resolve_image_grid_pinpoints(parsed, effective_base)
+
+        if "x" in raw and "(" in raw:
+            matches = re.findall(r"\((\d+)x(\d+)\)", raw)
+            if not matches:
+                raise ValueError("image_grid_pinpoints string did not contain any '(WxH)' pairs.")
+            multipliers = [[int(w), int(h)] for w, h in matches]
+            if "..." in raw and len(multipliers) >= 2:
+                start_w, start_h = multipliers[0]
+                end_w, end_h = multipliers[-1]
+                expanded = [[i, j] for i in range(start_w, end_w + 1) for j in range(start_h, end_h + 1)]
+                multipliers = expanded
+            return [[w * effective_base, h * effective_base] for w, h in multipliers]
+
+        raise ValueError("unrecognized image_grid_pinpoints string format.")
+
+    raise ValueError(f"Unsupported image_grid_pinpoints value type: {type(value)!r}")
+
+
+
+def ensure_image_config(
+    model,
+    fallback_aspect_ratio: Optional[str],
+    fallback_grid_pinpoints: Optional[Any],
+    override_aspect_ratio: bool = False,
+    override_grid_pinpoints: bool = False,
+) -> None:
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+
+    aspect_ratio = getattr(config, "image_aspect_ratio", None)
+    if override_aspect_ratio and fallback_aspect_ratio:
+        if aspect_ratio and aspect_ratio != fallback_aspect_ratio:
+            print(f"Overriding image_aspect_ratio from '{aspect_ratio}' to '{fallback_aspect_ratio}'.")
+        elif not aspect_ratio:
+            print(f"Setting image_aspect_ratio to '{fallback_aspect_ratio}'.")
+        config.image_aspect_ratio = fallback_aspect_ratio
+        aspect_ratio = fallback_aspect_ratio
+    elif not aspect_ratio and fallback_aspect_ratio:
+        config.image_aspect_ratio = fallback_aspect_ratio
+        print(f"image_aspect_ratio missing in checkpoint; using fallback '{fallback_aspect_ratio}'.")
+
+    base_resolution = determine_base_image_resolution(model)
+
+    current_grid = getattr(config, "image_grid_pinpoints", None)
+    resolved_grid: Optional[List[List[int]]] = None
+    if not override_grid_pinpoints and current_grid not in (None, "", []):
+        try:
+            resolved_grid = resolve_image_grid_pinpoints(current_grid, base_resolution)
+            config.image_grid_pinpoints = deepcopy(resolved_grid)
+        except ValueError:
+            resolved_grid = None
+
+    should_apply_fallback_grid = fallback_grid_pinpoints not in (None, "", [])
+    if should_apply_fallback_grid and (override_grid_pinpoints or resolved_grid is None):
+        try:
+            resolved_grid = resolve_image_grid_pinpoints(fallback_grid_pinpoints, base_resolution)
+        except ValueError as exc:
+            raise ValueError(
+                f"Failed to parse image_grid_pinpoints fallback '{fallback_grid_pinpoints}': {exc}"
+            ) from exc
+        config.image_grid_pinpoints = deepcopy(resolved_grid)
+        if override_grid_pinpoints:
+            print("image_grid_pinpoints overridden via arguments.")
+        else:
+            print("image_grid_pinpoints missing in checkpoint; using fallback from arguments.")
+
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is None:
+        return
+
+    if not getattr(vision_config, "image_aspect_ratio", None) and getattr(config, "image_aspect_ratio", None):
+        vision_config.image_aspect_ratio = config.image_aspect_ratio
+
+    if not getattr(vision_config, "image_grid_pinpoints", None) and resolved_grid:
+        vision_config.image_grid_pinpoints = deepcopy(resolved_grid)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run vanilla LLaVA inference on a single image and prompt.")
     parser.add_argument("--model-path", default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Model or checkpoint path to load (defaults to LLaVA-OneVision 7B).")
@@ -124,6 +263,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-4bit", action="store_true", help="Load the model with 4-bit quantization.")
     parser.add_argument("--load-8bit", action="store_true", help="Load the model with 8-bit quantization.")
     parser.add_argument("--image-path", required=True, help="Path to the input image.")
+    
+    parser.add_argument("--image-aspect-ratio", default=DEFAULT_IMAGE_ASPECT_RATIO, help="Fallback image_aspect_ratio used when absent in the checkpoint.")
+    parser.add_argument("--image-grid-pinpoints", default=DEFAULT_IMAGE_GRID_PINPOINTS_EXPR, help="Fallback image_grid_pinpoints used when absent in the checkpoint. Accepts formats like '(1x1),...,(2x2)' or a JSON array of [width, height] pairs.")
     
     # prompt_group = parser.add_mutually_exclusive_group(required=True)
     parser.add_argument("--prompt", default="describe every person and where is he looking at?", help="User prompt to pair with the image.")
@@ -404,6 +546,14 @@ def main() -> None:
         load_8bit=args.load_8bit,
         model_base=args.model_base,
         adapter_path=fix_wsl_paths(adapter_path) if adapter_path else None,
+    )
+
+    ensure_image_config(
+        model,
+        args.image_aspect_ratio,
+        args.image_grid_pinpoints,
+        override_aspect_ratio=args.image_aspect_ratio != DEFAULT_IMAGE_ASPECT_RATIO,
+        override_grid_pinpoints=args.image_grid_pinpoints != DEFAULT_IMAGE_GRID_PINPOINTS_EXPR,
     )
 
     prompt_text = read_prompt(args.prompt)

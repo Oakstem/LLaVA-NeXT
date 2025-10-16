@@ -89,8 +89,8 @@ OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outp
 DEEPSPEED_CONFIG="scripts/zero1.json"
 
 # Model architecture parameters
-MM_TUNABLE_PARTS="mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,"
-MM_TUNABLE_PARTS+="model.vision_tower.vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-4:].mlp"
+MM_TUNABLE_PARTS="mm_projector,model.layers[-8:].self_attn.{q_proj,v_proj},model.layers[-8:].mlp,"
+MM_TUNABLE_PARTS+="model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
 #"mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},vision_tower.vision_model.encoder.layers[-4:].mlp"
 MM_VISION_TOWER_LR="3e-6"
 MM_PROJECTOR_TYPE="mlp2x_gelu"
