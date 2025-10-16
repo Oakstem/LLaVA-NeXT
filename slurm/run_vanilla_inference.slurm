@@ -98,10 +98,10 @@ TOP_P="${TOP_P:-0.9}"
 NUM_BEAMS="${NUM_BEAMS:-1}"
 DO_SAMPLE="${DO_SAMPLE:-false}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
-SAVE_OUTPUT="${SAVE_OUTPUT:-}"
+SAVE_OUTPUT="${SAVE_OUTPUT:-true}"
 CHAT_MODE="${CHAT_MODE:-false}"
 NO_STREAM="${NO_STREAM:-false}"
-
+DETECT_GAZE_BBOXES="${DETECT_GAZE_BBOXES:-true}"
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
@@ -128,6 +128,7 @@ echo "Num Beams: $NUM_BEAMS"
 echo "Do Sample: $DO_SAMPLE"
 echo "Chat Mode: $CHAT_MODE"
 echo "Save Output: $SAVE_OUTPUT"
+echo "Detect Gaze Bboxes: $DETECT_GAZE_BBOXES"
 echo "=========================================="
 
 # Load any required modules (uncomment and modify as needed)
@@ -214,6 +215,10 @@ if [ -n "$SAVE_OUTPUT" ]; then
     ARGS+=("--save-output" "$SAVE_OUTPUT")
 fi
 
+# Add gaze detection option
+if [ "$DETECT_GAZE_BBOXES" = "true" ]; then
+    ARGS+=("--run-gdino")
+fi
 # Print the command that will be executed
 echo "Executing command:"
 echo "python generate_vanilla_inference.py ${ARGS[*]}"
@@ -229,3 +234,4 @@ echo "Exit code: $exit_code"
 echo "=========================================="
 
 exit $exit_code
+

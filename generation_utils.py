@@ -18,6 +18,65 @@ import requests
 import pandas as pd
 
 from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers import modeling_utils as _transformers_modeling_utils
+
+if not hasattr(_transformers_modeling_utils, 'apply_chunking_to_forward'):
+    def _apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
+        if chunk_size is None or chunk_size <= 0:
+            return forward_fn(*input_tensors)
+        if len(input_tensors) == 0:
+            raise ValueError('apply_chunking_to_forward requires at least one input tensor')
+        tensor_shape = input_tensors[0].shape[chunk_dim]
+        for tensor in input_tensors:
+            if tensor.shape[chunk_dim] != tensor_shape:
+                raise ValueError('All input tensors must have the same shape in the chunk dimension')
+        if tensor_shape % chunk_size != 0:
+            chunk_size = tensor_shape
+        num_chunks = max(tensor_shape // chunk_size, 1)
+        chunked_inputs = [tensor.chunk(num_chunks, dim=chunk_dim) for tensor in input_tensors]
+        output_chunks = []
+        for chunk_idx in range(num_chunks):
+            chunk_args = [chunk_input[chunk_idx] for chunk_input in chunked_inputs]
+            output_chunks.append(forward_fn(*chunk_args))
+        first_chunk = output_chunks[0]
+        if isinstance(first_chunk, tuple):
+            return tuple(torch.cat([chunk[i] for chunk in output_chunks], dim=chunk_dim) for i in range(len(first_chunk)))
+        return torch.cat(output_chunks, dim=chunk_dim)
+
+    _transformers_modeling_utils.apply_chunking_to_forward = _apply_chunking_to_forward
+
+if not hasattr(_transformers_modeling_utils, 'find_pruneable_heads_and_indices'):
+    def _find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+        heads_to_prune = set(heads) - already_pruned_heads
+        mask = torch.ones(n_heads, head_size, dtype=torch.bool)
+        for head in heads_to_prune:
+            mask[head % n_heads] = False
+        index = torch.arange(n_heads * head_size, dtype=torch.long).view(n_heads, head_size)
+        index = index[mask].view(1, -1)
+        return heads_to_prune, index
+    _transformers_modeling_utils.find_pruneable_heads_and_indices = _find_pruneable_heads_and_indices
+
+if not hasattr(_transformers_modeling_utils, 'prune_linear_layer'):
+    def _prune_linear_layer(layer, index, dim=0):
+        if not isinstance(index, torch.Tensor):
+            index = torch.tensor(index, device=layer.weight.device, dtype=torch.long)
+        else:
+            index = index.to(layer.weight.device, dtype=torch.long)
+        index = index.long()
+        W = layer.weight.index_select(dim, index).clone().detach()
+        new_size = list(layer.weight.size())
+        new_size[dim] = index.numel()
+        new_layer = torch.nn.Linear(new_size[1], new_size[0], bias=layer.bias is not None).to(layer.weight.device)
+        new_layer.weight.requires_grad = layer.weight.requires_grad
+        new_layer.weight.data.copy_(W.contiguous())
+        if layer.bias is not None:
+            if dim == 1:
+                new_layer.bias.data.copy_(layer.bias.clone().detach())
+            else:
+                new_layer.bias.data.copy_(layer.bias[index].clone().detach())
+        return new_layer
+    _transformers_modeling_utils.prune_linear_layer = _prune_linear_layer
+
 from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
 from llava.model.builder import load_pretrained_model
 from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token

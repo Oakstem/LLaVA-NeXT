@@ -10,10 +10,86 @@ import json
 import sys
 from pathlib import Path
 from threading import Thread
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
+# Patch PyTorch pytree for older torch versions used with newer Transformers
+if hasattr(torch, 'utils') and hasattr(torch.utils, '_pytree'):
+    _pytree = torch.utils._pytree
+    if not hasattr(_pytree, 'register_pytree_node') and hasattr(_pytree, '_register_pytree_node'):
+        def _compat_register_pytree_node(*args, **kwargs):
+            kwargs = {k: v for k, v in kwargs.items() if k not in {'serialized_type_name', 'serialized_context'}}
+            return _pytree._register_pytree_node(*args, **kwargs)
+        _pytree.register_pytree_node = _compat_register_pytree_node
+
 from transformers import TextIteratorStreamer
+from transformers import modeling_utils as _transformers_modeling_utils
+
+if not hasattr(_transformers_modeling_utils, "apply_chunking_to_forward"):
+    def _apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
+        if chunk_size is None or chunk_size <= 0:
+            return forward_fn(*input_tensors)
+        if len(input_tensors) == 0:
+            raise ValueError("apply_chunking_to_forward requires at least one input tensor")
+        tensor_shape = input_tensors[0].shape[chunk_dim]
+        for tensor in input_tensors:
+            if tensor.shape[chunk_dim] != tensor_shape:
+                raise ValueError("All input tensors must have the same shape in the chunk dimension")
+        if tensor_shape % chunk_size != 0:
+            chunk_size = tensor_shape
+        num_chunks = max(tensor_shape // chunk_size, 1)
+        chunked_inputs = [tensor.chunk(num_chunks, dim=chunk_dim) for tensor in input_tensors]
+        output_chunks = []
+        for chunk_idx in range(num_chunks):
+            chunk_args = [chunk_input[chunk_idx] for chunk_input in chunked_inputs]
+            output_chunks.append(forward_fn(*chunk_args))
+        first_chunk = output_chunks[0]
+        if isinstance(first_chunk, tuple):
+            return tuple(torch.cat([chunk[i] for chunk in output_chunks], dim=chunk_dim) for i in range(len(first_chunk)))
+        return torch.cat(output_chunks, dim=chunk_dim)
+
+    _transformers_modeling_utils.apply_chunking_to_forward = _apply_chunking_to_forward
+
+if not hasattr(_transformers_modeling_utils, 'find_pruneable_heads_and_indices'):
+    def _find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+        heads_to_prune = set(heads) - already_pruned_heads
+        mask = torch.ones(n_heads, head_size, dtype=torch.bool)
+        for head in heads_to_prune:
+            mask[head % n_heads] = False
+        index = torch.arange(n_heads * head_size, dtype=torch.long).view(n_heads, head_size)
+        index = index[mask].view(1, -1)
+        return heads_to_prune, index
+    _transformers_modeling_utils.find_pruneable_heads_and_indices = _find_pruneable_heads_and_indices
+
+if not hasattr(_transformers_modeling_utils, 'prune_linear_layer'):
+    def _prune_linear_layer(layer, index, dim=0):
+        if not isinstance(index, torch.Tensor):
+            index = torch.tensor(index, device=layer.weight.device, dtype=torch.long)
+        else:
+            index = index.to(layer.weight.device, dtype=torch.long)
+        index = index.long()
+        W = layer.weight.index_select(dim, index).clone().detach()
+        new_size = list(layer.weight.size())
+        new_size[dim] = index.numel()
+        new_layer = torch.nn.Linear(new_size[1], new_size[0], bias=layer.bias is not None).to(layer.weight.device)
+        new_layer.weight.requires_grad = layer.weight.requires_grad
+        new_layer.weight.data.copy_(W.contiguous())
+        if layer.bias is not None:
+            if dim == 1:
+                new_layer.bias.data.copy_(layer.bias.clone().detach())
+            else:
+                new_layer.bias.data.copy_(layer.bias[index].clone().detach())
+        return new_layer
+    _transformers_modeling_utils.prune_linear_layer = _prune_linear_layer
+
+try:
+    from gazefollow.auto_phrase_grounding.detect_gaze_targets import (
+        parse_person_descriptions as gdino_parse_person_descriptions,
+        detect_gaze_targets as gdino_detect_gaze_targets,
+    )
+except Exception:  # noqa: BLE001
+    gdino_parse_person_descriptions = None
+    gdino_detect_gaze_targets = None
 
 # Ensure project root is importable (needed when running from subdirectories)
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -63,6 +139,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-output", default=None, help="Optional path to save the generated text as JSON (with keys image, prompt, response).")
     parser.add_argument("--chat", action="store_true", help="Enter an interactive chat loop that reuses the loaded model and image.")
     parser.add_argument("--no-stream", action="store_true", help="Disable token streaming and only print responses after generation completes.")
+    parser.add_argument("--run-gdino", action="store_true", help="Run GroundingDINO gaze detection on the generated response.")
+    parser.add_argument("--gdino-model-id", default="IDEA-Research/grounding-dino-base", help="Hugging Face model identifier for GroundingDINO.")
+    parser.add_argument("--gdino-box-threshold", type=float, default=0.3, help="Box confidence threshold for GroundingDINO detections.")
+    parser.add_argument("--gdino-text-threshold", type=float, default=0.25, help="Text matching threshold for GroundingDINO detections.")
+    parser.add_argument("--gdino-device", default="cuda", help="Device string for GroundingDINO (default: cuda).")
     return parser.parse_args()
 
 def prompt_for_adapter_path(training_outputs_dir: str = "training_outputs") -> Optional[str]:
@@ -160,6 +241,53 @@ def prepare_image_tensor(image_path: str, image_processor, model) -> Tuple[torch
 
     image_tensor = image_tensor.to(model.device, dtype=model.dtype)
     return image_tensor, pil_image.size
+
+
+def maybe_run_gdino(args: argparse.Namespace, description_text: str, image_path: str) -> Optional[Dict[str, Any]]:
+    """Run GroundingDINO on the generated description when requested."""
+    if not args.run_gdino:
+        return None
+
+    if gdino_parse_person_descriptions is None or gdino_detect_gaze_targets is None:
+        print("GroundingDINO utilities not available; skipping detection.", file=sys.stderr)
+        return {"error": "detect_gaze_targets module not available"}
+
+    try:
+        persons = gdino_parse_person_descriptions(description_text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Failed to parse person descriptions for GroundingDINO: {exc}", file=sys.stderr)
+        return {"error": f"parse error: {exc}"}
+
+    payload_base: Dict[str, Any] = {
+        "image_path": str(image_path),
+        "model_id": args.gdino_model_id,
+    }
+
+    if not persons:
+        payload_base["results"] = {}
+        payload_base["warning"] = "No person descriptions detected in generated text."
+        return payload_base
+
+    try:
+        pil_image = load_image(image_path)
+        device_choice = args.gdino_device or "cpu"
+        if device_choice.lower() == "auto":
+            device_choice = "cuda" if torch.cuda.is_available() else "cpu"
+
+        detections = gdino_detect_gaze_targets(
+            image=pil_image,
+            persons=persons,
+            model_id=args.gdino_model_id,
+            box_threshold=args.gdino_box_threshold,
+            text_threshold=args.gdino_text_threshold,
+            device=device_choice,
+        )
+
+        payload_base["results"] = detections
+        return payload_base
+    except Exception as exc:  # noqa: BLE001
+        print(f"GroundingDINO detection failed: {exc}", file=sys.stderr)
+        return {"error": str(exc)}
 
 
 def build_generation_kwargs(args: argparse.Namespace, tokenizer, image_tensor: torch.Tensor, image_size: Tuple[int, int]):
@@ -377,6 +505,11 @@ def main() -> None:
                 print("\nAssistant>")
                 print(response)
 
+    gdino_payload = maybe_run_gdino(args, response, image_path)
+    if gdino_payload is not None:
+        print("\n=== GroundingDINO Results ===")
+        print(json.dumps(gdino_payload, indent=2))
+
     if args.save_output:
         output_path = Path(args.save_output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -396,6 +529,9 @@ def main() -> None:
                 "prompt": prompt_text,
                 "response": response,
             }
+
+        if gdino_payload is not None:
+            payload["gdino"] = gdino_payload
 
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Saved response to {output_path}")
