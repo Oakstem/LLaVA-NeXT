@@ -116,7 +116,7 @@ from llava.constants import (  # noqa: E402
 from llava.conversation import conv_templates  # noqa: E402
 
 
-DEFAULT_IMAGE_ASPECT_RATIO = "anyres_max_9"
+DEFAULT_IMAGE_ASPECT_RATIO = "anyres_max_4"
 DEFAULT_IMAGE_GRID_PINPOINTS_EXPR = "(1x1),...,(2x2)"
 
 
@@ -444,6 +444,7 @@ def build_generation_kwargs(args: argparse.Namespace, tokenizer, image_tensor: t
         "max_new_tokens": args.max_new_tokens,
         "use_cache": True,
         "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+        "sequence_bias": {(tokenizer.eos_token_id,): -5.0},
         # "eos_token_id": None,
     }
 
