@@ -189,6 +189,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    mm_projector_full_finetune: bool = field(default=False, metadata={"help": "If true, train mm_projector base weights directly even when LoRA is enabled."})
     mm_projector_lr: Optional[float] = None
     mm_vision_tower_lr: Optional[float] = None
     group_by_varlen: bool = field(default=False)
@@ -511,7 +512,7 @@ def resolve_custom_tunable_modules(model: torch.nn.Module, tunable_parts: Sequen
     return sorted(set(resolved))
 
 
-def find_all_linear_names(model, mm_tunable_parts=None):
+def find_all_linear_names(model, mm_tunable_parts=None, exclude_mm_projector: bool = False):
     cls = torch.nn.Linear
     lora_module_names = set()
 
@@ -522,6 +523,8 @@ def find_all_linear_names(model, mm_tunable_parts=None):
         for name, module in model.named_modules():
             if isinstance(module, cls):
                 if "mm_projector" in name:
+                    if exclude_mm_projector:
+                        continue
                     lora_module_names.add(name)
                 else:
                     names = name.split('.')
@@ -553,6 +556,8 @@ def find_all_linear_names(model, mm_tunable_parts=None):
             continue
 
         if "mm_projector" in name:
+            if exclude_mm_projector:
+                continue
             lora_module_names.add(name)
         else:
             names = name.split('.')
@@ -1976,7 +1981,11 @@ def train(attn_implementation=None):
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model, mm_tunable_parts=model_args.mm_tunable_parts),
+            target_modules=find_all_linear_names(
+                model,
+                mm_tunable_parts=model_args.mm_tunable_parts,
+                exclude_mm_projector=training_args.mm_projector_full_finetune,
+            ),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
@@ -2169,7 +2178,18 @@ def train(attn_implementation=None):
                         param.requires_grad_(True)
         if "mm_projector" in tunable_parts:
             print("Enabling mm_projector parameters")
-            if training_args.lora_enable:
+            if training_args.mm_projector_full_finetune:
+                rank0_print("mm_projector_full_finetune enabled: training base projector weights without LoRA adapters")
+                if hasattr(model.get_model(), "mm_projector"):
+                    model.get_model().mm_projector.requires_grad_(True)
+                for name, param in model.named_parameters():
+                    if "mm_projector" not in name:
+                        continue
+                    if "lora_" in name:
+                        param.requires_grad_(False)
+                    else:
+                        param.requires_grad_(True)
+            elif training_args.lora_enable:
                 for name, param in model.named_parameters():
                     if "mm_projector" in name and "lora_" in name:
                         param.requires_grad_(True)
@@ -2239,6 +2259,7 @@ def train(attn_implementation=None):
     model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
     model.config.mm_projector_lr = training_args.mm_projector_lr
     model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
+    model.config.mm_projector_full_finetune = training_args.mm_projector_full_finetune
     training_args.use_im_start_end = model_args.mm_use_im_start_end
     model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
     # model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)        # todo: test if this really required

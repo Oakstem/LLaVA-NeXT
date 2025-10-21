@@ -89,8 +89,8 @@ OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outp
 DEEPSPEED_CONFIG="scripts/zero1.json"
 
 # Model architecture parameters
-MM_TUNABLE_PARTS="mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,"
-MM_TUNABLE_PARTS+="model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
+MM_TUNABLE_PARTS="mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj,o_proj},model.layers[-4:].mlp,"
+# MM_TUNABLE_PARTS+="model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
 #"mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},vision_tower.vision_model.encoder.layers[-4:].mlp"
 MM_VISION_TOWER_LR="3e-6"
 MM_PROJECTOR_TYPE="mlp2x_gelu"
@@ -107,6 +107,7 @@ MM_PATCH_MERGE_TYPE="spatial_unpad"
 LORA_ENABLE="True"
 LORA_R="8"
 LORA_ALPHA="16"
+MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
 NUM_TRAIN_EPOCHS="2"
@@ -261,6 +262,7 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --dataloader_prefetch_factor 2 \
     --dataloader_pin_memory True \
     --persistent_workers=True \
+    --mm_projector_full_finetune ${MM_PROJECTOR_FULL_FINETUNE} \
     # --deepspeed ${DEEPSPEED_CONFIG} \
     # --attn_implementation flash_attention_2 \
     # --dataloader_num_workers 10 \
