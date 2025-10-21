@@ -7,7 +7,9 @@ so it supports optional LoRA adapters in addition to base checkpoints.
 
 import argparse
 import json
+import math
 import sys
+from datetime import datetime
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -15,6 +17,7 @@ from copy import deepcopy
 
 import re
 import torch
+import torch.nn.functional as F
 # Patch PyTorch pytree for older torch versions used with newer Transformers
 if hasattr(torch, 'utils') and hasattr(torch.utils, '_pytree'):
     _pytree = torch.utils._pytree
@@ -116,8 +119,8 @@ from llava.constants import (  # noqa: E402
 from llava.conversation import conv_templates  # noqa: E402
 
 
-DEFAULT_IMAGE_ASPECT_RATIO = "anyres_max_4"
-DEFAULT_IMAGE_GRID_PINPOINTS_EXPR = "(1x1),...,(2x2)"
+DEFAULT_IMAGE_ASPECT_RATIO = "anyres_max_9"
+DEFAULT_IMAGE_GRID_PINPOINTS_EXPR = "(1x1),...,(3x3)"
 
 
 def _normalize_absolute_grid_pinpoints(pairs: List[Any]) -> List[List[int]]:
@@ -206,6 +209,7 @@ def ensure_image_config(
         return
 
     aspect_ratio = getattr(config, "image_aspect_ratio", None)
+    print(f"INFO: Current image_aspect_ratio in checkpoint: {aspect_ratio}")
     if override_aspect_ratio and fallback_aspect_ratio:
         if aspect_ratio and aspect_ratio != fallback_aspect_ratio:
             print(f"Overriding image_aspect_ratio from '{aspect_ratio}' to '{fallback_aspect_ratio}'.")
@@ -277,6 +281,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus sampling value.")
     parser.add_argument("--num-beams", type=int, default=1, help="Number of beams for beam search decoding.")
     parser.add_argument("--do-sample", action="store_true", help="Enable sampling instead of greedy decoding.")
+    parser.add_argument("--log-topk-tokens", type=int, default=5, help="Log the top-K token probabilities for each generated step (0 to disable).")
+    parser.add_argument("--log-topk-file", default=None, help="Optional path to write top-K token statistics as JSON Lines.")
     parser.add_argument("--disable-optimizations", action="store_true", help="Skip enabling CUDA inference optimizations.")
     parser.add_argument("--save-output", default=None, help="Optional path to save the generated text as JSON (with keys image, prompt, response).")
     parser.add_argument("--chat", action="store_true", help="Enter an interactive chat loop that reuses the loaded model and image.")
@@ -452,9 +458,178 @@ def build_generation_kwargs(args: argparse.Namespace, tokenizer, image_tensor: t
         kwargs.pop("temperature", None)
         kwargs.pop("top_p", None)
 
+    if getattr(args, "log_topk_tokens", 0) > 0:
+        kwargs["return_dict_in_generate"] = True
+
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     return kwargs
 
+
+def _extract_sequences_from_generate_output(output: Any) -> torch.Tensor:
+    """Normalize different generate outputs to a sequences tensor."""
+    if hasattr(output, "sequences"):
+        return output.sequences
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, (list, tuple)) and output:
+        return output[0]
+    raise TypeError(f"Unsupported generation output type: {type(output)!r}")
+
+
+def _format_token_piece(tokenizer, token_id: int) -> str:
+    piece = tokenizer.decode([token_id], skip_special_tokens=False)
+    if not piece:
+        converted = tokenizer.convert_ids_to_tokens([token_id])
+        piece = converted[0] if converted else str(token_id)
+    return piece.replace("\n", "\\n")
+
+
+def collect_topk_token_probabilities(
+    tokenizer,
+    model,
+    sequences: torch.Tensor,
+    prompt_token_length: int,
+    topk: int,
+    image_tensor: torch.Tensor,
+    image_size: Tuple[int, int],
+) -> Optional[Dict[str, Any]]:
+    """Collect top-k token probabilities for the generated continuation."""
+    if topk <= 0:
+        return None
+
+    if sequences.ndim == 1:
+        sequences = sequences.unsqueeze(0)
+
+    if sequences.size(0) != 1:
+        print("INFO: Top-k logging currently supports batch size 1; skipping.")
+        return None
+
+    sequences_cpu = sequences.detach().cpu()
+    generated_length = sequences_cpu.size(1) - prompt_token_length
+    if generated_length <= 0:
+        print("INFO: No generated tokens to log.")
+        return None
+
+    if hasattr(model, "device"):
+        model_device = model.device
+    else:
+        model_device = next(model.parameters()).device
+    sequences_device = sequences.to(model_device)
+    inputs = sequences_device[:, :-1]
+    attention_mask = torch.ones_like(inputs, dtype=torch.long, device=model_device)
+
+    model_inputs = {
+        "input_ids": inputs,
+        "attention_mask": attention_mask,
+        "images": image_tensor,
+        "image_sizes": [list(image_size)],
+    }
+
+    with torch.inference_mode():
+        outputs = model(**model_inputs)
+
+    logits = getattr(outputs, "logits", None)
+    if logits is None:
+        print("INFO: Model output did not include logits; skipping top-k logging.")
+        return None
+
+    if logits.size(1) < generated_length:
+        print("INFO: Unable to compute top-k probabilities; received fewer logits than generated tokens.")
+        return None
+
+    logits = logits[:, -generated_length:, :]
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    generated_ids = sequences_cpu[0, prompt_token_length:prompt_token_length + generated_length].tolist()
+
+    effective_k = min(topk, log_probs.size(-1))
+    steps_payload: List[Dict[str, Any]] = []
+
+    for step_idx, token_id in enumerate(generated_ids):
+        step_log_probs = log_probs[0, step_idx]
+        topk_log_probs, topk_indices = torch.topk(step_log_probs, k=effective_k)
+
+        actual_log_prob = float(step_log_probs[token_id].item())
+        actual_prob = math.exp(actual_log_prob)
+        actual_piece = _format_token_piece(tokenizer, token_id)
+
+        top_candidates: List[Dict[str, Any]] = []
+        topk_log_probs_cpu = topk_log_probs.detach().cpu()
+        topk_indices_cpu = topk_indices.detach().cpu()
+        for rank in range(effective_k):
+            candidate_id = int(topk_indices_cpu[rank].item())
+            candidate_log_prob = float(topk_log_probs_cpu[rank].item())
+            candidate_prob = math.exp(candidate_log_prob)
+            candidate_piece = _format_token_piece(tokenizer, candidate_id)
+            top_candidates.append(
+                {
+                    "rank": rank + 1,
+                    "token_id": candidate_id,
+                    "token": candidate_piece,
+                    "prob": candidate_prob,
+                    "log_prob": candidate_log_prob,
+                    "selected": candidate_id == token_id,
+                }
+            )
+
+        steps_payload.append(
+            {
+                "step": step_idx + 1,
+                "token_id": int(token_id),
+                "token": actual_piece,
+                "prob": actual_prob,
+                "log_prob": actual_log_prob,
+                "top_candidates": top_candidates,
+            }
+        )
+
+    return {
+        "topk": effective_k,
+        "prompt_token_length": prompt_token_length,
+        "generated_length": generated_length,
+        "vocab_size": log_probs.size(-1),
+        "steps": steps_payload,
+    }
+
+
+def print_topk_summary(payload: Dict[str, Any], max_steps: int = 5, max_candidates: int = 5) -> None:
+    """Emit a concise console summary of the recorded top-k statistics."""
+    steps = payload.get("steps") or []
+    if not steps:
+        print("INFO: No top-k token data available.")
+        return
+
+    print("=== Top-k Token Probabilities ===")
+    for step in steps[:max_steps]:
+        candidates = step.get("top_candidates") or []
+        pieces: List[str] = []
+        for candidate in candidates[:max_candidates]:
+            prob = candidate.get("prob")
+            token = candidate.get("token", "")
+            marker = " *" if candidate.get("selected") else ""
+            if isinstance(prob, (int, float)):
+                pieces.append(f"{token} ({prob:.3f}){marker}")
+            else:
+                pieces.append(f"{token}{marker}")
+        summary = ", ".join(pieces) if pieces else "(no candidates)"
+        print(f"Step {step.get('step')}: {summary}")
+
+    remaining = len(steps) - min(len(steps), max_steps)
+    if remaining > 0:
+        print(f"... {remaining} additional step(s) omitted from console output.")
+
+def append_topk_log(log_path: Path, payload: Dict[str, Any]) -> None:
+    """Append a JSON payload containing top-k statistics to the log file."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    needs_separator = log_path.exists() and log_path.stat().st_size > 0
+    with log_path.open("a", encoding="utf-8") as log_file:
+        if needs_separator:
+            log_file.write("\n")
+        log_file.write(serialized)
+        if not serialized.endswith("\n"):
+            log_file.write("\n")
+    print(f"Appended top-k token log to {log_path.resolve()}")
 
 def generate_turn(
     conv,
@@ -466,8 +641,13 @@ def generate_turn(
     base_gen_kwargs: dict,
     include_image_token: bool,
     stream_printer: Optional[Callable[[str], None]] = None,
-):
-    """Generate a response for a single user turn and update the conversation."""
+) -> Tuple[str, Optional[torch.Tensor], int]:
+    """Generate a response for a single user turn and update the conversation.
+
+    Returns:
+        Tuple containing the decoded response text, the full generated sequences tensor
+        (or None when streaming is used), and the length of the prompt tokens.
+    """
 
     prompt_text = prompt_text.strip()
     if not prompt_text:
@@ -492,6 +672,8 @@ def generate_turn(
     gen_kwargs = base_gen_kwargs.copy()
     gen_kwargs["inputs"] = input_ids
 
+    prompt_token_length = input_ids.shape[1]
+
     if stream_printer:
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         gen_kwargs["streamer"] = streamer
@@ -510,21 +692,22 @@ def generate_turn(
 
         thread.join()
         response = "".join(collected_chunks).strip()
+        sequences_tensor: Optional[torch.Tensor] = None
     else:
         with torch.inference_mode():
             generation_output = model.generate(**gen_kwargs)
-
-        if isinstance(generation_output, tuple):
-            output_ids = generation_output[0]
-        else:
-            output_ids = generation_output
-
-        generated_tokens = output_ids[0, input_ids.shape[1] :]
+        output_ids = _extract_sequences_from_generate_output(generation_output)
+        generated_tokens = output_ids[0, prompt_token_length:].tolist()
         response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        sequences_tensor = output_ids
+        # Print the response for non-streaming mode chunk by chunk
+        print("=== Model Response ===")
+        for chunk in response.split("\n"):
+            print(chunk)
 
     conv.messages[-1][1] = response
 
-    return response
+    return response, sequences_tensor, prompt_token_length
 
 
 def main() -> None:
@@ -569,8 +752,24 @@ def main() -> None:
     conv = conv_templates[conv_name].copy()
     conv.tokenizer = tokenizer
 
+    if args.log_topk_tokens < 0:
+        raise ValueError("--log-topk-tokens must be non-negative.")
+
+    topk_log_path: Optional[Path] = None
+    if args.log_topk_tokens > 0:
+        if args.log_topk_file:
+            topk_log_path = Path(args.log_topk_file)
+        elif args.save_output:
+            topk_log_path = Path(args.save_output).with_suffix(".topk.jsonl")
+        else:
+            topk_log_path = Path("topk_token_log.jsonl")
+        print(f"INFO: Top-k token statistics will be written to {topk_log_path}.")
+
     base_gen_kwargs = build_generation_kwargs(args, tokenizer, image_tensor, image_size)
     stream_output = not args.no_stream
+    if args.log_topk_tokens > 0 and stream_output:
+        print("INFO: Disabling streaming to enable top-k token logging.")
+        stream_output = False
 
     if args.chat and not prompt_text:
         try:
@@ -585,10 +784,52 @@ def main() -> None:
     def stream_printer(chunk: str) -> None:
         print(chunk, end="", flush=True)
 
+    def maybe_record_topk(
+        user_prompt: str,
+        response_text: str,
+        sequences_tensor: Optional[torch.Tensor],
+        prompt_token_length: int,
+        turn_id: int,
+    ) -> bool:
+        if args.log_topk_tokens <= 0 or sequences_tensor is None or topk_log_path is None:
+            print(f"DEBUG: Skipping top-k token logging for this turn due to:{' no logging requested' if args.log_topk_tokens <= 0 else ''}{' missing sequences tensor' if sequences_tensor is None else ''}{' no log path' if topk_log_path is None else ''}")
+            return False
+
+        payload = collect_topk_token_probabilities(
+            tokenizer,
+            model,
+            sequences_tensor,
+            prompt_token_length,
+            args.log_topk_tokens,
+            image_tensor,
+            image_size,
+        )
+
+        if payload is None:
+            return False
+
+        payload.update(
+            {
+                "turn_index": turn_id,
+                "mode": "chat" if args.chat else "single",
+                "prompt": user_prompt,
+                "response": response_text,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "image_path": image_path,
+                "model_path": args.model_path,
+            }
+        )
+
+        print_topk_summary(payload)
+        append_topk_log(topk_log_path, payload)
+        return True
+
+    turn_index = 0
+
     print("Generating response...")
     print("\n=== Model Response ===")
     if stream_output:
-        response = generate_turn(
+        response, sequences, prompt_token_length = generate_turn(
             conv,
             prompt_text,
             tokenizer,
@@ -601,7 +842,7 @@ def main() -> None:
         )
         print()
     else:
-        response = generate_turn(
+        response, sequences, prompt_token_length = generate_turn(
             conv,
             prompt_text,
             tokenizer,
@@ -612,6 +853,9 @@ def main() -> None:
             include_image_token=True,
         )
         print(response)
+
+    if maybe_record_topk(prompt_text, response, sequences, prompt_token_length, turn_index):
+        turn_index += 1
 
     if args.chat:
         while True:
@@ -630,7 +874,7 @@ def main() -> None:
 
             if stream_output:
                 print("\nAssistant> ", end="", flush=True)
-                response = generate_turn(
+                response, sequences, prompt_token_length = generate_turn(
                     conv,
                     next_prompt,
                     tokenizer,
@@ -643,7 +887,7 @@ def main() -> None:
                 )
                 print()
             else:
-                response = generate_turn(
+                response, sequences, prompt_token_length = generate_turn(
                     conv,
                     next_prompt,
                     tokenizer,
@@ -655,6 +899,9 @@ def main() -> None:
                 )
                 print("\nAssistant>")
                 print(response)
+
+            if maybe_record_topk(next_prompt, response, sequences, prompt_token_length, turn_index):
+                turn_index += 1
 
     gdino_payload = maybe_run_gdino(args, response, image_path)
     if gdino_payload is not None:
