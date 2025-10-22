@@ -599,18 +599,45 @@ def print_topk_summary(payload: Dict[str, Any], max_steps: int = 5, max_candidat
     if remaining > 0:
         print(f"... {remaining} additional step(s) omitted from console output.")
 
-def append_topk_log(log_path: Path, payload: Dict[str, Any]) -> None:
-    """Append a JSON payload containing top-k statistics to the log file."""
+def append_topk_log(log_path: Path, payload: Dict[str, Any], is_first_turn: bool = False, checkpoint_name: str = "", full_response: str = "", user_prompt: str = "") -> None:
+    """Append a JSON payload containing top-k statistics to the log file.
+    
+    If is_first_turn is True, creates a new file with metadata as the first entry.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
-    needs_separator = log_path.exists() and log_path.stat().st_size > 0
-    with log_path.open("a", encoding="utf-8") as log_file:
-        if needs_separator:
-            log_file.write("\n")
-        log_file.write(serialized)
-        if not serialized.endswith("\n"):
-            log_file.write("\n")
-    print(f"Appended top-k token log to {log_path.resolve()}")
+    
+    if is_first_turn:
+        # Create new file with metadata as first entry
+        metadata = {
+            "metadata": {
+                "checkpoint_name": checkpoint_name,
+                "prompt": user_prompt,
+                "full_response": full_response,
+                "timestamp": datetime.now().isoformat(),
+                "image_path": payload.get("image_path", ""),
+            }
+        }
+        
+        with log_path.open("w", encoding="utf-8") as log_file:
+            json.dump([metadata, payload], log_file, ensure_ascii=False, indent=2)
+        print(f"Created top-k token log at {log_path.resolve()}")
+    else:
+        # Append to existing file
+        if log_path.exists():
+            # Read existing content
+            with log_path.open("r", encoding="utf-8") as log_file:
+                try:
+                    data = json.load(log_file)
+                except json.JSONDecodeError:
+                    data = []
+        else:
+            data = []
+        
+        data.append(payload)
+        
+        with log_path.open("w", encoding="utf-8") as log_file:
+            json.dump(data, log_file, ensure_ascii=False, indent=2)
+        print(f"Appended top-k token log to {log_path.resolve()}")
 
 def generate_turn(
     conv,
@@ -747,10 +774,13 @@ def main() -> None:
     if args.log_topk_tokens > 0:
         if args.log_topk_file:
             topk_log_path = Path(args.log_topk_file)
-        elif args.save_output:
-            topk_log_path = Path(args.save_output).with_suffix(".topk.jsonl")
         else:
-            topk_log_path = Path("topk_token_log.jsonl")
+            # Create dedicated topk_logs folder
+            topk_dir = Path("topk_logs")
+            topk_dir.mkdir(parents=True, exist_ok=True)
+            # Generate timestamp for filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            topk_log_path = topk_dir / f"topk_log_{timestamp}.json"
         print(f"INFO: Top-k token statistics will be written to {topk_log_path}.")
 
     base_gen_kwargs = build_generation_kwargs(args, tokenizer, image_tensor, image_size)
@@ -811,7 +841,17 @@ def main() -> None:
         )
 
         print_topk_summary(payload)
-        append_topk_log(topk_log_path, payload)
+        # Pass additional metadata for first turn
+        is_first_turn = (turn_id == 0)
+        checkpoint_name = args.model_path if args.adapter_path is None else args.adapter_path
+        append_topk_log(
+            topk_log_path, 
+            payload, 
+            is_first_turn=is_first_turn,
+            checkpoint_name=checkpoint_name,
+            full_response=response_text,
+            user_prompt=user_prompt
+        )
         return True
 
     turn_index = 0
