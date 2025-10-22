@@ -90,6 +90,16 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
+def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only: bool = True):
+    """Collect non-LoRA parameters (optionally only trainable ones) from possibly ZeRO sharded models."""
+
+    to_return = {k: t for k, t in named_params if "lora_" not in k}
+    if require_grad_only:
+        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
+    to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
+    return to_return
+
+
 def split_to_even_chunks(indices, lengths, num_chunks):
     """
     Split a list of indices into `chunks` chunks of roughly equal lengths.
@@ -997,18 +1007,54 @@ class LLaVATrainer(Trainer):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
             weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+            for key in list(non_lora_weight_to_save.keys()):
+                if key in weight_to_save:
+                    del non_lora_weight_to_save[key]
 
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
-                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(output_dir, "mm_projector.bin"))
+                if non_lora_weight_to_save:
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+
+            if getattr(self.args, "lora_enable", False):
+                from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+                checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+                run_dir = self._get_output_dir(trial=trial)
+                output_dir = os.path.join(run_dir, checkpoint_folder)
+
+                non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+                if non_lora_weight_to_save:
+                    os.makedirs(output_dir, exist_ok=True)
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
+                    projector_weights = {k: v for k, v in non_lora_weight_to_save.items() if "mm_projector" in k or "vision_resampler" in k}
+                    if projector_weights:
+                        torch.save(projector_weights, os.path.join(output_dir, "mm_projector.bin"))
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+
+        target_model = model if model is not None else self.model
+        if target_model is None:
+            return
+
+        non_lora_path = os.path.join(resume_from_checkpoint, "non_lora_trainables.bin")
+        if os.path.isfile(non_lora_path):
+            state_dict = torch.load(non_lora_path, map_location="cpu")
+            if state_dict:
+                load_result = target_model.load_state_dict(state_dict, strict=False)
+                self._issue_warnings_after_load(load_result)
 
     def _move_model_to_device(self, model: nn.Module, device: torch.device) -> None:
         """
@@ -1066,10 +1112,17 @@ class LLaVADPOTrainer(DPOTrainer):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
             weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+            for key in list(non_lora_weight_to_save.keys()):
+                if key in weight_to_save:
+                    del non_lora_weight_to_save[key]
 
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
-                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(output_dir, "mm_projector.bin"))
+                if non_lora_weight_to_save:
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
         else:
             # super(LLaVADPOTrainer, self)._save_checkpoint(model, trial, metrics)
             # print(type(model))
@@ -1085,6 +1138,13 @@ class LLaVADPOTrainer(DPOTrainer):
                 from transformers.modeling_utils import unwrap_model
 
                 unwrapped_model = unwrap_model(model)
+                non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+                if non_lora_weight_to_save:
+                    os.makedirs(output_dir, exist_ok=True)
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
+                    projector_weights = {k: v for k, v in non_lora_weight_to_save.items() if "mm_projector" in k or "vision_resampler" in k}
+                    if projector_weights:
+                        torch.save(projector_weights, os.path.join(output_dir, "mm_projector.bin"))
                 self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
             else:
                 super(LLaVADPOTrainer, self)._save_checkpoint(model, trial, metrics)
@@ -1094,3 +1154,17 @@ class LLaVADPOTrainer(DPOTrainer):
             pass
         else:
             super(LLaVADPOTrainer, self)._save(output_dir, state_dict)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+
+        target_model = model if model is not None else self.model
+        if target_model is None:
+            return
+
+        non_lora_path = os.path.join(resume_from_checkpoint, "non_lora_trainables.bin")
+        if os.path.isfile(non_lora_path):
+            state_dict = torch.load(non_lora_path, map_location="cpu")
+            if state_dict:
+                load_result = target_model.load_state_dict(state_dict, strict=False)
+                self._issue_warnings_after_load(load_result)

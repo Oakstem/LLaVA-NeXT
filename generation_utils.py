@@ -5,7 +5,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 import copy
-from typing import Dict, List, Optional, Any, Tuple, Union
+from typing import Dict, List, Optional, Any, Tuple, Union, Set
 
 import torch
 import cv2
@@ -97,6 +97,131 @@ from generation_metrics import (
     generate_next_token_with_evaluation, create_generation_summary,
     analyze_generation_quality, calculate_attention_correlation_from_similarity
 )
+
+
+def _strip_prefix_if_present(value: str, prefix: str) -> str:
+    return value[len(prefix):] if value.startswith(prefix) else value
+
+
+def _normalize_sidecar_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    normalized = {_strip_prefix_if_present(key, "base_model."): tensor for key, tensor in state_dict.items()}
+    if any(key.startswith("model.model.") for key in normalized):
+        normalized = {
+            (_strip_prefix_if_present(key, "model.") if key.startswith("model.") else key): tensor
+            for key, tensor in normalized.items()
+        }
+    return normalized
+
+
+def _load_state_subset(
+    model: PreTrainedModel,
+    weights_path: Path,
+    description: str,
+    cast_to_model_dtype: bool = False,
+    already_loaded: Optional[Set[str]] = None,
+) -> bool:
+    if weights_path is None or not weights_path.is_file():
+        return False
+
+    state_dict = torch.load(weights_path, map_location="cpu")
+
+    if not isinstance(state_dict, dict) or len(state_dict) == 0:
+        print(f"INFO: {description} file at {weights_path} is empty; skipping.")
+        return False
+
+    state_dict = _normalize_sidecar_state_dict(state_dict)
+    if already_loaded is not None:
+        state_dict = {key: tensor for key, tensor in state_dict.items() if key not in already_loaded}
+    if cast_to_model_dtype and state_dict:
+        model_dtype = next(model.parameters()).dtype
+        state_dict = {
+            key: (tensor.to(model_dtype) if torch.is_tensor(tensor) and tensor.is_floating_point() else tensor)
+            for key, tensor in state_dict.items()
+        }
+
+    load_result = model.load_state_dict(state_dict, strict=False)
+    unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
+
+    loaded_keys = sorted(set(state_dict.keys()) - set(unexpected_keys))
+    if already_loaded is not None:
+        already_loaded.update(loaded_keys)
+    if loaded_keys:
+        preview = ", ".join(loaded_keys[:8])
+        suffix = " ..." if len(loaded_keys) > 8 else ""
+        print(f"Loaded {len(loaded_keys)} parameter tensors for {description}: {preview}{suffix}")
+    else:
+        print(f"INFO: No matching parameters applied from {description}.")
+
+    if unexpected_keys:
+        preview = ", ".join(unexpected_keys[:8])
+        suffix = " ..." if len(unexpected_keys) > 8 else ""
+        print(f"WARNING: Unexpected keys while loading {description}: {preview}{suffix}")
+
+    return True
+
+
+def maybe_apply_additional_trainables(model: PreTrainedModel, adapter_location: Optional[str]) -> None:
+    if not adapter_location:
+        return
+
+    adapter_path = Path(adapter_location)
+    if adapter_path.is_file():
+        base_dir = adapter_path.parent
+    elif adapter_path.is_dir():
+        base_dir = adapter_path
+    else:
+        print(f"INFO: Adapter path {adapter_location} not found; skipping sidecar weights.")
+        return
+
+    candidate_dirs: List[Path] = []
+    seen_dirs: Set[Path] = set()
+
+    def _append_dir(path: Path) -> None:
+        if not path.exists():
+            return
+        resolved = path.resolve()
+        if resolved in seen_dirs:
+            return
+        seen_dirs.add(resolved)
+        candidate_dirs.append(path)
+
+    _append_dir(base_dir)
+    parent = base_dir.parent
+    if parent != base_dir:
+        _append_dir(parent)
+
+    candidate_non_lora_files: List[Path] = []
+    candidate_mm_projector_files: List[Path] = []
+
+    for directory in candidate_dirs:
+        candidate_non_lora_files.append(directory / "non_lora_trainables.bin")
+        candidate_mm_projector_files.append(directory / "mm_projector.bin")
+
+        if directory.name.startswith("checkpoint-"):
+            parent_dir = directory.parent
+            candidate_non_lora_files.append(parent_dir / "non_lora_trainables" / f"{directory.name}.bin")
+            candidate_mm_projector_files.append(parent_dir / "mm_projector" / f"{directory.name}.bin")
+
+    def _try_candidates(files: List[Path], description: str, cast: bool = False, already_loaded: Optional[Set[str]] = None) -> bool:
+        seen: Set[Path] = set()
+        for candidate in files:
+            if not candidate.exists():
+                continue
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if resolved.is_file() and _load_state_subset(model, resolved, description, cast_to_model_dtype=cast, already_loaded=already_loaded):
+                return True
+        return False
+
+    loaded_keys: Set[str] = set()
+
+    if not _try_candidates(candidate_non_lora_files, "non-LoRA trainable weights", already_loaded=loaded_keys):
+        print("INFO: No non-LoRA trainable weights found alongside adapter.")
+
+    if not _try_candidates(candidate_mm_projector_files, "mm_projector weights", cast=True, already_loaded=loaded_keys):
+        print("INFO: No mm_projector weights found alongside adapter.")
 
 def enable_inference_optimizations() -> None:
     """Enable tf32 and other CUDA optimizations for faster inference"""
@@ -645,6 +770,8 @@ def load_model_and_setup(
                 overwrite_config=custom_config,
                 **llava_model_args
             )
+
+        maybe_apply_additional_trainables(model, adapter_path)
 
         try:
             from peft import PeftModel

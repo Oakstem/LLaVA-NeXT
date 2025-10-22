@@ -6,15 +6,6 @@ Core multimodal code lives in `llava/`: `model/` handles architectures and check
 ## Build, Test, and Development Commands
 Use the existing Python environment at `/galitylab/students/alonmardi/llava/bin/python` for all commands. Do not create new environments or reinstall packages in this repo.
 
-Launch the chat CLI to sanity-check checkpoints:
-```bash
-/galitylab/students/alonmardi/llava/bin/python -m llava.serve.cli --model-path lmms-lab/LLaVA-NeXT-Video-7B-DPO --image-file path/to/sample.jpg
-```
-Run the Python unit suite (mock-heavy, CPU-safe):
-```bash
-/galitylab/students/alonmardi/llava/bin/python -m unittest discover -s tests -p 'test_*.py'
-```
-
 ## Coding Style & Naming Conventions
 Follow standard Python style with 4-space indentation and `snake_case` functions. Run `black` (line length 240 as defined in `pyproject.toml`) before pushing. Prefer explicit typing on new APIs and reuse existing dataclass or helper patterns already used in `llava/model`. Name scripts with descriptive verbs (e.g., `generate_*`, `extract_*`) and keep modules import-safe.
 

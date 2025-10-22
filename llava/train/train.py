@@ -587,6 +587,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(trainer.model.named_parameters())
+        for key in list(non_lora_weight_to_save.keys()):
+            if key in weight_to_save:
+                del non_lora_weight_to_save[key]
         trainer.model.config.save_pretrained(output_dir)
 
         current_folder = output_dir.split("/")[-1]
@@ -595,9 +599,17 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
             if current_folder.startswith("checkpoint-"):
                 mm_projector_folder = os.path.join(parent_folder, "mm_projector")
                 os.makedirs(mm_projector_folder, exist_ok=True)
-                torch.save(weight_to_save, os.path.join(mm_projector_folder, f"{current_folder}.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(mm_projector_folder, f"{current_folder}.bin"))
+                if non_lora_weight_to_save:
+                    non_lora_folder = os.path.join(parent_folder, "non_lora_trainables")
+                    os.makedirs(non_lora_folder, exist_ok=True)
+                    torch.save(non_lora_weight_to_save, os.path.join(non_lora_folder, f"{current_folder}.bin"))
             else:
-                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(output_dir, "mm_projector.bin"))
+                if non_lora_weight_to_save:
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
         return
 
     if trainer.deepspeed:
