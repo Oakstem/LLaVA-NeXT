@@ -281,7 +281,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus sampling value.")
     parser.add_argument("--num-beams", type=int, default=1, help="Number of beams for beam search decoding.")
     parser.add_argument("--do-sample", action="store_true", help="Enable sampling instead of greedy decoding.")
-    parser.add_argument("--log-topk-tokens", type=int, default=5, help="Log the top-K token probabilities for each generated step (0 to disable).")
+    parser.add_argument("--log-topk-tokens", type=int, default=3, help="Log the top-K token probabilities for each generated step (0 to disable).")
     parser.add_argument("--log-topk-file", default=None, help="Optional path to write top-K token statistics as JSON Lines.")
     parser.add_argument("--disable-optimizations", action="store_true", help="Skip enabling CUDA inference optimizations.")
     parser.add_argument("--save-output", default=None, help="Optional path to save the generated text as JSON (with keys image, prompt, response).")
@@ -468,9 +468,9 @@ def build_generation_kwargs(args: argparse.Namespace, tokenizer, image_tensor: t
 def _extract_sequences_from_generate_output(output: Any) -> torch.Tensor:
     """Normalize different generate outputs to a sequences tensor."""
     if hasattr(output, "sequences"):
-        return output.sequences
+        return output.sequences[0]
     if isinstance(output, torch.Tensor):
-        return output
+        return output[0]
     if isinstance(output, (list, tuple)) and output:
         return output[0]
     raise TypeError(f"Unsupported generation output type: {type(output)!r}")
@@ -488,6 +488,7 @@ def collect_topk_token_probabilities(
     tokenizer,
     model,
     sequences: torch.Tensor,
+    logits: Optional[torch.Tensor],
     prompt_token_length: int,
     topk: int,
     image_tensor: torch.Tensor,
@@ -505,44 +506,24 @@ def collect_topk_token_probabilities(
         return None
 
     sequences_cpu = sequences.detach().cpu()
-    generated_length = sequences_cpu.size(1) - prompt_token_length
+    generated_length = sequences_cpu.size(1) - 1
     if generated_length <= 0:
         print("INFO: No generated tokens to log.")
         return None
 
-    if hasattr(model, "device"):
-        model_device = model.device
-    else:
-        model_device = next(model.parameters()).device
-    sequences_device = sequences.to(model_device)
-    inputs = sequences_device[:, :-1]
-    attention_mask = torch.ones_like(inputs, dtype=torch.long, device=model_device)
-
-    model_inputs = {
-        "input_ids": inputs,
-        "attention_mask": attention_mask,
-        "images": image_tensor,
-        "image_sizes": [list(image_size)],
-    }
-
-    with torch.inference_mode():
-        outputs = model(**model_inputs)
-
-    logits = getattr(outputs, "logits", None)
     if logits is None:
         print("INFO: Model output did not include logits; skipping top-k logging.")
         return None
 
-    if logits.size(1) < generated_length:
-        print("INFO: Unable to compute top-k probabilities; received fewer logits than generated tokens.")
-        return None
+    # if logits.size(1) < generated_length:
+    #     print("INFO: Unable to compute top-k probabilities; received fewer logits than generated tokens.")
+    #     return None
 
-    logits = logits[:, -generated_length:, :]
     log_probs = F.log_softmax(logits, dim=-1)
 
-    generated_ids = sequences_cpu[0, prompt_token_length:prompt_token_length + generated_length].tolist()
+    generated_ids = sequences_cpu[0, :].tolist()
 
-    effective_k = min(topk, log_probs.size(-1))
+    effective_k = min(topk, log_probs.shape[-1])
     steps_payload: List[Dict[str, Any]] = []
 
     for step_idx, token_id in enumerate(generated_ids):
@@ -671,6 +652,7 @@ def generate_turn(
 
     gen_kwargs = base_gen_kwargs.copy()
     gen_kwargs["inputs"] = input_ids
+    gen_kwargs["output_scores"] = True
 
     prompt_token_length = input_ids.shape[1]
 
@@ -697,17 +679,23 @@ def generate_turn(
         with torch.inference_mode():
             generation_output = model.generate(**gen_kwargs)
         output_ids = _extract_sequences_from_generate_output(generation_output)
-        generated_tokens = output_ids[0, prompt_token_length:].tolist()
-        response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        # generated_tokens = output_ids.tolist()
+        response = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
         sequences_tensor = output_ids
-        # Print the response for non-streaming mode chunk by chunk
-        print("=== Model Response ===")
-        for chunk in response.split("\n"):
-            print(chunk)
+        if 'scores' in generation_output:
+            # generation_output.scores is typically a tuple/list of per-step logits tensors
+            # Stack them into a single tensor of shape (batch_size, seq_len, vocab_size)
+            scores = getattr(generation_output, "scores", None)
+            if isinstance(scores, (tuple, list)):
+                logits = torch.stack(list(scores), dim=1)
+            else:
+                logits = scores
+        else:
+            logits = None
 
     conv.messages[-1][1] = response
 
-    return response, sequences_tensor, prompt_token_length
+    return response, sequences_tensor, prompt_token_length, logits
 
 
 def main() -> None:
@@ -788,6 +776,7 @@ def main() -> None:
         user_prompt: str,
         response_text: str,
         sequences_tensor: Optional[torch.Tensor],
+        logits: Optional[torch.Tensor],
         prompt_token_length: int,
         turn_id: int,
     ) -> bool:
@@ -799,6 +788,7 @@ def main() -> None:
             tokenizer,
             model,
             sequences_tensor,
+            logits,
             prompt_token_length,
             args.log_topk_tokens,
             image_tensor,
@@ -829,7 +819,7 @@ def main() -> None:
     print("Generating response...")
     print("\n=== Model Response ===")
     if stream_output:
-        response, sequences, prompt_token_length = generate_turn(
+        response, sequences, prompt_token_length, logits = generate_turn(
             conv,
             prompt_text,
             tokenizer,
@@ -842,7 +832,7 @@ def main() -> None:
         )
         print()
     else:
-        response, sequences, prompt_token_length = generate_turn(
+        response, sequences, prompt_token_length, logits = generate_turn(
             conv,
             prompt_text,
             tokenizer,
@@ -854,7 +844,7 @@ def main() -> None:
         )
         print(response)
 
-    if maybe_record_topk(prompt_text, response, sequences, prompt_token_length, turn_index):
+    if maybe_record_topk(prompt_text, response, sequences, logits, prompt_token_length, turn_index):
         turn_index += 1
 
     if args.chat:
@@ -874,7 +864,7 @@ def main() -> None:
 
             if stream_output:
                 print("\nAssistant> ", end="", flush=True)
-                response, sequences, prompt_token_length = generate_turn(
+                response, sequences, prompt_token_length, logits = generate_turn(
                     conv,
                     next_prompt,
                     tokenizer,
@@ -887,7 +877,7 @@ def main() -> None:
                 )
                 print()
             else:
-                response, sequences, prompt_token_length = generate_turn(
+                response, sequences, prompt_token_length, logits = generate_turn(
                     conv,
                     next_prompt,
                     tokenizer,
