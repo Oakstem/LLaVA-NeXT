@@ -3,7 +3,8 @@
 #SBATCH --output=logs/vanilla_inference_%j.out
 #SBATCH --error=logs/vanilla_inference_%j.err
 #SBATCH --time=00:10:00
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu-tad-pool
+#SBATCH --qos=owner
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=10G

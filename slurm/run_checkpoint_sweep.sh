@@ -406,7 +406,8 @@ for idx in "${!checkpoint_paths[@]}"; do
 #SBATCH --output=$PROJECT_ROOT/logs/${sanitized_name}_%j.out
 #SBATCH --error=$PROJECT_ROOT/logs/${sanitized_name}_%j.err
 #SBATCH --time=$JOB_TIME
-#SBATCH --partition=gpu-tad
+#SBATCH --partition=gpu-tad-pool
+#SBATCH --qos=owner
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=$JOB_MEM
