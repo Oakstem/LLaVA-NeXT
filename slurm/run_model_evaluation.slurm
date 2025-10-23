@@ -13,7 +13,7 @@
 # Configuration variables - modify these as needed
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-ADAPTER_PATH="${ADAPTER_PATH:-}"
+ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20251022_130502/checkpoint-14000}"
 # Prompt for adapter path if not set
 if [ -z "$ADAPTER_PATH" ]; then
     echo "=========================================="
@@ -54,7 +54,7 @@ QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 # Dataset parameters
 DATASET_JSON="${DATASET_JSON:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/val.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-LIMIT="${LIMIT:-20}"  # Set to a number to limit samples for testing (e.g., 100)
+LIMIT="${LIMIT:-1000}"  # Set to a number to limit samples for testing (e.g., 100)
 
 # Generation parameters
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"

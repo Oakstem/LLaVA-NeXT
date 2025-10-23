@@ -7,10 +7,10 @@ with images, calculating various metrics and saving detailed results.
 """
 
 import argparse
-import csv
 import importlib
 import importlib.util
 import json
+import statistics
 import sys
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
@@ -28,6 +28,12 @@ from gazefollow.auto_phrase_grounding.detect_gaze_targets import (
     normalize_person_description,
     normalize_gaze_target_text,
     run_grounding_dino_detection,
+)
+from gazefollow.gaze_metrics import (
+    load_combined_description_cache,
+    ensure_ground_truth_gaze,
+    compute_gaze_errors,
+    persist_ground_truth_updates,
 )
 
 # Ensure project root is importable
@@ -54,36 +60,6 @@ from llava.constants import (
 from llava.conversation import conv_templates
 
 # Import metrics calculation if available
-METRICS_AVAILABLE = False
-_metrics_spec = importlib.util.find_spec("generation_metrics")
-if _metrics_spec is not None:
-    calculate_metrics = importlib.import_module("generation_metrics").calculate_metrics
-    METRICS_AVAILABLE = True
-else:
-    print("Warning: generation_metrics module not available. Only basic evaluation will be performed.")
-
-COMBINED_CSV_PATH = Path("/galitylab/students/alonmardi/projects/LLaVA-NeXT/combined_description_results.csv")
-_combined_dataset_cache: Optional[Dict[str, Dict[str, str]]] = None
-
-
-def load_combined_description_cache() -> Dict[str, Dict[str, str]]:
-    global _combined_dataset_cache
-    if _combined_dataset_cache is None:
-        mapping: Dict[str, Dict[str, str]] = {}
-        if COMBINED_CSV_PATH.exists():
-            with open(COMBINED_CSV_PATH, "r", encoding="utf-8") as csv_file:
-                reader = csv.DictReader(csv_file)
-                for row in reader:
-                    rel_path = row.get("image_path.1")
-                    if not rel_path:
-                        continue
-                    key = rel_path.strip()
-                    if key:
-                        mapping[key] = row
-        else:
-            print(f"Warning: Combined description CSV not found at {COMBINED_CSV_PATH}")
-        _combined_dataset_cache = mapping
-    return _combined_dataset_cache
 
 def load_wandb_config_from_checkpoint(model_path: str) -> Dict[str, Any]:
     """
@@ -178,13 +154,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gaze-box-threshold",
         type=float,
-        default=0.3,
+        default=0.2,
         help="Confidence threshold for GroundingDINO bounding boxes.",
     )
     parser.add_argument(
         "--gaze-text-threshold",
         type=float,
-        default=0.25,
+        default=0.20,
         help="Text confidence threshold for GroundingDINO detections.",
     )
     parser.add_argument(
@@ -760,10 +736,6 @@ def evaluate_dataset_for_training(
     if predictions:
         basic_metrics = calculate_basic_metrics(predictions, ground_truths)
         metrics.update(basic_metrics)
-        
-        if METRICS_AVAILABLE:
-            advanced_metrics = calculate_metrics(predictions, ground_truths)
-            metrics.update(advanced_metrics)
     
     if losses:
         metrics.update({
@@ -926,9 +898,6 @@ def main():
             gaze_processor_local, gaze_model_local = load_grounding_dino(args.gaze_model_id, gaze_device)
             gaze_processor = gaze_processor_local
             gaze_model = gaze_model_local
-        else:
-            if args.verbose:
-                print("GroundingDINO model already loaded.")
 
         return gaze_processor, gaze_model
 
@@ -944,6 +913,12 @@ def main():
     failed_samples = []
     evaluation_results = []
     losses = []
+    gaze_l2_errors: List[float] = []
+    gaze_normalized_l2_errors: List[float] = []
+    gaze_angular_errors: List[float] = []
+    dataset_updated = False
+    combined_cache: Optional[Dict[str, Dict[str, str]]] = None
+    dataset_gt_updates: List[Dict[str, Any]] = []
     
     start_time = time.time()
     
@@ -1019,7 +994,54 @@ def main():
                 })
                 continue
 
-            image_tensor, image_size, pil_image = image_result
+        image_tensor, image_size, pil_image = image_result
+
+        try:
+            relative_image_path = str(full_image_path.relative_to(images_dir))
+        except ValueError:
+            relative_image_path = str(full_image_path)
+        relative_image_path = relative_image_path.replace("\\", "/")
+
+        image_width_px, image_height_px = pil_image.size
+
+        mapping_ref = combined_cache if combined_cache is not None else {}
+        ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
+            sample,
+            relative_image_path,
+            image_width_px,
+            image_height_px,
+            mapping_ref,
+        )
+        if ground_truth_gaze is None and combined_cache is None:
+            combined_cache = load_combined_description_cache()
+            mapping_ref = combined_cache
+            ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
+                sample,
+                relative_image_path,
+                image_width_px,
+                image_height_px,
+                mapping_ref,
+            )
+        if gt_updated and ground_truth_gaze:
+            dataset_updated = True
+            dataset_gt_updates.append(
+                {
+                    "id": sample.get("id"),
+                    "image": sample.get("image"),
+                    "relative_path": relative_image_path,
+                    "values": {
+                        "gaze_gt_x": ground_truth_gaze[0],
+                        "gaze_gt_y": ground_truth_gaze[1],
+                        "gaze_gt_width": ground_truth_gaze[2],
+                        "gaze_gt_height": ground_truth_gaze[3],
+                    },
+                }
+            )
+
+        ground_truth_point: Optional[Tuple[float, float]] = None
+        if ground_truth_gaze:
+            gt_x, gt_y, image_width_px, image_height_px = ground_truth_gaze
+            ground_truth_point = (gt_x, gt_y)
 
             prediction = None
             if should_generate_predictions:
@@ -1073,6 +1095,13 @@ def main():
                 result["prediction"] = prediction
             if sample_loss is not None:
                 result["loss"] = sample_loss
+            if ground_truth_point is not None:
+                result["gaze_ground_truth"] = {
+                    "x": ground_truth_point[0],
+                    "y": ground_truth_point[1],
+                    "image_width": image_width_px,
+                    "image_height": image_height_px,
+                }
             evaluation_results.append(result)
 
             if generate_model_results:
@@ -1111,6 +1140,13 @@ def main():
                 }
                 if sample_loss is not None:
                     model_generation_entry["loss"] = sample_loss
+                if ground_truth_point is not None:
+                    model_generation_entry["gaze_ground_truth"] = {
+                        "x": ground_truth_point[0],
+                        "y": ground_truth_point[1],
+                        "image_width": image_width_px,
+                        "image_height": image_height_px,
+                    }
 
                 if person_descriptions:
                     for person in person_descriptions:
@@ -1137,6 +1173,25 @@ def main():
                             "person_coordinates": person_box,
                             "person_score": person_score,
                         }
+                        if ground_truth_point is not None:
+                            errors = compute_gaze_errors(
+                                predicted_box=gaze_info.get("coordinates"),
+                                person_box=person_box,
+                                ground_truth_point=ground_truth_point,
+                                image_width=image_width_px,
+                                image_height=image_height_px,
+                            )
+                            processed_people[person.person_id]["gaze_ground_truth"] = {
+                                "x": ground_truth_point[0],
+                                "y": ground_truth_point[1],
+                            }
+                            processed_people[person.person_id].update(errors)
+                            if errors["gaze_l2_error"] is not None:
+                                gaze_l2_errors.append(errors["gaze_l2_error"])
+                            if errors["gaze_normalized_l2_error"] is not None:
+                                gaze_normalized_l2_errors.append(errors["gaze_normalized_l2_error"])
+                            if errors["gaze_angular_error"] is not None:
+                                gaze_angular_errors.append(errors["gaze_angular_error"])
 
                 model_generation_records.append(model_generation_entry)
 
@@ -1149,6 +1204,9 @@ def main():
                     print("Prediction: [skipped - generation disabled]")
                 if sample_loss is not None:
                     print(f"Loss: {sample_loss:.6f}")
+                l2_error = result.get("gaze_l2_error")
+                if l2_error is not None:
+                    print(f"L2 error: {round(float(l2_error), 2)}")
                 print("-" * 40)
 
             if isinstance(pil_image, Image.Image):
@@ -1180,13 +1238,8 @@ def main():
     if predictions:
         basic_metrics = calculate_basic_metrics(predictions, ground_truths)
         
-        advanced_metrics = {}
-        if METRICS_AVAILABLE:
-            advanced_metrics = calculate_metrics(predictions, ground_truths)
-        
-        
         # Combine all metrics
-        final_metrics = {**basic_metrics, **advanced_metrics, **loss_metrics}
+        final_metrics = {**basic_metrics, **loss_metrics}
         
         # Add evaluation statistics
         total_processed = len(evaluation_results)  # Total samples that were successfully processed (regardless of prediction generation)
@@ -1224,6 +1277,27 @@ def main():
 
     if generate_model_results:
         final_metrics["model_generation_samples"] = len(model_generation_records)
+
+    if gaze_l2_errors:
+        final_metrics["gaze_l2_error_mean"] = sum(gaze_l2_errors) / len(gaze_l2_errors)
+        final_metrics["gaze_l2_error_median"] = statistics.median(gaze_l2_errors)
+        final_metrics["gaze_l2_error_count"] = len(gaze_l2_errors)
+    if gaze_normalized_l2_errors:
+        final_metrics["gaze_l2_normalized_mean"] = sum(gaze_normalized_l2_errors) / len(gaze_normalized_l2_errors)
+        final_metrics["gaze_l2_normalized_median"] = statistics.median(gaze_normalized_l2_errors)
+        final_metrics["gaze_l2_normalized_count"] = len(gaze_normalized_l2_errors)
+    if gaze_angular_errors:
+        final_metrics["gaze_angular_error_mean"] = sum(gaze_angular_errors) / len(gaze_angular_errors)
+        final_metrics["gaze_angular_error_median"] = statistics.median(gaze_angular_errors)
+        final_metrics["gaze_angular_error_count"] = len(gaze_angular_errors)
+
+    if dataset_updated and dataset_gt_updates:
+        try:
+            persisted = persist_ground_truth_updates(Path(args.dataset_json), dataset_gt_updates)
+            if persisted:
+                print(f"Persisted gaze ground truth for {persisted} samples to {args.dataset_json}")
+        except Exception as exc:
+            print(f"Warning: Failed to update dataset with gaze ground truth: {exc}")
     
     # Print results
     print("\n" + "=" * 60)
@@ -1238,15 +1312,6 @@ def main():
                 print(f"  {metric_name}: {value:.4f}")
             else:
                 print(f"  {metric_name}: {value}")
-        
-        # Print advanced metrics if available
-        if advanced_metrics:
-            print("\n🔍 ADVANCED METRICS:")
-            for metric_name, value in advanced_metrics.items():
-                if isinstance(value, float):
-                    print(f"  {metric_name}: {value:.4f}")
-                else:
-                    print(f"  {metric_name}: {value}")
     else:
         print("\n📊 PREDICTION METRICS: No predictions generated (generation disabled)")
     
