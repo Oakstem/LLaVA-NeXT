@@ -13,14 +13,48 @@
 # Configuration variables - modify these as needed
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20251013_201208/checkpoint-12000}"
+ADAPTER_PATH="${ADAPTER_PATH:-}"
+# Prompt for adapter path if not set
+if [ -z "$ADAPTER_PATH" ]; then
+    echo "=========================================="
+    echo "Available recent checkpoints:"
+    
+    mapfile -t checkpoints < <(ls -dt /galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-*/checkpoint-* 2>/dev/null | head -10)
+    
+    if [ ${#checkpoints[@]} -eq 0 ]; then
+        echo "No checkpoints found."
+        ADAPTER_PATH=""
+    else
+        for i in "${!checkpoints[@]}"; do
+            echo "  [$i] ${checkpoints[$i]}"
+        done
+        
+        echo "  [-1] No adapter (base model only)"
+        echo "=========================================="
+        echo "Default: [0] ${checkpoints[0]}"
+        read -p "Enter checkpoint number, -1 for no adapter, full path, or press Enter for default: " user_input
+        
+        if [ -z "$user_input" ]; then
+            ADAPTER_PATH="${checkpoints[0]}"
+            echo "Selected: $ADAPTER_PATH"
+        elif [ "$user_input" = "-1" ]; then
+            ADAPTER_PATH=""
+            echo "Selected: No adapter (base model only)"
+        elif [[ "$user_input" =~ ^[0-9]+$ ]] && [ "$user_input" -lt "${#checkpoints[@]}" ]; then
+            ADAPTER_PATH="${checkpoints[$user_input]}"
+            echo "Selected: $ADAPTER_PATH"
+        else
+            ADAPTER_PATH="$user_input"
+        fi
+    fi
+fi
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 
 # Dataset parameters
 DATASET_JSON="${DATASET_JSON:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/val.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-LIMIT="${LIMIT:-}"  # Set to a number to limit samples for testing (e.g., 100)
+LIMIT="${LIMIT:-20}"  # Set to a number to limit samples for testing (e.g., 100)
 
 # Generation parameters
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
@@ -38,6 +72,12 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 VERBOSE="${VERBOSE:-true}"
 SAFE_MODE="${SAFE_MODE:-true}"  # Enable safe mode by default for CUDA stability
 WANDB="${WANDB:-true}"  # Set to true to enable wandb logging
+GENERATE_MODEL_RESULTS="${GENERATE_MODEL_RESULTS:-true}"
+PROMPT_OVERRIDE="${PROMPT_OVERRIDE:-}"
+GAZE_MODEL_ID="${GAZE_MODEL_ID:-IDEA-Research/grounding-dino-base}"
+GAZE_BOX_THRESHOLD="${GAZE_BOX_THRESHOLD:-0.20}"
+GAZE_TEXT_THRESHOLD="${GAZE_TEXT_THRESHOLD:-0.20}"
+GAZE_DEVICE="${GAZE_DEVICE:-}"
 
 # Create necessary directories
 mkdir -p logs
@@ -80,6 +120,15 @@ echo "  Batch Size: $BATCH_SIZE"
 echo "  Verbose: $VERBOSE"
 echo "  Safe Mode: $SAFE_MODE"
 echo "  Log to Wandb: $WANDB"
+echo "  Generate Model Results: $GENERATE_MODEL_RESULTS"
+if [ -n "$PROMPT_OVERRIDE" ]; then
+    echo "  Prompt Override: $PROMPT_OVERRIDE"
+fi
+echo "Gaze Detection:"
+echo "  Model ID: $GAZE_MODEL_ID"
+echo "  Box Threshold: $GAZE_BOX_THRESHOLD"
+echo "  Text Threshold: $GAZE_TEXT_THRESHOLD"
+echo "  Device: ${GAZE_DEVICE:-auto}"
 echo "=========================================="
 
 # Validate required files exist
@@ -210,6 +259,30 @@ if [ "$WANDB" = "true" ]; then
     ARGS+=("--log-to-wandb")
 fi
 
+if [ "$GENERATE_MODEL_RESULTS" = "true" ]; then
+    ARGS+=("--generate-model-results")
+fi
+
+if [ -n "$PROMPT_OVERRIDE" ]; then
+    ARGS+=("--prompt-override" "$PROMPT_OVERRIDE")
+fi
+
+if [ -n "$GAZE_MODEL_ID" ]; then
+    ARGS+=("--gaze-model-id" "$GAZE_MODEL_ID")
+fi
+
+if [ -n "$GAZE_BOX_THRESHOLD" ]; then
+    ARGS+=("--gaze-box-threshold" "$GAZE_BOX_THRESHOLD")
+fi
+
+if [ -n "$GAZE_TEXT_THRESHOLD" ]; then
+    ARGS+=("--gaze-text-threshold" "$GAZE_TEXT_THRESHOLD")
+fi
+
+if [ -n "$GAZE_DEVICE" ]; then
+    ARGS+=("--gaze-device" "$GAZE_DEVICE")
+fi
+
 # Print the command that will be executed
 echo "=========================================="
 echo "Executing evaluation command:"
@@ -284,6 +357,9 @@ except Exception as e:
     echo "  cat $OUTPUT_DIR/metrics.json"
     if [ "$SAVE_PREDICTIONS" = "true" ]; then
         echo "  head $OUTPUT_DIR/predictions.json"
+    fi
+    if [ "$GENERATE_MODEL_RESULTS" = "true" ]; then
+        echo "  head $OUTPUT_DIR/model_generation_results.json"
     fi
     
 else

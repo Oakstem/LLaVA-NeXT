@@ -7,6 +7,9 @@ with images, calculating various metrics and saving detailed results.
 """
 
 import argparse
+import csv
+import importlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -16,7 +19,16 @@ import torch
 import time
 import os
 import math
-import re
+from PIL import Image
+
+from gazefollow.auto_phrase_grounding.detect_gaze_targets import (
+    detect_gaze_targets,
+    load_grounding_dino,
+    parse_person_descriptions,
+    normalize_person_description,
+    normalize_gaze_target_text,
+    run_grounding_dino_detection,
+)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -42,13 +54,36 @@ from llava.constants import (
 from llava.conversation import conv_templates
 
 # Import metrics calculation if available
-try:
-    from generation_metrics import calculate_metrics
+METRICS_AVAILABLE = False
+_metrics_spec = importlib.util.find_spec("generation_metrics")
+if _metrics_spec is not None:
+    calculate_metrics = importlib.import_module("generation_metrics").calculate_metrics
     METRICS_AVAILABLE = True
-except ImportError:
-    METRICS_AVAILABLE = False
+else:
     print("Warning: generation_metrics module not available. Only basic evaluation will be performed.")
 
+COMBINED_CSV_PATH = Path("/galitylab/students/alonmardi/projects/LLaVA-NeXT/combined_description_results.csv")
+_combined_dataset_cache: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def load_combined_description_cache() -> Dict[str, Dict[str, str]]:
+    global _combined_dataset_cache
+    if _combined_dataset_cache is None:
+        mapping: Dict[str, Dict[str, str]] = {}
+        if COMBINED_CSV_PATH.exists():
+            with open(COMBINED_CSV_PATH, "r", encoding="utf-8") as csv_file:
+                reader = csv.DictReader(csv_file)
+                for row in reader:
+                    rel_path = row.get("image_path.1")
+                    if not rel_path:
+                        continue
+                    key = rel_path.strip()
+                    if key:
+                        mapping[key] = row
+        else:
+            print(f"Warning: Combined description CSV not found at {COMBINED_CSV_PATH}")
+        _combined_dataset_cache = mapping
+    return _combined_dataset_cache
 
 def load_wandb_config_from_checkpoint(model_path: str) -> Dict[str, Any]:
     """
@@ -66,16 +101,12 @@ def load_wandb_config_from_checkpoint(model_path: str) -> Dict[str, Any]:
     # Try to find trainer_state.json in parent directory
     trainer_state_file = run_dir / "trainer_state.json"
     if trainer_state_file.exists():
-        try:
-            with open(trainer_state_file, 'r') as f:
-                trainer_state = json.load(f)
-                # Extract wandb info if available
-                return {
-                    "best_model_checkpoint": trainer_state.get("best_model_checkpoint"),
-                    "log_history": trainer_state.get("log_history", []),
-                }
-        except Exception as e:
-            print(f"Warning: Could not load trainer_state.json: {e}")
+        with open(trainer_state_file, 'r') as f:
+            trainer_state = json.load(f)
+            return {
+                "best_model_checkpoint": trainer_state.get("best_model_checkpoint"),
+                "log_history": trainer_state.get("log_history", []),
+            }
     
     # Try to find wandb directory
     wandb_dir = run_dir / "wandb"
@@ -86,13 +117,13 @@ def load_wandb_config_from_checkpoint(model_path: str) -> Dict[str, Any]:
             latest_run = run_dirs[-1]
             config_file = latest_run / "files" / "config.yaml"
             if config_file.exists():
-                try:
-                    import yaml
+                yaml_spec = importlib.util.find_spec("yaml")
+                if yaml_spec is None:
+                    print("Warning: PyYAML not available. Skipping wandb config load.")
+                else:
+                    yaml = importlib.import_module("yaml")
                     with open(config_file, 'r') as f:
-                        config = yaml.safe_load(f)
-                        return config
-                except Exception as e:
-                    print(f"Warning: Could not load wandb config.yaml: {e}")
+                        return yaml.safe_load(f)
     
     return {}
 
@@ -127,6 +158,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for evaluation (currently only 1 supported).")
     
     # Other arguments
+    parser.add_argument(
+        "--generate-model-results",
+        action="store_true",
+        help="Generate full model outputs and gaze analysis per sample.",
+    )
+    parser.add_argument(
+        "--prompt-override",
+        type=str,
+        default=None,
+        help="Override the prompt used for model generation instead of the dataset-provided human conversation.",
+    )
+    parser.add_argument(
+        "--gaze-model-id",
+        type=str,
+        default="IDEA-Research/grounding-dino-tiny",
+        help="GroundingDINO model identifier to use for gaze target detection.",
+    )
+    parser.add_argument(
+        "--gaze-box-threshold",
+        type=float,
+        default=0.3,
+        help="Confidence threshold for GroundingDINO bounding boxes.",
+    )
+    parser.add_argument(
+        "--gaze-text-threshold",
+        type=float,
+        default=0.25,
+        help="Text confidence threshold for GroundingDINO detections.",
+    )
+    parser.add_argument(
+        "--gaze-device",
+        type=str,
+        default=None,
+        help="Device for running gaze detection (defaults to CUDA when available).",
+    )
     parser.add_argument("--disable-optimizations", action="store_true", help="Skip enabling CUDA optimizations.")
     parser.add_argument("--verbose", action="store_true", help="Print detailed progress information.")
     parser.add_argument("--safe-mode", action="store_true", help="Enable safe mode with more aggressive memory cleanup and smaller batches.")
@@ -226,53 +292,34 @@ def build_focus_phrase_token_ids(tokenizer, phrase: str) -> List[List[int]]:
     return token_sequences
 
 
-def prepare_image_tensor(image_path: str, image_processor, model) -> Optional[Tuple[torch.Tensor, Tuple[int, int]]]:
-    """Prepare image tensor, return None if image cannot be loaded."""
-    try:
-        # Clear CUDA cache before processing (with error handling)
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except RuntimeError:
-                pass  # Ignore CUDA errors during cache cleanup
-            
-        pil_image = load_image(image_path)
-        
-        # Process image with error handling
-        try:
-            processed = process_images([pil_image], image_processor, model.config)
-        except Exception as e:
-            print(f"Error in process_images for {image_path}: {e}")
+def prepare_image_tensor(
+    image_path: str, image_processor, model
+) -> Optional[Tuple[torch.Tensor, Tuple[int, int], Image.Image]]:
+    """Prepare image tensor, returning the tensor, original size, and PIL image object."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    pil_image = load_image(image_path)
+    processed = process_images([pil_image], image_processor, model.config)
+
+    if isinstance(processed, tuple):
+        image_tensor = processed[0]
+    else:
+        image_tensor = processed
+
+    if isinstance(image_tensor, list):
+        if not image_tensor:
             return None
+        image_tensor = image_tensor[0]
 
-        if isinstance(processed, tuple):
-            image_tensor = processed[0]
-        else:
-            image_tensor = processed
+    if isinstance(image_tensor, torch.Tensor) and image_tensor.ndim == 3:
+        image_tensor = image_tensor.unsqueeze(0)
 
-        if isinstance(image_tensor, list):
-            if not image_tensor:
-                return None
-            image_tensor = image_tensor[0]
-
-        if isinstance(image_tensor, torch.Tensor) and image_tensor.ndim == 3:
-            image_tensor = image_tensor.unsqueeze(0)
-
-        if not isinstance(image_tensor, torch.Tensor):
-            return None
-
-        # Move to device with error handling
-        try:
-            image_tensor = image_tensor.to(model.device, dtype=model.dtype)
-        except Exception as e:
-            print(f"CUDA error when moving tensor to device for {image_path}: {e}")
-            return None
-            
-        return image_tensor, pil_image.size
-    
-    except Exception as e:
-        print(f"Error loading image {image_path}: {e}")
+    if not isinstance(image_tensor, torch.Tensor):
         return None
+
+    image_tensor = image_tensor.to(model.device, dtype=model.dtype)
+    return image_tensor, pil_image.size, pil_image
 
 
 def compute_ground_truth_loss(
@@ -288,90 +335,82 @@ def compute_ground_truth_loss(
     focus_loss_missing_value: Optional[float] = None,
 ) -> Optional[float]:
     """Teacher-force the ground truth response to compute language modeling loss."""
-    try:
-        conv = conv_templates[conv_template].copy()
-        conv.tokenizer = tokenizer
+    conv = conv_templates[conv_template].copy()
+    conv.tokenizer = tokenizer
 
-        if DEFAULT_IMAGE_TOKEN not in prompt_text:
-            user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt_text}"
-        else:
-            user_content = prompt_text
+    if DEFAULT_IMAGE_TOKEN not in prompt_text:
+        user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt_text}"
+    else:
+        user_content = prompt_text
 
-        conv.append_message(conv.roles[0], user_content)
-        conv.append_message(conv.roles[1], ground_truth)
-        full_prompt = conv.get_prompt()
+    conv.append_message(conv.roles[0], user_content)
+    conv.append_message(conv.roles[1], ground_truth)
+    full_prompt = conv.get_prompt()
 
-        input_ids = tokenizer_image_token(
-            full_prompt,
-            tokenizer,
-            IMAGE_TOKEN_INDEX,
-            return_tensors="pt",
-        ).unsqueeze(0).to(model.device)
+    input_ids = tokenizer_image_token(
+        full_prompt,
+        tokenizer,
+        IMAGE_TOKEN_INDEX,
+        return_tensors="pt",
+    ).unsqueeze(0).to(model.device)
 
-        labels = input_ids.clone()
+    labels = input_ids.clone()
 
-        prompt_conv = conv_templates[conv_template].copy()
-        prompt_conv.tokenizer = tokenizer
-        prompt_conv.append_message(prompt_conv.roles[0], user_content)
-        prompt_conv.append_message(prompt_conv.roles[1], None)
-        prompt_only_ids = tokenizer_image_token(
-            prompt_conv.get_prompt(),
-            tokenizer,
-            IMAGE_TOKEN_INDEX,
-            return_tensors="pt",
+    prompt_conv = conv_templates[conv_template].copy()
+    prompt_conv.tokenizer = tokenizer
+    prompt_conv.append_message(prompt_conv.roles[0], user_content)
+    prompt_conv.append_message(prompt_conv.roles[1], None)
+    prompt_only_ids = tokenizer_image_token(
+        prompt_conv.get_prompt(),
+        tokenizer,
+        IMAGE_TOKEN_INDEX,
+        return_tensors="pt",
+    )
+
+    prompt_length = prompt_only_ids.size(-1)
+    labels = labels.to(model.device)
+    invalid_label_mask = labels < 0
+    if invalid_label_mask.any():
+        labels = labels.masked_fill(invalid_label_mask, IGNORE_INDEX)
+
+    if prompt_length > 0:
+        labels[:, :prompt_length] = IGNORE_INDEX
+
+    vocab_size = getattr(model.config, "vocab_size", None)
+    if vocab_size is not None:
+        overflow_mask = labels >= vocab_size
+        if overflow_mask.any():
+            labels = labels.masked_fill(overflow_mask, IGNORE_INDEX)
+    model_kwargs = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "images": image_tensor,
+        "image_sizes": [list(image_size)],
+        "modalities": ["image"],
+        "use_cache": False,
+        "return_dict": True,
+    }
+
+    if focus_loss_after_phrase:
+        if not focus_loss_phrase_token_ids:
+            raise ValueError("Focus loss is enabled but no phrase token ids were provided.")
+        model_kwargs.update(
+            {
+                "focus_loss_after_phrase": True,
+                "focus_loss_phrase_token_ids": focus_loss_phrase_token_ids,
+            }
         )
+        if focus_loss_missing_value is not None:
+            model_kwargs["focus_loss_missing_value"] = focus_loss_missing_value
 
-        prompt_length = prompt_only_ids.size(-1)
-        labels = labels.to(model.device)
-        # Mask out image placeholder tokens so they do not participate in the loss
-        invalid_label_mask = labels < 0
-        if invalid_label_mask.any():
-            labels = labels.masked_fill(invalid_label_mask, IGNORE_INDEX)
+    with torch.no_grad():
+        outputs = model(**model_kwargs)
 
-        # ensure we ignore sequence regions beyond the language tokens
-        if prompt_length > 0:
-            labels[:, :prompt_length] = IGNORE_INDEX
-
-        vocab_size = getattr(model.config, "vocab_size", None)
-        # tokenizer_vocab_size = getattr(tokenizer, "vocab_size", None)
-        # vocab_size = min(vocab_size, tokenizer_vocab_size) if vocab_size and tokenizer_vocab_size else vocab_size or tokenizer_vocab_size
-        if vocab_size is not None:
-            overflow_mask = labels >= vocab_size
-            if overflow_mask.any():
-                labels = labels.masked_fill(overflow_mask, IGNORE_INDEX)
-        model_kwargs = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "images": image_tensor,
-            "image_sizes": [list(image_size)],
-            "modalities": ["image"],
-            "use_cache": False,
-            "return_dict": True,
-        }
-
-        if focus_loss_after_phrase:
-            if not focus_loss_phrase_token_ids:
-                raise ValueError("Focus loss is enabled but no phrase token ids were provided.")
-            model_kwargs.update(
-                {
-                    "focus_loss_after_phrase": True,
-                    "focus_loss_phrase_token_ids": focus_loss_phrase_token_ids,
-                }
-            )
-            if focus_loss_missing_value is not None:
-                model_kwargs["focus_loss_missing_value"] = focus_loss_missing_value
-
-        with torch.no_grad():
-            outputs = model(**model_kwargs)
-
-        loss_tensor = getattr(outputs, "loss", None)
-        if loss_tensor is None:
-            return None
-
-        return loss_tensor.detach().to("cpu", dtype=torch.float32).item()
-    except Exception as exc:  # pragma: no cover - best effort safeguard
-        print(f"Loss calculation failed: {exc}")
+    loss_tensor = getattr(outputs, "loss", None)
+    if loss_tensor is None:
         return None
+
+    return loss_tensor.detach().to("cpu", dtype=torch.float32).item()
 
 
 def generate_response(
@@ -627,118 +666,93 @@ def evaluate_dataset_for_training(
     with torch.no_grad():
         iterator = tqdm(range(total_samples), desc="Evaluating") if verbose else range(total_samples)
         for idx in iterator:
-            try:
-                # Get sample from dataset
-                sample = eval_dataset.list_data_dict[idx]
-                
-                # Extract conversations
-                conversations = sample.get("conversations", [])
-                prompt = extract_prompt_from_conversation(conversations)
-                ground_truth = extract_ground_truth_from_conversation(conversations)
-                
-                if not prompt or not ground_truth:
-                    failed_samples.append({"index": idx, "reason": "Missing prompt or ground truth"})
-                    continue
-                
-                # Get image path
-                image_file = sample.get("image", "")
-                if isinstance(image_file, list):
-                    image_file = image_file[0]
-                
-                # Handle relative paths from dataset
-                if not os.path.isabs(image_file):
-                    # Try to resolve relative to dataset's image_folder
-                    image_folder = None
+            sample = eval_dataset.list_data_dict[idx]
+
+            conversations = sample.get("conversations", [])
+            prompt = extract_prompt_from_conversation(conversations)
+            ground_truth = extract_ground_truth_from_conversation(conversations)
+
+            if not prompt or not ground_truth:
+                failed_samples.append({"index": idx, "reason": "Missing prompt or ground truth"})
+                continue
+
+            image_file = sample.get("image", "")
+            if isinstance(image_file, list):
+                image_file = image_file[0]
+
+            if not os.path.isabs(image_file):
+                image_folder = None
+                if hasattr(eval_dataset, 'data_args') and hasattr(eval_dataset.data_args, 'image_folder'):
+                    image_folder = eval_dataset.data_args.image_folder
+
+                if image_folder:
+                    image_file = os.path.join(image_folder, image_file)
+                else:
+                    data_path = getattr(eval_dataset, 'data_path', None)
+                    if data_path:
+                        base_dir = Path(data_path).parent
+                        image_file = str(base_dir / image_file)
+
+            if not Path(image_file).exists():
+                if verbose:
+                    print(f"Image not found: {image_file}")
                     if hasattr(eval_dataset, 'data_args') and hasattr(eval_dataset.data_args, 'image_folder'):
-                        image_folder = eval_dataset.data_args.image_folder
-                    
-                    if image_folder:
-                        image_file = os.path.join(image_folder, image_file)
-                    else:
-                        # Fallback: try to resolve relative to data_path
-                        data_path = getattr(eval_dataset, 'data_path', None)
-                        if data_path:
-                            base_dir = Path(data_path).parent
-                            image_file = str(base_dir / image_file)
-                
-                # Process image
-                try:
-                    image_result = prepare_image_tensor(
-                        image_file,
-                        image_processor,
-                        model
-                    )
-                    
-                    if image_result is None:
-                        failed_samples.append({"index": idx, "reason": f"Failed to load image: {image_file}"})
-                        continue
-                except FileNotFoundError as e:
-                    if verbose:
-                        print(f"Image not found: {image_file}")
-                        if hasattr(eval_dataset, 'data_args') and hasattr(eval_dataset.data_args, 'image_folder'):
-                            print(f"  Image folder: {eval_dataset.data_args.image_folder}")
-                    failed_samples.append({"index": idx, "reason": f"Image not found: {image_file}"})
-                    continue
-                except Exception as e:
-                    if verbose:
-                        print(f"Error loading image {image_file}: {e}")
-                    failed_samples.append({"index": idx, "reason": f"Error loading image: {str(e)}"})
-                    continue
-                
-                image_tensor, image_size = image_result
-                
-                # Generate response
-                generation_kwargs = {
-                    "do_sample": False,
-                    "max_new_tokens": max_new_tokens,
-                    "use_cache": True,
-                    "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
-                }
-                
-                prediction = generate_response(
+                        print(f"  Image folder: {eval_dataset.data_args.image_folder}")
+                failed_samples.append({"index": idx, "reason": f"Image not found: {image_file}"})
+                continue
+
+            image_result = prepare_image_tensor(
+                image_file,
+                image_processor,
+                model
+            )
+
+            if image_result is None:
+                failed_samples.append({"index": idx, "reason": f"Failed to load image: {image_file}"})
+                continue
+
+            image_tensor, image_size, _ = image_result
+
+            generation_kwargs = {
+                "do_sample": False,
+                "max_new_tokens": max_new_tokens,
+                "use_cache": True,
+                "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+            }
+
+            prediction = generate_response(
+                prompt_text=prompt,
+                image_tensor=image_tensor,
+                image_size=image_size,
+                tokenizer=tokenizer,
+                model=model,
+                conv_template=conv_template,
+                generation_kwargs=generation_kwargs,
+                return_loss_data=False,
+            )
+
+            predictions.append(prediction)
+            ground_truths.append(ground_truth)
+
+            if not no_loss:
+                loss = compute_ground_truth_loss(
                     prompt_text=prompt,
-                    image_tensor=image_tensor,
-                    image_size=image_size,
+                    ground_truth=ground_truth,
                     tokenizer=tokenizer,
                     model=model,
                     conv_template=conv_template,
-                    generation_kwargs=generation_kwargs,
-                    return_loss_data=False,
+                    image_tensor=image_tensor,
+                    image_size=image_size,
+                    focus_loss_after_phrase=focus_loss_after_looking,
+                    focus_loss_phrase_token_ids=focus_phrase_token_ids if focus_phrase_token_ids else None,
+                    focus_loss_missing_value=focus_loss_threshold,
                 )
-                
-                predictions.append(prediction)
-                ground_truths.append(ground_truth)
-                
-                # Compute loss if enabled
-                if not no_loss:
-                    loss = compute_ground_truth_loss(
-                        prompt_text=prompt,
-                        ground_truth=ground_truth,
-                        tokenizer=tokenizer,
-                        model=model,
-                        conv_template=conv_template,
-                        image_tensor=image_tensor,
-                        image_size=image_size,
-                        focus_loss_after_phrase=focus_loss_after_looking,
-                        focus_loss_phrase_token_ids=focus_phrase_token_ids if focus_phrase_token_ids else None,
-                        focus_loss_missing_value=focus_loss_threshold,
-                    )
-                    
-                    if loss is not None and math.isfinite(loss):
-                        losses.append(loss)
-                
-            except Exception as e:
-                if verbose:
-                    print(f"Error evaluating sample {idx}: {e}")
-                failed_samples.append({"index": idx, "reason": str(e)})
-                continue
-            
-            # Clear cache periodically
+
+                if loss is not None and math.isfinite(loss):
+                    losses.append(loss)
+
             if (idx + 1) % 10 == 0 and torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                except RuntimeError:
-                    pass
+                torch.cuda.empty_cache()
     
     # Calculate metrics
     metrics = {}
@@ -747,14 +761,9 @@ def evaluate_dataset_for_training(
         basic_metrics = calculate_basic_metrics(predictions, ground_truths)
         metrics.update(basic_metrics)
         
-        # Try advanced metrics if available
         if METRICS_AVAILABLE:
-            try:
-                advanced_metrics = calculate_metrics(predictions, ground_truths)
-                metrics.update(advanced_metrics)
-            except Exception as e:
-                if verbose:
-                    print(f"Warning: Could not calculate advanced metrics: {e}")
+            advanced_metrics = calculate_metrics(predictions, ground_truths)
+            metrics.update(advanced_metrics)
     
     if losses:
         metrics.update({
@@ -781,7 +790,6 @@ def main():
         raise ValueError("Cannot enable both --load-4bit and --load-8bit.")
     
     # Set CUDA launch blocking for better error reporting
-    import os
     if torch.cuda.is_available():
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
         print("Set CUDA_LAUNCH_BLOCKING=1 for better error reporting")
@@ -797,15 +805,17 @@ def main():
     # Initialize wandb if requested
     wandb_run = None
     if args.log_to_wandb:
-        try:
-            import wandb
-            # Extract run_id from adapter path
+        wandb_spec = importlib.util.find_spec("wandb")
+        if wandb_spec is None:
+            print("Warning: wandb not available. Install with: pip install wandb")
+            args.log_to_wandb = False
+        else:
+            wandb = importlib.import_module("wandb")
             if not args.adapter_path:
                 run_id = 'Baseline'
                 print("Warning: No adapter path provided, cannot extract run_id. Will create a new wandb run: Baseline.")
             else:
                 run_id = Path(args.adapter_path).resolve().parent.name
-                # Add the checkpoint name if applicable
                 if Path(args.adapter_path).name.startswith("checkpoint-"):
                     run_id = f"{run_id}_{Path(args.adapter_path).name}"
             if not run_id:
@@ -813,20 +823,16 @@ def main():
                 run_id = 'Baseline'
             else:
                 print(f"Extracted run_id: {run_id}")
-            
-            # Load wandb config from checkpoint if available
+
             wandb_config = load_wandb_config_from_checkpoint(args.model_path)
-            
-            # Determine project and entity
             project = args.wandb_project or wandb_config.get("wandb_project") or "llava-evaluation"
             entity = args.wandb_entity or wandb_config.get("wandb_entity")
-            
-            # Resume the run with the extracted run_id
+
             wandb_run = wandb.init(
                 project=project,
                 entity=entity,
                 id=run_id,
-                resume="allow",  # Allow resuming if run exists, create new if not
+                resume="allow",
                 name=f"{run_id}" if run_id else "evaluation",
                 job_type="evaluation",
                 config={
@@ -845,13 +851,6 @@ def main():
                 }
             )
             print(f"Initialized wandb run: {wandb_run.name} (project: {project})")
-            
-        except ImportError:
-            print("Warning: wandb not available. Install with: pip install wandb")
-            args.log_to_wandb = False
-        except Exception as e:
-            print(f"Warning: Could not initialize wandb: {e}")
-            args.log_to_wandb = False
     
     print("=" * 60)
     print("LLaVA Model Evaluation")
@@ -909,6 +908,30 @@ def main():
             model.config.focus_loss_phrase_token_ids = focus_phrase_token_ids
             model.config.focus_loss_missing_value = args.focus_loss_threshold
 
+    generate_model_results = args.generate_model_results or bool(args.prompt_override)
+    if args.prompt_override and not args.generate_model_results:
+        print("Note: --prompt-override provided without --generate-model-results. Enabling generation of model outputs.")
+    should_generate_predictions = args.use_iterative_generation or generate_model_results
+
+    model_generation_records: List[Dict[str, Any]] = []
+    gaze_processor = None
+    gaze_model = None
+    gaze_device = args.gaze_device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    def ensure_gaze_resources():
+        nonlocal gaze_processor, gaze_model
+        if gaze_processor is None or gaze_model is None:
+            if args.verbose:
+                print(f"Loading GroundingDINO model ({args.gaze_model_id}) on device {gaze_device}...")
+            gaze_processor_local, gaze_model_local = load_grounding_dino(args.gaze_model_id, gaze_device)
+            gaze_processor = gaze_processor_local
+            gaze_model = gaze_model_local
+        else:
+            if args.verbose:
+                print("GroundingDINO model already loaded.")
+
+        return gaze_processor, gaze_model
+
     # Load dataset
     print("\n2. Loading dataset...")
     dataset = load_dataset(args.dataset_json, args.limit)
@@ -936,64 +959,72 @@ def main():
         for i, sample in enumerate(tqdm(batch_samples, desc=f"Batch {batch_start//batch_size + 1}")):
             sample_idx = batch_start + i
             sample_id = sample.get("id", f"sample_{sample_idx}")
-        image_path = sample.get("image", "")
-        conversations = sample.get("conversations", [])
-        
-        if args.verbose:
-            print(f"\nProcessing sample {sample_id}...")
-        
-        # Extract prompt and ground truth
-        prompt = extract_prompt_from_conversation(conversations)
-        ground_truth = extract_ground_truth_from_conversation(conversations)
-        
-        if not prompt or not ground_truth:
-            failed_samples.append({
-                "id": sample_id,
-                "reason": "Missing prompt or ground truth",
-                "prompt": prompt,
-                "ground_truth": ground_truth
-            })
-            continue
-        
-        # Construct full image path
-        if image_path.endswith('.jpg') or image_path.endswith('.png') or image_path.endswith('.jpeg'):
-            full_image_path = images_dir / image_path
-        else:
-            # Try common extensions
-            for ext in ['.jpg', '.png', '.jpeg']:
-                potential_path = images_dir / f"{image_path}{ext}"
-                if potential_path.exists():
-                    full_image_path = potential_path
-                    break
-            else:
+            image_path = sample.get("image", "")
+            conversations = sample.get("conversations", [])
+
+            if args.verbose:
+                print(f"\nProcessing sample {sample_id}...")
+
+            dataset_prompt = extract_prompt_from_conversation(conversations)
+            ground_truth = extract_ground_truth_from_conversation(conversations)
+
+            if not ground_truth:
                 failed_samples.append({
                     "id": sample_id,
-                    "reason": f"Image not found: {image_path}",
-                    "prompt": prompt,
-                    "ground_truth": ground_truth
+                    "reason": "Missing ground truth",
+                    "dataset_prompt": dataset_prompt,
+                    "prompt_override": args.prompt_override,
                 })
                 continue
-        
-        # Prepare image tensor
-        image_result = prepare_image_tensor(str(full_image_path), image_processor, model)
-        if image_result is None:
-            failed_samples.append({
-                "id": sample_id,
-                "reason": f"Failed to process image: {full_image_path}",
-                "prompt": prompt,
-                "ground_truth": ground_truth
-            })
-            continue
-        
-        image_tensor, image_size = image_result
-        
-        # Generate prediction and optionally compute loss against ground truth
-        try:
+
+            prompt_used = args.prompt_override if args.prompt_override is not None else dataset_prompt
+            prompt_source = "override" if args.prompt_override is not None else "dataset"
+
+            if prompt_used is None or not prompt_used.strip():
+                failed_samples.append({
+                    "id": sample_id,
+                    "reason": "Missing prompt",
+                    "dataset_prompt": dataset_prompt,
+                    "prompt_override": args.prompt_override,
+                })
+                continue
+
+            # Construct full image path
+            if image_path.endswith((".jpg", ".png", ".jpeg")):
+                full_image_path = images_dir / image_path
+            else:
+                # Try common extensions
+                for ext in (".jpg", ".png", ".jpeg"):
+                    potential_path = images_dir / f"{image_path}{ext}"
+                    if potential_path.exists():
+                        full_image_path = potential_path
+                        break
+                else:
+                    failed_samples.append({
+                        "id": sample_id,
+                        "reason": f"Image not found: {image_path}",
+                        "dataset_prompt": dataset_prompt,
+                        "prompt_override": args.prompt_override,
+                    })
+                    continue
+
+            # Prepare image tensor
+            image_result = prepare_image_tensor(str(full_image_path), image_processor, model)
+            if image_result is None:
+                failed_samples.append({
+                    "id": sample_id,
+                    "reason": f"Failed to process image: {full_image_path}",
+                    "dataset_prompt": dataset_prompt,
+                    "prompt_override": args.prompt_override,
+                })
+                continue
+
+            image_tensor, image_size, pil_image = image_result
+
             prediction = None
-            # Generate prediction only if iterative generation is enabled
-            if args.use_iterative_generation:
+            if should_generate_predictions:
                 prediction = generate_response(
-                    prompt,
+                    prompt_used,
                     image_tensor,
                     image_size,
                     tokenizer,
@@ -1005,7 +1036,7 @@ def main():
             sample_loss = None
             if not args.no_loss:
                 loss_value = compute_ground_truth_loss(
-                    prompt,
+                    prompt_used,
                     ground_truth,
                     tokenizer,
                     model,
@@ -1024,61 +1055,112 @@ def main():
                         reason = "None" if loss_value is None else "non-finite"
                         print(f"Loss calculation skipped for {sample_id}: returned {reason} value")
 
-            # Only add to predictions list if we actually generated a prediction
             if prediction is not None:
                 predictions.append(prediction)
             ground_truths.append(ground_truth)
-            
-            # Store detailed result
+
             result = {
                 "id": sample_id,
                 "image_path": str(full_image_path),
-                "prompt": prompt,
+                "prompt": prompt_used,
                 "ground_truth": ground_truth,
-                "success": True
+                "prompt_source": prompt_source,
+                "success": True,
             }
+            if dataset_prompt and dataset_prompt != prompt_used:
+                result["dataset_prompt"] = dataset_prompt
             if prediction is not None:
                 result["prediction"] = prediction
             if sample_loss is not None:
                 result["loss"] = sample_loss
             evaluation_results.append(result)
-            
+
+            if generate_model_results:
+                raw_text = prediction or ""
+                person_descriptions = parse_person_descriptions(raw_text)
+                if not person_descriptions and raw_text:
+                    fallback_text = f"Person 1: {raw_text}"
+                    person_descriptions = parse_person_descriptions(fallback_text)
+
+                gaze_detections: Dict[str, Any] = {}
+                processor = None
+                detection_model = None
+                if person_descriptions:
+                    processor, detection_model = ensure_gaze_resources()
+                    gaze_detections = detect_gaze_targets(
+                        image=pil_image,
+                        persons=person_descriptions,
+                        model_id=args.gaze_model_id,
+                        box_threshold=args.gaze_box_threshold,
+                        text_threshold=args.gaze_text_threshold,
+                        device=gaze_device,
+                        processor=processor,
+                        model=detection_model,
+                    )
+
+                processed_people: Dict[str, Any] = {}
+                model_generation_entry: Dict[str, Any] = {
+                    "id": sample_id,
+                    "image_path": str(full_image_path),
+                    "dataset_prompt": dataset_prompt,
+                    "prompt_used": prompt_used,
+                    "prompt_source": prompt_source,
+                    "ground_truth": ground_truth,
+                    "model_prediction": prediction,
+                    "gaze_detections": processed_people,
+                }
+                if sample_loss is not None:
+                    model_generation_entry["loss"] = sample_loss
+
+                if person_descriptions:
+                    for person in person_descriptions:
+                        sanitized_description = normalize_person_description(person.raw_description)
+                        if not sanitized_description:
+                            sanitized_description = person.raw_description.strip()
+                        person_prompt = sanitized_description or person.raw_description.strip()
+                        normalized_gaze_target = normalize_gaze_target_text(person.gaze_target)
+                        gaze_info = gaze_detections.get(person.person_id, {})
+                        person_box, person_score = run_grounding_dino_detection(
+                            image=pil_image,
+                            text_prompt=person_prompt,
+                            processor=processor,
+                            model=detection_model,
+                            box_threshold=args.gaze_box_threshold,
+                            text_threshold=args.gaze_text_threshold,
+                        )
+                        processed_people[person.person_id] = {
+                            "label": person.label,
+                            "person_description": sanitized_description,
+                            "gaze_target": normalized_gaze_target,
+                            "gaze_coordinates": gaze_info.get("coordinates"),
+                            "gaze_score": gaze_info.get("score"),
+                            "person_coordinates": person_box,
+                            "person_score": person_score,
+                        }
+
+                model_generation_records.append(model_generation_entry)
+
             if args.verbose:
-                print(f"Prompt: {prompt}")
+                print(f"Prompt (source={prompt_source}): {prompt_used}")
                 print(f"Ground truth: {ground_truth}")
                 if prediction is not None:
                     print(f"Prediction: {prediction}")
                 else:
-                    print("Prediction: [skipped - iterative generation not enabled]")
+                    print("Prediction: [skipped - generation disabled]")
                 if sample_loss is not None:
                     print(f"Loss: {sample_loss:.6f}")
                 print("-" * 40)
-        
-        except Exception as e:
-            failed_samples.append({
-                "id": sample_id,
-                "reason": f"Generation error: {str(e)}",
-                "prompt": prompt,
-                "ground_truth": ground_truth
-            })
-            continue
-        
-        finally:
-            # Clean up GPU memory after each sample to prevent CUDA errors
+
+            if isinstance(pil_image, Image.Image):
+                pil_image.close()
             if torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                except RuntimeError:
-                    pass  # Ignore CUDA errors during cleanup
+                torch.cuda.empty_cache()
         
         # Clean up GPU memory after each batch
         if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-                if args.verbose:
-                    print(f"Cleaned GPU memory after batch {batch_start//batch_size + 1}")
-            except RuntimeError:
-                pass  # Ignore CUDA errors during cleanup
+            torch.cuda.empty_cache()
+            if args.verbose:
+                print(f"Cleaned GPU memory after batch {batch_start//batch_size + 1}")
     
     end_time = time.time()
     evaluation_time = end_time - start_time
@@ -1098,13 +1180,9 @@ def main():
     if predictions:
         basic_metrics = calculate_basic_metrics(predictions, ground_truths)
         
-        # Try to calculate advanced metrics if available
         advanced_metrics = {}
         if METRICS_AVAILABLE:
-            try:
-                advanced_metrics = calculate_metrics(predictions, ground_truths)
-            except Exception as e:
-                print(f"Warning: Could not calculate advanced metrics: {e}")
+            advanced_metrics = calculate_metrics(predictions, ground_truths)
         
         
         # Combine all metrics
@@ -1126,7 +1204,7 @@ def main():
     else:
         total_processed = len(evaluation_results)
         if total_processed > 0:
-            print(f"Processed {total_processed} samples but no predictions were generated (--use-iterative-generation not enabled).")
+            print(f"Processed {total_processed} samples but no predictions were generated (generation disabled).")
         else:
             print("No successful predictions to evaluate!")
         final_metrics = {
@@ -1143,6 +1221,9 @@ def main():
         }
 
         final_metrics.update(loss_metrics)
+
+    if generate_model_results:
+        final_metrics["model_generation_samples"] = len(model_generation_records)
     
     # Print results
     print("\n" + "=" * 60)
@@ -1167,7 +1248,7 @@ def main():
                 else:
                     print(f"  {metric_name}: {value}")
     else:
-        print("\n📊 PREDICTION METRICS: No predictions generated (--use-iterative-generation not enabled)")
+        print("\n📊 PREDICTION METRICS: No predictions generated (generation disabled)")
     
     # Print loss metrics prominently (regardless of whether predictions were generated)
     if loss_metrics:
@@ -1213,12 +1294,21 @@ def main():
         json.dump(final_metrics, f, indent=2, ensure_ascii=False)
     print(f"Metrics saved to: {metrics_file}")
     
+    model_generation_file: Optional[Path] = None
+
     # Save detailed predictions if requested
     if args.save_predictions:
         predictions_file = output_dir / "predictions.json"
         with open(predictions_file, 'w', encoding='utf-8') as f:
             json.dump(evaluation_results, f, indent=2, ensure_ascii=False)
         print(f"Detailed predictions saved to: {predictions_file}")
+
+    # Save model generation outputs if requested
+    if generate_model_results:
+        model_generation_file = output_dir / "model_generation_results.json"
+        with open(model_generation_file, 'w', encoding='utf-8') as f:
+            json.dump(model_generation_records, f, indent=2, ensure_ascii=False)
+        print(f"Model generation results saved to: {model_generation_file}")
     
     # Save failed samples
     if failed_samples:
@@ -1246,38 +1336,54 @@ def main():
     
     # Log to wandb if enabled
     if args.log_to_wandb and wandb_run is not None:
-        try:
-            import wandb
-            
-            # Prepare metrics for wandb with eval/ prefix
-            wandb_metrics = {f"eval/{k}": v for k, v in final_metrics.items() if isinstance(v, (int, float, bool))}
-            
-            # Log metrics
-            wandb.log(wandb_metrics)
-            
-            # Save artifacts (metrics, predictions, failed samples)
-            artifact = wandb.Artifact(
-                name=f"evaluation_results_{wandb_run.id}",
-                type="evaluation",
-                description=f"Evaluation results for {args.model_path}"
+        wandb_metrics = {f"eval/{k}": v for k, v in final_metrics.items() if isinstance(v, (int, float, bool))}
+
+        wandb.log(wandb_metrics)
+
+        if generate_model_results and model_generation_records:
+            generation_table = wandb.Table(
+                columns=[
+                    "id",
+                    "prompt_source",
+                    "prompt_used",
+                    "ground_truth",
+                    "model_prediction",
+                    "gaze_detections",
+                    "loss",
+                ]
             )
-            
-            artifact.add_file(str(metrics_file), name="metrics.json")
-            if args.save_predictions and predictions_file.exists():
-                artifact.add_file(str(predictions_file), name="predictions.json")
-            if failed_samples and failed_file.exists():
-                artifact.add_file(str(failed_file), name="failed_samples.json")
-            artifact.add_file(str(config_file), name="evaluation_config.json")
-            
-            wandb.log_artifact(artifact)
-            
-            print(f"\n✅ Logged evaluation results to wandb run: {wandb_run.name}")
-            
-            # Finish the run
-            wandb.finish()
-            
-        except Exception as e:
-            print(f"\n⚠️  Warning: Could not log to wandb: {e}")
+            for entry in model_generation_records:
+                generation_table.add_data(
+                    entry.get("id"),
+                    entry.get("prompt_source"),
+                    entry.get("prompt_used"),
+                    entry.get("ground_truth"),
+                    entry.get("model_prediction"),
+                    json.dumps(entry.get("gaze_detections", {}), ensure_ascii=False),
+                    entry.get("loss"),
+                )
+            wandb.log({"model_generation/results": generation_table})
+
+        artifact = wandb.Artifact(
+            name=f"evaluation_results_{wandb_run.id}",
+            type="evaluation",
+            description=f"Evaluation results for {args.model_path}"
+        )
+
+        artifact.add_file(str(metrics_file), name="metrics.json")
+        if args.save_predictions and predictions_file.exists():
+            artifact.add_file(str(predictions_file), name="predictions.json")
+        if failed_samples and failed_file.exists():
+            artifact.add_file(str(failed_file), name="failed_samples.json")
+        artifact.add_file(str(config_file), name="evaluation_config.json")
+        if generate_model_results and model_generation_file and model_generation_file.exists():
+            artifact.add_file(str(model_generation_file), name="model_generation_results.json")
+
+        wandb.log_artifact(artifact)
+
+        print(f"\n✅ Logged evaluation results to wandb run: {wandb_run.name}")
+
+        wandb.finish()
     
     print("\nEvaluation completed successfully!")
     
