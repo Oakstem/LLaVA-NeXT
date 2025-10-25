@@ -18,9 +18,9 @@ ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/
 if [ -z "$ADAPTER_PATH" ]; then
     echo "=========================================="
     echo "Available recent checkpoints:"
-    
+
     mapfile -t checkpoints < <(ls -dt /galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-*/checkpoint-* 2>/dev/null | head -10)
-    
+
     if [ ${#checkpoints[@]} -eq 0 ]; then
         echo "No checkpoints found."
         ADAPTER_PATH=""
@@ -28,12 +28,12 @@ if [ -z "$ADAPTER_PATH" ]; then
         for i in "${!checkpoints[@]}"; do
             echo "  [$i] ${checkpoints[$i]}"
         done
-        
+
         echo "  [-1] No adapter (base model only)"
         echo "=========================================="
         echo "Default: [0] ${checkpoints[0]}"
         read -p "Enter checkpoint number, -1 for no adapter, full path, or press Enter for default: " user_input
-        
+
         if [ -z "$user_input" ]; then
             ADAPTER_PATH="${checkpoints[0]}"
             echo "Selected: $ADAPTER_PATH"
@@ -72,8 +72,9 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 VERBOSE="${VERBOSE:-true}"
 SAFE_MODE="${SAFE_MODE:-true}"  # Enable safe mode by default for CUDA stability
 WANDB="${WANDB:-true}"  # Set to true to enable wandb logging
+WANDB_RUN_NAME_SUFFIX="${WANDB_RUN_NAME_SUFFIX:-}"  # Optional suffix for wandb run name
 GENERATE_MODEL_RESULTS="${GENERATE_MODEL_RESULTS:-true}"
-PROMPT_OVERRIDE="${PROMPT_OVERRIDE:-}"
+PROMPT_OVERRIDE="${PROMPT_OVERRIDE:-false}"
 GAZE_MODEL_ID="${GAZE_MODEL_ID:-IDEA-Research/grounding-dino-base}"
 GAZE_BOX_THRESHOLD="${GAZE_BOX_THRESHOLD:-0.20}"
 GAZE_TEXT_THRESHOLD="${GAZE_TEXT_THRESHOLD:-0.20}"
@@ -82,6 +83,36 @@ GAZE_DEVICE="${GAZE_DEVICE:-}"
 # Create necessary directories
 mkdir -p logs
 mkdir -p "$(dirname "$OUTPUT_DIR")"
+
+# Optional strict prompt
+if [ "$PROMPT_OVERRIDE" = "true" ]; then
+    read -r -d '' PROMPT_OVERRIDE <<'EOF'
+You are an expert vision assistant.
+Step 1 - Caption
+• Provide one concise sentence that broadly describes the entire scene.
+• Begin the line with: Caption:
+Step 2 - Foreground people & gaze
+1. Detect every person whose height is at least 5% of the image (foreground).
+2. List them from left to right and number sequentially starting at 1.
+For each person output exactly one line in this format:
+Person {N}: {short description}, looking at {target | outside the frame | uncertain}
+3. If there are more then 1 person, describe their social interactions.
+Output format (no extra lines, no prose other than what is specified):
+-------------------------------------------------
+Caption: {your one-sentence scene description}
+Person 1: {short description}, looking at ...
+Person 2: {short description}, looking at ...
+...
+Social interactions: {describe any social interactions briefly}
+-------------------------------------------------
+Additional rules
+• Keep the phrase "looking at" unchanged.
+• {short description} must be 6 words or fewer (e.g., "man in red jacket").
+• If no foreground person is detected, write exactly: No foreground people detected.
+• If gaze cannot be determined, use "uncertain".
+• Do not output your reasoning or any extra text.
+EOF
+fi
 
 # Print job information
 echo "=========================================="
@@ -120,6 +151,9 @@ echo "  Batch Size: $BATCH_SIZE"
 echo "  Verbose: $VERBOSE"
 echo "  Safe Mode: $SAFE_MODE"
 echo "  Log to Wandb: $WANDB"
+if [ -n "$WANDB_RUN_NAME_SUFFIX" ]; then
+    echo "  Wandb Run Name Suffix: $WANDB_RUN_NAME_SUFFIX"
+fi
 echo "  Generate Model Results: $GENERATE_MODEL_RESULTS"
 if [ -n "$PROMPT_OVERRIDE" ]; then
     echo "  Prompt Override: $PROMPT_OVERRIDE"
@@ -259,6 +293,10 @@ if [ "$WANDB" = "true" ]; then
     ARGS+=("--log-to-wandb")
 fi
 
+if [ -n "$WANDB_RUN_NAME_SUFFIX" ]; then
+    ARGS+=("--wandb-run-name-suffix" "$WANDB_RUN_NAME_SUFFIX")
+fi
+
 if [ "$GENERATE_MODEL_RESULTS" = "true" ]; then
     ARGS+=("--generate-model-results")
 fi
@@ -311,7 +349,7 @@ echo "Total runtime: ${duration} seconds ($(($duration / 60)) minutes)"
 
 if [ $exit_code -eq 0 ]; then
     echo "✓ Evaluation completed successfully!"
-    
+
     # Display results if available
     if [ -f "$OUTPUT_DIR/metrics.json" ]; then
         echo ""
@@ -324,13 +362,13 @@ import sys
 try:
     with open('$OUTPUT_DIR/metrics.json', 'r') as f:
         metrics = json.load(f)
-    
+
     key_metrics = [
-        'success_rate', 'exact_match', 'total_samples', 
+        'success_rate', 'exact_match', 'total_samples',
         'successful_predictions', 'failed_samples',
         'avg_prediction_length', 'evaluation_time_seconds'
     ]
-    
+
     for metric in key_metrics:
         if metric in metrics:
             value = metrics[metric]
@@ -345,13 +383,13 @@ except Exception as e:
     print(f'Could not parse metrics: {e}')
 "
     fi
-    
+
     echo ""
     echo "Output files:"
     if [ -d "$OUTPUT_DIR" ]; then
         ls -la "$OUTPUT_DIR/"
     fi
-    
+
     echo ""
     echo "To view detailed results:"
     echo "  cat $OUTPUT_DIR/metrics.json"
@@ -361,7 +399,7 @@ except Exception as e:
     if [ "$GENERATE_MODEL_RESULTS" = "true" ]; then
         echo "  head $OUTPUT_DIR/model_generation_results.json"
     fi
-    
+
 else
     echo "✗ Evaluation failed with exit code: $exit_code"
     echo ""

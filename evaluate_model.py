@@ -28,6 +28,7 @@ from gazefollow.auto_phrase_grounding.detect_gaze_targets import (
     normalize_person_description,
     normalize_gaze_target_text,
     run_grounding_dino_detection,
+    extract_gaze_metrics_from_generation,
 )
 from gazefollow.gaze_metrics import (
     load_combined_description_cache,
@@ -176,6 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-to-wandb", action="store_true", help="Log evaluation results to wandb using the same run_id as training.")
     parser.add_argument("--wandb-project", default="llava-gazefollow-finetune", help="Wandb project name (optional, will try to infer from training config).")
     parser.add_argument("--wandb-entity", default="gylab", help="Wandb entity name (optional, will try to infer from training config).")
+    parser.add_argument("--wandb-run-name-suffix", default="", help="Optional suffix to append to the wandb run name.")
     parser.add_argument(
         "--focus-loss-after-looking",
         action="store_true",
@@ -800,12 +802,17 @@ def main():
             project = args.wandb_project or wandb_config.get("wandb_project") or "llava-evaluation"
             entity = args.wandb_entity or wandb_config.get("wandb_entity")
 
+            # Construct the run name with optional suffix
+            run_name = f"{run_id}" if run_id else "evaluation"
+            if args.wandb_run_name_suffix:
+                run_name = f"{run_name}_{args.wandb_run_name_suffix}"
+
             wandb_run = wandb.init(
                 project=project,
                 entity=entity,
                 id=run_id,
                 resume="allow",
-                name=f"{run_id}" if run_id else "evaluation",
+                name=run_name,
                 job_type="evaluation",
                 config={
                     "model_path": args.model_path,
@@ -1412,20 +1419,33 @@ def main():
                     "prompt_source",
                     "prompt_used",
                     "ground_truth",
+                    "ground_truth_gaze_target",
                     "model_prediction",
+                    "gaze_target",
                     "gaze_detections",
                     "loss",
+                    "gaze_l2_error",
+                    "gaze_normalized_l2_error",
                 ]
             )
             for entry in model_generation_records:
+                # Extract gaze metrics using utility function
+                ground_truth_gaze_target, gaze_target, gaze_l2_error, gaze_normalized_l2_error = (
+                    extract_gaze_metrics_from_generation(entry, focus_phrase=args.focus_loss_phrase)
+                )
+                
                 generation_table.add_data(
                     entry.get("id"),
                     entry.get("prompt_source"),
                     entry.get("prompt_used"),
-                    entry.get("ground_truth"),
+                    entry.get("ground_truth", ""),
+                    ground_truth_gaze_target,
                     entry.get("model_prediction"),
+                    gaze_target,
                     json.dumps(entry.get("gaze_detections", {}), ensure_ascii=False),
                     entry.get("loss"),
+                    gaze_l2_error,
+                    gaze_normalized_l2_error,
                 )
             wandb.log({"model_generation/results": generation_table})
 

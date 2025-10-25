@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import math
+from datetime import datetime
 from pathlib import Path
+from shutil import copy2
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -201,6 +203,23 @@ def persist_ground_truth_updates(dataset_path: Path, updates: List[Dict[str, Any
             persisted += 1
 
     if persisted:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_suffix = dataset_path.suffix + f".bak_{timestamp}"
+        backup_path = dataset_path.with_suffix(backup_suffix)
+
+        counter = 1
+        while backup_path.exists():
+            backup_path = dataset_path.with_suffix(
+                dataset_path.suffix + f".bak_{timestamp}_{counter}"
+            )
+            counter += 1
+
+        try:
+            copy2(dataset_path, backup_path)
+            print(f"Created backup of dataset at {backup_path}")
+        except Exception as exc:
+            print(f"Warning: Failed to create dataset backup at {backup_path}: {exc}")
+
         with open(dataset_path, "w", encoding="utf-8") as dataset_file:
             json.dump(full_dataset, dataset_file, indent=2, ensure_ascii=False)
 

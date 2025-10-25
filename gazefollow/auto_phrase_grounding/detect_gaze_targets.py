@@ -100,6 +100,54 @@ def strip_gaze_clause(description: str) -> str:
     return description.strip()
 
 
+def extract_gaze_metrics_from_generation(
+    model_generation_entry: Dict[str, Any],
+    focus_phrase: str = "looking at"
+) -> Tuple[str, str, Optional[float], Optional[float]]:
+    """
+    Extract gaze-related metrics from a model generation entry for wandb logging.
+    
+    Args:
+        model_generation_entry: Dictionary containing model generation results with keys:
+            - "ground_truth": The ground truth text containing the gaze target
+            - "gaze_detections": Dictionary of person detections with gaze information
+        focus_phrase: The phrase used to locate the gaze target in ground truth (default: "looking at")
+    
+    Returns:
+        Tuple containing:
+        - ground_truth_gaze_target: Text after the focus phrase in ground truth
+        - gaze_target: Predicted gaze target from first person detection
+        - gaze_l2_error: L2 distance error (if available)
+        - gaze_normalized_l2_error: Normalized L2 error (if available)
+    """
+    # Extract ground truth gaze target (text after focus phrase)
+    ground_truth_text = model_generation_entry.get("ground_truth", "")
+    ground_truth_gaze_target = ""
+    if focus_phrase in ground_truth_text.lower():
+        # Find the position after the focus phrase
+        idx = ground_truth_text.lower().find(focus_phrase)
+        ground_truth_gaze_target = ground_truth_text[idx + len(focus_phrase):].strip()
+        # Remove any trailing punctuation
+        ground_truth_gaze_target = ground_truth_gaze_target.rstrip(".;,!?")
+    
+    # Extract gaze_target and error metrics from first person in gaze_detections
+    gaze_detections = model_generation_entry.get("gaze_detections", {})
+    gaze_target = ""
+    gaze_l2_error = None
+    gaze_normalized_l2_error = None
+    
+    if gaze_detections:
+        # Get the first person's data (usually there's only one)
+        first_person_key = next(iter(gaze_detections.keys()), None)
+        if first_person_key:
+            person_data = gaze_detections[first_person_key]
+            gaze_target = person_data.get("gaze_target", "")
+            gaze_l2_error = person_data.get("gaze_l2_error")
+            gaze_normalized_l2_error = person_data.get("gaze_normalized_l2_error")
+    
+    return ground_truth_gaze_target, gaze_target, gaze_l2_error, gaze_normalized_l2_error
+
+
 def normalize_person_description(description: str) -> str:
     if not description:
         return description
@@ -148,6 +196,18 @@ def detect_gaze_targets(
         processor, model = load_grounding_dino(model_id, device)
 
     image_height, image_width = image.height, image.width
+    tokenizer = getattr(processor, "tokenizer", None)
+    max_text_length = None
+    if tokenizer is not None:
+        max_text_length = getattr(tokenizer, "model_max_length", None)
+    if not isinstance(max_text_length, int) or max_text_length <= 0:
+        max_text_length = getattr(model.config, "text_encoder_model_max_length", None)
+    if not isinstance(max_text_length, int) or max_text_length <= 0:
+        text_encoder = getattr(model.config, "text_encoder", None)
+        max_text_length = getattr(text_encoder, "model_max_length", None) if text_encoder else None
+    if not isinstance(max_text_length, int) or max_text_length <= 0:
+        max_text_length = 256
+    max_text_length = max(1, min(int(max_text_length), 256))
 
     results: Dict[str, Dict[str, Any]] = {}
     for person in persons:
@@ -169,6 +229,9 @@ def detect_gaze_targets(
             images=image,
             text=text_prompt,
             return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=max_text_length,
         ).to(model.device)
 
         with torch.no_grad():
@@ -216,10 +279,26 @@ def run_grounding_dino_detection(
     if not text_prompt or not text_prompt.strip():
         return None, None
 
+    tokenizer = getattr(processor, "tokenizer", None)
+    max_text_length = None
+    if tokenizer is not None:
+        max_text_length = getattr(tokenizer, "model_max_length", None)
+    if not isinstance(max_text_length, int) or max_text_length <= 0:
+        max_text_length = getattr(model.config, "text_encoder_model_max_length", None)
+    if not isinstance(max_text_length, int) or max_text_length <= 0:
+        text_encoder = getattr(model.config, "text_encoder", None)
+        max_text_length = getattr(text_encoder, "model_max_length", None) if text_encoder else None
+    if not isinstance(max_text_length, int) or max_text_length <= 0:
+        max_text_length = 256
+    max_text_length = max(1, min(int(max_text_length), 256))
+
     inputs = processor(
         images=image,
         text=text_prompt,
         return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=max_text_length,
     ).to(model.device)
 
     with torch.no_grad():
