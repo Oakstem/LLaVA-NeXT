@@ -79,3 +79,5 @@ attention_output/
 *.json
 *.sh
 evaluation_results/
+*.npy
+*.pt

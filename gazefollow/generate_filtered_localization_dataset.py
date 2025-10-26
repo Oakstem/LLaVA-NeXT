@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from copy import deepcopy
 from pathlib import Path
 from statistics import mean
 from typing import Iterable, List, Tuple
@@ -23,6 +24,11 @@ def parse_args() -> argparse.Namespace:
         "--output",
         required=True,
         help="Path to write the filtered conversation JSON file.",
+    )
+    parser.add_argument(
+        "--filtered-output",
+        default=None,
+        help="Optional path to write samples filtered out of the dataset with reasons (default: <output>_filtered_out.json).",
     )
     parser.add_argument(
         "--threshold",
@@ -56,6 +62,12 @@ def main() -> None:
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    filtered_output_path = (
+        Path(args.filtered_output).expanduser().resolve()
+        if args.filtered_output
+        else output_path.with_name(f"{output_path.stem}_filtered_out.json")
+    )
+    filtered_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with input_path.open("r", encoding="utf-8") as f:
         samples = json.load(f)
@@ -63,18 +75,28 @@ def main() -> None:
     normalized_errors: List[float] = []
     filtered_samples: List[dict] = []
     filtered_errors: List[float] = []
+    filtered_out_samples: List[dict] = []
     skipped_without_error = 0
 
     for sample in samples:
         error = extract_normalized_l2(sample)
         if error is None:
             skipped_without_error += 1
+            filtered_sample = deepcopy(sample)
+            filtered_sample["filter_reason"] = "missing_normalized_l2_error"
+            filtered_out_samples.append(filtered_sample)
             continue
 
         normalized_errors.append(error)
         if error < args.threshold:
             filtered_samples.append(sample)
             filtered_errors.append(error)
+        else:
+            filtered_sample = deepcopy(sample)
+            filtered_sample["filter_reason"] = "normalized_l2_error_above_threshold"
+            filtered_sample["filter_threshold"] = args.threshold
+            filtered_sample["filter_normalized_l2_error"] = error
+            filtered_out_samples.append(filtered_sample)
 
     total_count, total_mean = compute_statistics(normalized_errors)
     filtered_count, filtered_mean = compute_statistics(filtered_errors)
@@ -97,6 +119,10 @@ def main() -> None:
             json.dump(filtered_samples, f, indent=2)
         print(f"Wrote filtered samples to {output_path}")
         print(f"Resulting dataset contains {len(filtered_samples)} samples.")
+
+    with filtered_output_path.open("w", encoding="utf-8") as f:
+        json.dump(filtered_out_samples, f, indent=2)
+    print(f"Wrote {len(filtered_out_samples)} filtered-out samples with reasons to {filtered_output_path}")
 
 
 if __name__ == "__main__":
