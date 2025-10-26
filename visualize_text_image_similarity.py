@@ -253,9 +253,9 @@ def main() -> None:
             text_vec = text_vectors[last_key]
             text_label = last_key
             # for text_label, text_vec in text_vectors.items():
-            # if text_vec.numel() == 0 or text_vec.shape[-1] != hidden_dim:
-            #     print(f" - Skipping text vector '{text_label}' with shape {text_vec.shape}")
-            #     continue
+            if text_vec.numel() == 0 or text_vec.shape[-1] != hidden_dim:
+                print(f" - Skipping text vector '{text_label}' with shape {text_vec.shape}")
+                continue
 
             similarity = compute_similarity_map(text_vec, vision_tensor)
             heatmap = upscale_to_image(similarity, original_size)
