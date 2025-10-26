@@ -247,32 +247,35 @@ def main() -> None:
                 print(f" - Skipping vision tensor with non-square token count {token_count}")
                 continue
 
-            print(f"Processing text-image combinations: {[text_label for text_label in text_vectors.keys()]}")
+            text_vectors_list = list(text_vectors.items())
+            last_key = text_vectors_list[-1][0] if text_vectors_list else "none"
 
-            for text_label, text_vec in text_vectors.items():
-                if text_vec.numel() == 0 or text_vec.shape[-1] != hidden_dim:
-                    print(f" - Skipping text vector '{text_label}' with shape {text_vec.shape}")
-                    continue
+            text_vec = text_vectors[last_key]
+            text_label = last_key
+            # for text_label, text_vec in text_vectors.items():
+            # if text_vec.numel() == 0 or text_vec.shape[-1] != hidden_dim:
+            #     print(f" - Skipping text vector '{text_label}' with shape {text_vec.shape}")
+            #     continue
 
-                similarity = compute_similarity_map(text_vec, vision_tensor)
-                heatmap = upscale_to_image(similarity, original_size)
-                overlay = overlay_heatmap(original_image, heatmap, args.cmap, args.alpha, args.min_percentile)
+            similarity = compute_similarity_map(text_vec, vision_tensor)
+            heatmap = upscale_to_image(similarity, original_size)
+            overlay = overlay_heatmap(original_image, heatmap, args.cmap, args.alpha, args.min_percentile)
 
-                text_name = sanitize_label(text_label)
-                vision_name = sanitize_label(vision_label)
-                filename = f"{vision_name}__{text_name}.png"
-                destination_npy = output_dir / 'npy' / filename
-                destination = output_dir / filename
-                destination_npy.parent.mkdir(parents=True, exist_ok=True)
-                heatmap_path = destination_npy.with_suffix(".npy")
+            text_name = sanitize_label(text_label)
+            vision_name = sanitize_label(vision_label)
+            filename = f"{vision_name}__{text_name}.png"
+            destination_npy = output_dir / 'npy' / filename
+            destination = output_dir / filename
+            destination_npy.parent.mkdir(parents=True, exist_ok=True)
+            heatmap_path = destination_npy.with_suffix(".npy")
 
-                if args.skip_existing and destination.exists() and heatmap_path.exists():
-                    print(f" - Skipping existing output for {filename}")
-                    continue
+            # if args.skip_existing and destination.exists() and heatmap_path.exists():
+            #     print(f" - Skipping existing output for {filename}")
+            #     continue
 
-                np.save(heatmap_path, heatmap.cpu().numpy())
-                overlay.save(destination)
-                combinations += 1
+            # np.save(heatmap_path, heatmap.cpu().numpy())
+            overlay.save(destination)
+            combinations += 1
 
     print(f"Generated {combinations} similarity overlays in {output_dir}.")
 

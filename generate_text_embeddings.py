@@ -274,7 +274,7 @@ def main() -> None:
 
         # extract relevant hidden states corresponding to image tokens only
         # allow an optional offset for where image tokens start in the sequence
-        offset = int(getattr(args, "offset_image_token", 15) or 0)
+        offset = int(getattr(args, "offset_image_token", 14) or 0)
         if offset < 0:
             raise ValueError("offset_image_token must be non-negative.")
 
