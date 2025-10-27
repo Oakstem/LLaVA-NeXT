@@ -2,7 +2,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -39,20 +39,37 @@ def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
 
 
 
+def load_qwen3vl_model(
+    model_id: str,
+    *,
+    device_map: Optional[str] = "auto",
+) -> Tuple[AutoProcessor, Qwen3VLForConditionalGeneration]:
+    """Load the Qwen3-VL processor and model."""
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_id,
+        dtype=torch.bfloat16,
+        device_map=device_map or "auto",
+        trust_remote_code=True,
+    )
+    return processor, model
+
+
 def run_qwen3vl_grounding(
     image_path: str,
     query: str,
     model_id: str,
     max_new_tokens: int = 300,
+    *,
+    processor: Optional[AutoProcessor] = None,
+    model: Optional[Qwen3VLForConditionalGeneration] = None,
+    device_map: Optional[str] = "auto",
 ) -> list[dict[str, Any]]:
     """Run the Qwen3-VL model and return detections with pixel bbox and centers."""
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_id,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    owns_model = False
+    if processor is None or model is None:
+        processor, model = load_qwen3vl_model(model_id, device_map=device_map)
+        owns_model = True
 
     img = Image.open(image_path)
     img_width, img_height = img.size
@@ -69,28 +86,49 @@ def run_qwen3vl_grounding(
     ]
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[img], return_tensors="pt", padding=True).to(model.device)
-    out = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    pred = processor.batch_decode(out, skip_special_tokens=True)[0]
-    detections = parse_grounding_predictions(pred)
+    try:
+        inputs = processor(text=[text], images=[img], return_tensors="pt", padding=True).to(model.device)
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        pred = processor.batch_decode(out, skip_special_tokens=True)[0]
+        detections = parse_grounding_predictions(pred)
 
-    for detection in detections:
-        bbox_key = next((key for key in detection.keys() if "bbox" in key), None)
-        if not bbox_key:
-            continue
+        for detection in detections:
+            bbox_key = next((key for key in detection.keys() if "bbox" in key), None)
+            if not bbox_key:
+                continue
 
-        x1_norm, y1_norm, x2_norm, y2_norm = detection[bbox_key]
-        abs_bbox = [
-            int((x1_norm / 1000.0) * img_width),
-            int((y1_norm / 1000.0) * img_height),
-            int((x2_norm / 1000.0) * img_width),
-            int((y2_norm / 1000.0) * img_height),
-        ]
-        detection[bbox_key] = abs_bbox
-        detection["bbox_center"] = [
-            (abs_bbox[0] + abs_bbox[2]) / 2.0,
-            (abs_bbox[1] + abs_bbox[3]) / 2.0,
-        ]
+            x1_raw, y1_raw, x2_raw, y2_raw = detection[bbox_key]
+            max_coord = max(x1_raw, y1_raw, x2_raw, y2_raw)
+            scale = None
+            if max_coord <= 1.001:
+                scale = 1.0
+            elif max_coord <= 1000.0 + 1e-3:
+                scale = 1000.0
+
+            if scale is None:
+                abs_bbox = [
+                    int(x1_raw),
+                    int(y1_raw),
+                    int(x2_raw),
+                    int(y2_raw),
+                ]
+            else:
+                abs_bbox = [
+                    int((x1_raw / scale) * img_width),
+                    int((y1_raw / scale) * img_height),
+                    int((x2_raw / scale) * img_width),
+                    int((y2_raw / scale) * img_height),
+                ]
+
+            detection[bbox_key] = abs_bbox
+            detection["bbox_center"] = [
+                (abs_bbox[0] + abs_bbox[2]) / 2.0,
+                (abs_bbox[1] + abs_bbox[3]) / 2.0,
+            ]
+    finally:
+        img.close()
+        if owns_model:
+            del model  # free GPU memory when we instantiated inside this call
 
     return detections
 
@@ -106,11 +144,14 @@ def main() -> None:
 
     print(f"Loading model: {args.model_id}")
     print(f"Loading image: {args.image_path}")
+    processor, model = load_qwen3vl_model(args.model_id)
     detections = run_qwen3vl_grounding(
         image_path=args.image_path,
         query=args.query,
         model_id=args.model_id,
         max_new_tokens=args.max_new_tokens,
+        processor=processor,
+        model=model,
     )
 
     print(json.dumps(detections, indent=2))
