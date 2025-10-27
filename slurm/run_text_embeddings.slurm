@@ -11,8 +11,8 @@
 #SBATCH --nodes=1
 
 # Configuration variables - adjust via environment overrides when submitting
-TEXT_INPUT="${TEXT_INPUT:-boxer wearing red trunks with \"philipsburg\" and \"everlast\" logos}"
-IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000046/00046933.jpg}"
+TEXT_INPUT="${TEXT_INPUT:-laptop screen with photo of a couple on it}"
+IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000024/00024026.jpg}"
 IMAGE_TEXT="${IMAGE_TEXT:-}"
 TEXT_OUTPUT_PATH="${TEXT_OUTPUT_PATH:-}"
 IMAGE_OUTPUT_PATH="${IMAGE_OUTPUT_PATH:-}"

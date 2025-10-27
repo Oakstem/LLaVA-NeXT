@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from PIL import Image
 import matplotlib.cm as cm
 
+from compute_similarity_focus import compute_similarity_center, draw_circle_with_x
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -46,6 +48,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=85.0,
         help="Percentile threshold (0-100) applied to similarity map before visualization. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--min-area",
+        type=int,
+        default=1,
+        help="Minimum connected-component area (in pixels) retained for center-of-mass calculation. Use 0 to disable.",
     )
     parser.add_argument(
         "--skip-existing",
@@ -259,7 +267,15 @@ def main() -> None:
 
             similarity = compute_similarity_map(text_vec, vision_tensor)
             heatmap = upscale_to_image(similarity, original_size)
+            heatmap_np = heatmap.cpu().numpy()
+            center = compute_similarity_center(
+                heatmap_np,
+                percentile=args.min_percentile,
+                min_area=args.min_area,
+            )
             overlay = overlay_heatmap(original_image, heatmap, args.cmap, args.alpha, args.min_percentile)
+            if center is not None:
+                draw_circle_with_x(overlay, center)
 
             text_name = sanitize_label(text_label)
             vision_name = sanitize_label(vision_label)

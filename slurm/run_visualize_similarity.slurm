@@ -11,14 +11,14 @@
 #SBATCH --nodes=1
 
 # Configuration (override via --export when submitting)
-TEXT_EMB_PATH="${TEXT_EMB_PATH:-embeddings/text/text_embeddings_20251026_135829.pt}"
-IMAGE_EMB_PATH="${IMAGE_EMB_PATH:-embeddings/image/image_embeddings_20251026_135838.pt}"
+TEXT_EMB_PATH="${TEXT_EMB_PATH:-embeddings/text/text_embeddings_20251026_215051.pt}"
+IMAGE_EMB_PATH="${IMAGE_EMB_PATH:-embeddings/image/image_embeddings_20251026_215052.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-similarity_outputs}"
 CMAP="${CMAP:-magma}"
 ALPHA="${ALPHA:-0.45}"
 INCLUDE_VISION_SOURCES="${INCLUDE_VISION_SOURCES:-mm_projected_features,vision_features, vision_hidden_states}"
 SKIP_EXISTING="${SKIP_EXISTING:-false}"
-MIN_PERCENTILE="${MIN_PERCENTILE:-98}"
+MIN_PERCENTILE="${MIN_PERCENTILE:-99.8}"
 
 mkdir -p logs
 

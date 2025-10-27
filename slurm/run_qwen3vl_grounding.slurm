@@ -11,8 +11,8 @@
 #SBATCH --nodes=1
 
 # Configuration variables - adjust via environment overrides when submitting
-IMAGE_PATH="${IMAGE_PATH:-gazefollow/auto_phrase_grounding/test.jpg}"
-QUERY="${QUERY:-Detect all mugs. Return JSON: {\"objects\":[{\"label\":\"mug\",\"bbox\":[x1,y1,x2,y2],\"confidence\":float}]} Coordinates must be absolute pixel ints, origin at top-left. No extra text.}"
+IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000024/00024026.jpg}"
+QUERY="${QUERY:-Detect laptop screen with photo of a couple on it. Return JSON: {\"objects\":[{\"label\":\"object\",\"bbox\":[x1,y1,x2,y2],\"confidence\":float}]} Coordinates must be absolute pixel ints, origin at top-left. No extra text.}"
 OUTPUT_JSON="${OUTPUT_JSON:-grounding_output.json}"
 
 mkdir -p logs
