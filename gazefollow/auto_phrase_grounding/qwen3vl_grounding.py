@@ -106,7 +106,6 @@ def main() -> None:
 
     print(f"Loading model: {args.model_id}")
     print(f"Loading image: {args.image_path}")
-    print("Generating grounding predictions...")
     detections = run_qwen3vl_grounding(
         image_path=args.image_path,
         query=args.query,
