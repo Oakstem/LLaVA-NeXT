@@ -81,3 +81,4 @@ attention_output/
 evaluation_results/
 *.npy
 *.pt
+.venv/
