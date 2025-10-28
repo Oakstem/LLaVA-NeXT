@@ -82,3 +82,5 @@ evaluation_results/
 *.npy
 *.pt
 .venv/
+similarity_outputs/*
+text_embeddings/*
