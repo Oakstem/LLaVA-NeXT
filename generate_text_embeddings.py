@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_ROOT, help="Root directory for saved outputs (subdirs 'text' and 'image').")
     parser.add_argument("--output-path", default=None, help="Explicit path for text outputs (.pt).")
     parser.add_argument("--image-output-path", default=None, help="Explicit path for image outputs (.pt).")
-    parser.add_argument("--offset-image-token", type=int, default=15, help="Token offset where image tokens start in the sequence.")
+    parser.add_argument("--offset-image-token", type=int, default=14, help="Token offset where image tokens start in the sequence.")
     return parser.parse_args()
 
 

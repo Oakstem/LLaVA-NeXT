@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--include-vision-sources",
-        default="mm_projected_features,vision_features",
+        default="mm_projected_features,vision_features,vision_hidden_states",
         help="Comma-separated list of vision feature keys to consider.",
     )
     parser.add_argument(
