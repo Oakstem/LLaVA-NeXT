@@ -33,9 +33,9 @@ def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
             return [parsed]
         if isinstance(parsed, list):
             return parsed
-        raise ValueError("Parsed payload must be a JSON object or array.")
+        raise ValueError(f"Parsed payload must be a JSON object or array: {cleaned}")
 
-    raise ValueError("Unable to locate a JSON payload in the model response.")
+    raise ValueError(f"Unable to locate a JSON payload in the model response: {cleaned}")
 
 
 
@@ -64,6 +64,7 @@ def run_qwen3vl_grounding(
     processor: Optional[AutoProcessor] = None,
     model: Optional[Qwen3VLForConditionalGeneration] = None,
     device_map: Optional[str] = "auto",
+    temperature: float = 0.4,
 ) -> list[dict[str, Any]]:
     """Run the Qwen3-VL model and return detections with pixel bbox and centers."""
     owns_model = False
@@ -86,66 +87,49 @@ def run_qwen3vl_grounding(
     ]
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    try:
-        inputs = processor(text=[text], images=[img], return_tensors="pt", padding=True).to(model.device)
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens)
-        pred = processor.batch_decode(out, skip_special_tokens=True)[0]
-        detections = parse_grounding_predictions(pred)
+    inputs = processor(text=[text], images=[img], return_tensors="pt", padding=True).to(model.device)
+    out = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=temperature, do_sample=temperature > 0)
+    pred = processor.batch_decode(out, skip_special_tokens=True)[0]
+    detections = parse_grounding_predictions(pred)
+    raw_response = pred[pred.find('assistant\n'):].strip("assistant\n")
 
-        for detection in detections:
-            bbox_key = next((key for key in detection.keys() if "bbox" in key), None)
-            if not bbox_key:
-                continue
+    for detection in detections:
+        bbox_key = next((key for key in detection.keys() if "bbox" in key), None)
+        if not bbox_key:
+            continue
 
-            x1_raw, y1_raw, x2_raw, y2_raw = detection[bbox_key]
-            max_coord = max(x1_raw, y1_raw, x2_raw, y2_raw)
-            scale = None
-            if max_coord <= 1.001:
-                scale = 1.0
-            elif max_coord <= 1000.0 + 1e-3:
-                scale = 1000.0
+        x1_norm, y1_norm, x2_norm, y2_norm = detection[bbox_key]
+        abs_bbox = [
+            int((x1_norm / 1000.0) * img_width),
+            int((y1_norm / 1000.0) * img_height),
+            int((x2_norm / 1000.0) * img_width),
+            int((y2_norm / 1000.0) * img_height),
+        ]
+        detection['bbox'] = abs_bbox
+        detection["bbox_center"] = [
+            (abs_bbox[0] + abs_bbox[2]) / 2.0,
+            (abs_bbox[1] + abs_bbox[3]) / 2.0,
+        ]
+        if bbox_key != 'bbox':
+            detection.pop(bbox_key, None)
 
-            if scale is None:
-                abs_bbox = [
-                    int(x1_raw),
-                    int(y1_raw),
-                    int(x2_raw),
-                    int(y2_raw),
-                ]
-            else:
-                abs_bbox = [
-                    int((x1_raw / scale) * img_width),
-                    int((y1_raw / scale) * img_height),
-                    int((x2_raw / scale) * img_width),
-                    int((y2_raw / scale) * img_height),
-                ]
-
-            detection[bbox_key] = abs_bbox
-            detection["bbox_center"] = [
-                (abs_bbox[0] + abs_bbox[2]) / 2.0,
-                (abs_bbox[1] + abs_bbox[3]) / 2.0,
-            ]
-    finally:
-        img.close()
-        if owns_model:
-            del model  # free GPU memory when we instantiated inside this call
-
-    return detections
+    return detections, raw_response
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen3-VL grounding detection")
-    parser.add_argument("--image-path", type=str, default="/mnt/d/Projects/data/gazefollow/train/00000024/00024026.jpg", help="Path to input image")
-    parser.add_argument("--query", type=str, default="Locate the laptop screen with photo of a couple on it, output its bbox coordinates using JSON format.", help="Detection query")
+    parser.add_argument("--image-path", type=str, default="/mnt/d/Projects/data/gazefollow/train/00000065/00065874.jpg", help="Path to input image")
+    parser.add_argument("--query", type=str, default="Locate the wooden planks, output its bbox coordinates using JSON format.", help="Detection query")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen3-VL-4B-Instruct", help="Model ID")
     parser.add_argument("--max-new-tokens", type=int, default=300, help="Max tokens to generate")
     parser.add_argument("--output-json", type=str, default=None, help="Optional path to save detections as JSON")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     args = parser.parse_args()
 
     print(f"Loading model: {args.model_id}")
     print(f"Loading image: {args.image_path}")
     processor, model = load_qwen3vl_model(args.model_id)
-    detections = run_qwen3vl_grounding(
+    detections, raw_response = run_qwen3vl_grounding(
         image_path=args.image_path,
         query=args.query,
         model_id=args.model_id,
