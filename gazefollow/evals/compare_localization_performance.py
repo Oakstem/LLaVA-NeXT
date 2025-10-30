@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+# Add parent directory to path to enable imports from gazefollow
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from gazefollow.qwen3vl_utils import infer_in_out_from_phrase
 
@@ -90,6 +94,7 @@ def has_valid_coordinates(coords: object) -> bool:
 @dataclass
 class DatasetMetrics:
     path: Path
+    adapter_path: Optional[str] = None
     total_samples: int = 0
     false_negatives: int = 0
     false_positives: int = 0
@@ -101,8 +106,38 @@ class DatasetMetrics:
     intersection_mean_error: Optional[float] = None
 
 
+def format_dataset_reference(dataset: DatasetMetrics) -> str:
+    if dataset.adapter_path:
+        return f"{dataset.path} [adapter: {dataset.adapter_path}]"
+    return str(dataset.path)
+
+
+def load_adapter_suffix(result_path: Path) -> Optional[str]:
+    config_path = result_path.parent / "evaluation_config.json"
+    if not result_path.parent.stem.startswith("eval_") and "baseline" not in result_path.parent.stem:
+        config_path = result_path.parent.parent / "evaluation_config.json"
+    if not config_path.is_file():
+        return None
+
+    try:
+        config = json.loads(config_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse {config_path}: {exc}") from exc
+
+    adapter_value = config.get("adapter_path")
+    if not adapter_value or not isinstance(adapter_value, str):
+        return None
+
+    parts = Path(adapter_value).parts
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+
+    return adapter_value if parts else adapter_value
+
+
 def load_dataset_metrics(path: Path) -> DatasetMetrics:
     dataset = DatasetMetrics(path=path)
+    dataset.adapter_path = load_adapter_suffix(path)
 
     try:
         entries = json.loads(path.read_text())
@@ -217,6 +252,7 @@ def report_top_differences(
     top_k: int,
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
+    baseline_reference = format_dataset_reference(baseline)
 
     for ds in datasets:
         if ds is baseline:
@@ -238,13 +274,18 @@ def report_top_differences(
         ranked.sort(key=lambda entry: entry[0], reverse=True)
         top_entries = ranked[:top_k]
         dataset_key = str(ds.path)
+        dataset_reference = format_dataset_reference(ds)
         dataset_result = {
+            "path": str(ds.path),
+            "adapter_path": ds.adapter_path,
             "total_shared_samples": len(shared_ids),
             "truncated_count": max(len(ranked) - len(top_entries), 0),
             "top_differences": [],
         }
 
-        print(f"Top {len(top_entries)} normalized L2 error diffs vs baseline for {ds.path}:")
+        print(
+            f"Top {len(top_entries)} normalized L2 error diffs vs baseline {baseline_reference} for {dataset_reference}:"
+        )
         if not top_entries:
             print("  No shared samples with normalized L2 error available.\n")
             results[dataset_key] = dataset_result
@@ -308,8 +349,11 @@ def main() -> int:
     print(f"Evaluated {len(datasets)} localization file(s) under {args.root}")
     print(f"Intersection of valid gaze samples: {len(intersection)}\n")
 
+    dataset_summaries: Dict[str, Dict[str, Any]] = {}
+
     for ds in datasets:
-        print(str(ds.path))
+        path_key = str(ds.path)
+        print(format_dataset_reference(ds))
         print(f"  total_samples: {ds.total_samples}")
         print(f"  false_negatives (in_out=1 & missing gaze): {ds.false_negatives}")
         print(f"  false_positives (in_out=0 & gaze present): {ds.false_positives}")
@@ -323,12 +367,37 @@ def main() -> int:
             )
         print()
 
+        dataset_summaries[path_key] = {
+            "path": path_key,
+            "adapter_path": ds.adapter_path,
+            "total_samples": ds.total_samples,
+            "false_negatives": ds.false_negatives,
+            "false_positives": ds.false_positives,
+            "valid_gaze_samples": len(ds.valid_ids),
+            "intersection_mean_gaze_normalized_l2_error": ds.intersection_mean_error,
+            "missing_intersection_errors": ds.missing_intersection_errors,
+        }
+
     top_diff_results = report_top_differences(baseline, datasets, args.top_k)
 
+    combined_results: Dict[str, Dict[str, Any]] = {}
+    for path_key, metrics_summary in dataset_summaries.items():
+        diff_summary = top_diff_results.get(path_key, {})
+        combined_results[path_key] = {
+            **metrics_summary,
+            "total_shared_samples": diff_summary.get("total_shared_samples", 0),
+            "truncated_count": diff_summary.get("truncated_count", 0),
+            "top_differences": diff_summary.get("top_differences", []),
+        }
+
     summary = {
-        "baseline_path": str(baseline.path),
+        "root": str(args.root),
         "top_k": args.top_k,
-        "datasets": top_diff_results,
+        "intersection_size": len(intersection),
+        "baseline": {
+            "path": str(baseline.path),
+        },
+        "datasets": combined_results,
     }
     write_top_diff_json(args.output_json, summary)
     print(f"Top difference details saved to {args.output_json}")
