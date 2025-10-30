@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,9 +65,10 @@ class EvaluationConfig:
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "EvaluationConfig":
         if args.output_dir is None:
-            dataset_stem = Path(args.dataset_json).stem
+            dataset_stem = Path(args.dataset_json).parent.stem
+            dataset_dir = Path(args.dataset_json).parent
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            args.output_dir = f"./evaluation__run_{dataset_stem}_{timestamp}"
+            args.output_dir = f"{dataset_dir}/qwen3vl_grounding_run_{dataset_stem}_{timestamp}"
         return cls(
             dataset_json=Path(args.dataset_json),
             images_dir=Path(args.images_dir),
@@ -140,6 +142,63 @@ def extract_bbox(detection: Dict[str, Any]) -> Optional[List[int]]:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+_OUTSIDE_PATTERNS = (
+    re.compile(r"\bout\s+of\s+(?:frame|image|view|screen)\b"),
+    re.compile(r"\bout\s+of\s+(?:shot|picture|photo)\b"),
+    re.compile(r"\bout-of-(?:frame|view)\b"),
+    re.compile(r"\boff[-\s]?camera\b"),
+    re.compile(r"\boff[-\s]?screen\b"),
+    re.compile(r"\boffscreen\b"),
+    re.compile(r"\boutside\b"),
+    re.compile(r"\boutside\s+(?:of\s+)?the\s+(?:frame|image|photo|picture)\b"),
+    re.compile(r"\bout\s+the\s+(?:frame|image)\b"),
+    re.compile(r"\bnot\s+in\s+(?:frame|image|view)\b"),
+)
+
+_GENERIC_ONLY_PHRASES = {
+    "someone",
+    "somebody",
+    "somewhere",
+    "something",
+    "unknown",
+    "none",
+    "nothing",
+    "n/a",
+    "n.a.",
+    "unsure",
+}
+
+
+def infer_in_out_from_phrase(phrase: Optional[str]) -> Optional[int]:
+    """
+    Heuristically infer whether a gaze target phrase refers to an in-frame (1) or out-of-frame (0) target.
+
+    Returns 0 if the phrase appears to reference an out-of-frame target, 1 if it appears in-frame,
+    and None if no determination can be made (e.g., empty phrase).
+    """
+    if phrase is None:
+        return None
+
+    normalized = phrase.strip().lower()
+    if not normalized:
+        return None
+
+    for pattern in _OUTSIDE_PATTERNS:
+        if pattern.search(normalized):
+            return 0
+
+    cleaned = re.sub(r"[\s\W]+", " ", normalized).strip()
+    if not cleaned:
+        return None
+
+    if cleaned in _GENERIC_ONLY_PHRASES or any(
+        cleaned.startswith(prefix) for prefix in ("someone or something", "something or someone")
+    ):
+        return 0
+
+    return 1
 
 
 def extract_score(detection: Dict[str, Any]) -> Optional[float]:
