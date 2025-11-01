@@ -10,12 +10,13 @@ model evaluation.
 
 from __future__ import annotations
 
+
 import argparse
 import json
 import statistics
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PIL import Image
 from tqdm import tqdm
@@ -26,6 +27,7 @@ from auto_phrase_grounding.detect_gaze_targets import (
     normalize_person_description,
     parse_person_descriptions,
 )
+from data_proc.add_in_out_labels import load_in_out_lookup
 from auto_phrase_grounding.qwen3vl_grounding import (
     load_qwen3vl_model,
     run_qwen3vl_grounding,
@@ -47,6 +49,7 @@ try:  # Allow execution both as a module and via direct script invocation.
         choose_best_detection_by_error,
         extract_bbox,
         extract_score,
+        resolve_in_out_label,
         log_results_to_wandb,
         persist_evaluation_results,
         print_metrics,
@@ -62,10 +65,12 @@ except ImportError:  # pragma: no cover - fallback for CLI execution.
         choose_best_detection_by_error,
         extract_bbox,
         extract_score,
+        resolve_in_out_label,
         log_results_to_wandb,
         persist_evaluation_results,
         print_metrics,
     )
+    from data_proc.add_in_out_labels import load_in_out_lookup
 
 
 def load_image_rgb(path: Path) -> Image.Image:
@@ -171,6 +176,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use gpt_gaze_target and gpt_person_description fields from the dataset instead of parsing ground truth text.",
     )
+    parser.add_argument(
+        "--in-out-labels-csv",
+        default="gazefollow/data/combined_description_results.csv",
+        help="Optional CSV file produced by add_in_out_labels.py to supply in/out annotations.",
+    )
     return parser.parse_args()
 
 
@@ -217,6 +227,7 @@ def resolve_image_path(image_value: str, images_dir: Path) -> Optional[Path]:
             return alt
     return None
 
+
 def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     dataset = load_dataset(config.dataset_json, config.limit)
     images_dir = config.images_dir
@@ -231,6 +242,11 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
         print("Using parsed ground truth text for gaze targets")
 
     combined_cache = load_combined_description_cache()
+    in_out_lookup = load_in_out_lookup(config.in_out_labels_csv) if config.in_out_labels_csv else None
+    if in_out_lookup is not None:
+        print(f"Loaded in/out labels from {config.in_out_labels_csv} ({len(in_out_lookup)} entries)")
+    missing_in_out: Set[str] = set()
+    in_out_counts = {0: 0, 1: 0}
 
     sample_records: List[Dict[str, Any]] = []
     person_records: List[PersonLevelRecord] = []
@@ -381,6 +397,12 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
         samples_with_person_descriptions += 1
         total_person_descriptions += len(persons)
 
+        in_out_value = resolve_in_out_label(sample, in_out_lookup, persons)
+        if in_out_value is not None:
+            in_out_counts[in_out_value] = in_out_counts.get(in_out_value, 0) + 1
+        elif config.in_out_labels_csv or sample.get("in_out") is not None:
+            missing_in_out.add(str(sample_id))
+
         sample_entry: Dict[str, Any] = {
             "id": sample_id,
             "image_path": str(image_path),
@@ -394,6 +416,8 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
             },
             "gaze_detections": {},
         }
+        if in_out_value is not None:
+            sample_entry["in_out"] = in_out_value
 
         any_detection_for_sample = False
 
@@ -517,6 +541,10 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
         "average_time_per_sample": duration / total_samples if total_samples else 0.0,
         "failed_samples": len(failed_samples),
     }
+    metrics["samples_with_in_out"] = in_out_counts[0] + in_out_counts[1]
+    metrics["in_out_in_frame"] = in_out_counts[1]
+    metrics["in_out_out_of_frame"] = in_out_counts[0]
+    metrics["missing_in_out"] = len(missing_in_out)
 
     if gaze_l2_errors:
         metrics["gaze_l2_error_mean"] = sum(gaze_l2_errors) / len(gaze_l2_errors)

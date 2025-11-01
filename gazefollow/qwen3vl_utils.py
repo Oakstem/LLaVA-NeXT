@@ -3,16 +3,19 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict
 
 try:  # Allow execution both as a module and via direct script invocation.
     from .gaze_metrics import compute_gaze_errors, persist_ground_truth_updates
+    from .data_proc.add_in_out_labels import iter_normalized_keys
 except ImportError:  # pragma: no cover - fallback for CLI execution.
     from gaze_metrics import compute_gaze_errors, persist_ground_truth_updates
+    from data_proc.add_in_out_labels import iter_normalized_keys
 
 
 class FailureRecord(TypedDict):
@@ -61,6 +64,7 @@ class EvaluationConfig:
     wandb_run_name: Optional[str]
     wandb_run_name_suffix: str
     use_gpt_gaze_targets: bool
+    in_out_labels_csv: Optional[Path]
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "EvaluationConfig":
@@ -87,6 +91,7 @@ class EvaluationConfig:
             wandb_run_name=args.wandb_run_name,
             wandb_run_name_suffix=args.wandb_run_name_suffix,
             use_gpt_gaze_targets=args.use_gpt_gaze_targets,
+            in_out_labels_csv=Path(args.in_out_labels_csv) if args.in_out_labels_csv else None,
         )
 
     def resolved_device_map(self) -> str:
@@ -210,6 +215,101 @@ def extract_score(detection: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def coerce_in_out_value(value: Any) -> Optional[int]:
+    """Normalize free-form in/out annotations to {0, 1}."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return 1 if value >= 1 else 0
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        return 1 if value >= 0.5 else 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        lowered = stripped.lower()
+        if lowered in {"1", "in", "inside", "inframe", "in-frame", "in_frame"}:
+            return 1
+        if lowered in {"0", "out", "outside", "outframe", "out-frame", "out_frame", "offscreen", "off-screen"}:
+            return 0
+        try:
+            numeric = float(stripped)
+        except ValueError:
+            return None
+        if math.isnan(numeric):
+            return None
+        return 1 if numeric >= 0.5 else 0
+    return None
+
+
+_IN_OUT_LOOKUP_FIELDS: Tuple[str, ...] = (
+    "id",
+    "image",
+    "image_path",
+    "relative_path",
+    "image_relative_path",
+)
+
+
+def collect_in_out_lookup_keys(sample: Mapping[str, Any]) -> List[str]:
+    """Generate normalized lookup keys for matching external in/out labels."""
+    keys: List[str] = []
+    seen: Set[str] = set()
+
+    def _extend(value: Any) -> None:
+        for key in iter_normalized_keys(value):
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+    for field in _IN_OUT_LOOKUP_FIELDS:
+        _extend(sample.get(field))
+
+    metadata = sample.get("metadata")
+    if isinstance(metadata, Mapping):
+        for field in _IN_OUT_LOOKUP_FIELDS:
+            _extend(metadata.get(field))
+
+    return keys
+
+
+def resolve_in_out_label(
+    sample: Mapping[str, Any],
+    lookup: Optional[Mapping[str, Any]],
+    descriptions: Optional[Iterable[Any]],
+) -> Optional[int]:
+    """
+    Resolve an in/out flag for a dataset sample using embedded annotations,
+    an external lookup table, or gaze phrase heuristics.
+    """
+    value = coerce_in_out_value(sample.get("in_out"))
+
+    if value is None and lookup:
+        for key in collect_in_out_lookup_keys(sample):
+            mapped = lookup.get(key)
+            normalized = coerce_in_out_value(mapped)
+            if normalized is not None:
+                value = normalized
+                break
+
+    if value is None and descriptions:
+        fallback: Optional[int] = None
+        for entity in descriptions:
+            inferred = infer_in_out_from_phrase(getattr(entity, "gaze_target", None))
+            if inferred is not None:
+                if inferred == 0:
+                    return 0
+                fallback = inferred
+        if fallback is not None:
+            value = fallback
+
+    return value
+
+
 def choose_best_detection_by_error(
     detections: List[Dict[str, Any]],
     ground_truth_point: Tuple[float, float],
@@ -323,7 +423,7 @@ def persist_evaluation_results(config: EvaluationConfig, results: EvaluationResu
         failed_path = config.output_dir / "failures.json"
         with failed_path.open("w", encoding="utf-8") as failed_file:
             json.dump(results.failed_samples, failed_file, indent=2, ensure_ascii=False)
-
+    print(f"Persisted evaluation results to {config.output_dir}")
     return PersistedPaths(
         metrics_path=metrics_path,
         records_path=records_path,
