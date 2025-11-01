@@ -14,7 +14,8 @@
 ###############################################################################
 DATASET_JSON="${DATASET_JSON:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/val.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-DEFAULT_OUTPUT_DIR="./evaluation_results/qwen3vl_dataset_eval_$(date +%Y%m%d_%H%M%S)"
+DATASET_DIR="$(dirname "$DATASET_JSON")"
+DEFAULT_OUTPUT_DIR="evaluation_results/${DATASET_DIR%/}/qwen3vl_grounding_eval_$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
 LIMIT="${LIMIT:-}"  # Optional subset size for debugging
 
