@@ -9,6 +9,25 @@ from PIL import Image
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 
+class _TorchCompilerStub:
+    @staticmethod
+    def is_compiling() -> bool:
+        return False
+
+
+def _ensure_torch_compiler_stub() -> None:
+    """Patch older torch builds missing torch.compiler.is_compiling."""
+    compiler = getattr(torch, "compiler", None)
+    if compiler is None:
+        torch.compiler = _TorchCompilerStub()
+        return
+    if not hasattr(compiler, "is_compiling"):
+        compiler.is_compiling = lambda: False
+
+
+_ensure_torch_compiler_stub()
+
+
 def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
     """Extract the first JSON payload from the model response."""
     cleaned = raw_text.strip()
