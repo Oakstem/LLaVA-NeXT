@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Iterable, List, Sequence
 
 DATASET_RESULTS_NAME = "dataset_localization_results_inout.json"
+DATASET_RESULTS_NAME2 = "dataset_localization_results.json"
 MODEL_GENERATION_NAME = "model_generation_results.json"
 
 
@@ -28,6 +29,7 @@ class EvaluationJob:
     directory: Path
     dataset_json: Path
     sample_count: int
+    job_name: str
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -79,7 +81,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def has_existing_localization(directory: Path) -> bool:
-    return any(directory.rglob(DATASET_RESULTS_NAME))
+    return any(directory.rglob(DATASET_RESULTS_NAME)) or any(directory.rglob(DATASET_RESULTS_NAME2))
 
 
 def count_samples(dataset_json: Path) -> int:
@@ -115,7 +117,18 @@ def collect_jobs(evaluation_root: Path, min_samples: int) -> List[EvaluationJob]
             continue
         if sample_count <= min_samples:
             continue
-        jobs.append(EvaluationJob(directory=directory, dataset_json=dataset_json, sample_count=sample_count))
+        config_file = directory / "evaluation_config.json"
+        if not config_file.is_file():
+            print(f"[warn] {directory.name}: missing evaluation_config.json")
+            continue
+        with config_file.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        adapter_path = config.get("adapter_path")
+        if adapter_path is not None:
+            job_name = "_".join(Path(adapter_path).parts[-2:])
+        else:
+            job_name = "baseline"
+        jobs.append(EvaluationJob(directory=directory, dataset_json=dataset_json, sample_count=sample_count, job_name=job_name))
     return jobs
 
 
@@ -127,6 +140,9 @@ def build_command(python_exec: Path, evaluator: Path, job: EvaluationJob, images
         str(job.dataset_json),
         "--images-dir",
         str(images_dir),
+        "--wandb-run-name",
+        job.job_name,
+
     ]
     if extra_args:
         command.extend(extra_args)
