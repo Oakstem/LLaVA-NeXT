@@ -78,7 +78,7 @@ attention_output/
 *.csv
 *.json
 *.sh
-evaluation_results/
+evaluation_result*/
 *.npy
 *.pt
 .venv/

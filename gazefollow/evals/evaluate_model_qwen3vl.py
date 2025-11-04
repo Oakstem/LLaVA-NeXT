@@ -7,8 +7,6 @@ with the Qwen3-VL vision-language model to localize gaze targets mentioned in mo
 """
 
 import argparse
-import importlib
-import importlib.util
 import json
 import math
 import os
@@ -30,7 +28,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from gazefollow.auto_phrase_grounding.detect_gaze_targets import (
-    extract_gaze_metrics_from_generation,
     normalize_gaze_target_text,
     normalize_person_description,
     parse_person_descriptions,
@@ -71,6 +68,8 @@ from llava.constants import (
 )
 from llava.conversation import conv_templates
 
+from log_wandb_evaluations import DEFAULT_PROJECT, log_evaluation_directory
+
 
 @dataclass
 class EvaluationSampleOutput:
@@ -97,48 +96,6 @@ class JsonConversationDataset:
 
     def __len__(self) -> int:
         return len(self.list_data_dict)
-
-def load_wandb_config_from_checkpoint(model_path: str) -> Dict[str, Any]:
-    """
-    Try to load wandb configuration from training output directory.
-    Looks for trainer_state.json or wandb config files.
-    """
-    path = Path(model_path).resolve()
-    
-    # Navigate to run directory
-    if path.name.startswith("checkpoint-"):
-        run_dir = path.parent
-    else:
-        run_dir = path
-    
-    # Try to find trainer_state.json in parent directory
-    trainer_state_file = run_dir / "trainer_state.json"
-    if trainer_state_file.exists():
-        with open(trainer_state_file, 'r') as f:
-            trainer_state = json.load(f)
-            return {
-                "best_model_checkpoint": trainer_state.get("best_model_checkpoint"),
-                "log_history": trainer_state.get("log_history", []),
-            }
-    
-    # Try to find wandb directory
-    wandb_dir = run_dir / "wandb"
-    if wandb_dir.exists():
-        # Look for latest run directory
-        run_dirs = sorted([d for d in wandb_dir.iterdir() if d.is_dir() and d.name.startswith("run-")])
-        if run_dirs:
-            latest_run = run_dirs[-1]
-            config_file = latest_run / "files" / "config.yaml"
-            if config_file.exists():
-                yaml_spec = importlib.util.find_spec("yaml")
-                if yaml_spec is None:
-                    print("Warning: PyYAML not available. Skipping wandb config load.")
-                else:
-                    yaml = importlib.import_module("yaml")
-                    with open(config_file, 'r') as f:
-                        return yaml.safe_load(f)
-    
-    return {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -235,10 +192,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Print detailed progress information.")
     parser.add_argument("--safe-mode", action="store_true", help="Enable safe mode with more aggressive memory cleanup and smaller batches.")
     parser.add_argument("--no-loss", action="store_true", help="Disable loss calculation entirely to avoid CUDA errors.")
-    parser.add_argument("--log-to-wandb", action="store_true", help="Log evaluation results to wandb using the same run_id as training.")
-    parser.add_argument("--wandb-project", default="llava-gazefollow-finetune", help="Wandb project name (optional, will try to infer from training config).")
-    parser.add_argument("--wandb-entity", default="gylab", help="Wandb entity name (optional, will try to infer from training config).")
-    parser.add_argument("--wandb-run-name-suffix", default="", help="Optional suffix to append to the wandb run name.")
+    parser.add_argument(
+        "--log-to-wandb",
+        action="store_true",
+        default=True,
+        help="Log evaluation results to Weights & Biases using the shared logging helper.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default=DEFAULT_PROJECT,
+        help="Weights & Biases project name to use when logging evaluations.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        default=None,
+        help="Optional Weights & Biases entity/organization name.",
+    )
     parser.add_argument(
         "--focus-loss-after-looking",
         action="store_true",
@@ -918,66 +887,6 @@ def build_generation_kwargs(args: argparse.Namespace, tokenizer) -> Dict[str, An
     return generation_kwargs
 
 
-def initialize_wandb_run(
-    args: argparse.Namespace,
-    conv_template: str,
-    generation_kwargs: Dict[str, Any],
-) -> Tuple[Optional[Any], Optional[Any]]:
-    """Initialize a wandb run if available."""
-    wandb_spec = importlib.util.find_spec("wandb")
-    if wandb_spec is None:
-        print("Warning: wandb not available. Install with: pip install wandb")
-        return None, None
-
-    wandb = importlib.import_module("wandb")
-
-    if not args.adapter_path:
-        run_id = "Baseline"
-        print("Warning: No adapter path provided, cannot extract run_id. Using 'Baseline'.")
-    else:
-        run_parent = Path(args.adapter_path).resolve().parent.name
-        run_name = Path(args.adapter_path).name
-        run_id = f"{run_parent}_{run_name}" if run_name.startswith("checkpoint-") else run_parent
-
-    if not run_id:
-        run_id = "Baseline"
-
-    wandb_config = load_wandb_config_from_checkpoint(args.model_path)
-    project = args.wandb_project or wandb_config.get("wandb_project") or "llava-evaluation"
-    entity = args.wandb_entity or wandb_config.get("wandb_entity")
-
-    run_name = f"{run_id}"
-    if args.wandb_run_name_suffix:
-        run_name = f"{run_name}_{args.wandb_run_name_suffix}"
-
-    run = wandb.init(
-        project=project,
-        entity=entity,
-        id=run_id,
-        resume="allow",
-        name=run_name,
-        job_type="evaluation",
-        config={
-            "model_path": args.model_path,
-            "dataset_json": args.dataset_json,
-            "images_dir": args.images_dir,
-            "conv_template": conv_template,
-            "generation_kwargs": generation_kwargs,
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "num_beams": args.num_beams,
-            "do_sample": args.do_sample,
-            "limit": args.limit,
-            "focus_loss_after_looking": args.focus_loss_after_looking,
-            "focus_loss_phrase": args.focus_loss_phrase if args.focus_loss_after_looking else None,
-            "focus_loss_threshold": args.focus_loss_threshold if args.focus_loss_after_looking else None,
-        },
-    )
-    print(f"Initialized wandb run: {run.name} (project: {project})")
-
-    return wandb, run
-
 
 def main():
     args = parse_args()
@@ -1028,13 +937,6 @@ def main():
             model.config.focus_loss_after_phrase = True
             model.config.focus_loss_phrase_token_ids = focus_phrase_token_ids
             model.config.focus_loss_missing_value = args.focus_loss_threshold
-
-    wandb_module: Optional[Any] = None
-    wandb_run: Optional[Any] = None
-    if args.log_to_wandb:
-        wandb_module, wandb_run = initialize_wandb_run(args, conv_template, generation_kwargs)
-        if wandb_run is None:
-            args.log_to_wandb = False
 
     print("\n2. Loading dataset...")
     dataset_samples = load_dataset(args.dataset_json, args.limit)
@@ -1434,64 +1336,22 @@ def main():
     if missing_in_out_samples:
         print(f"\n⚠️  Missing in_out labels for {len(missing_in_out_samples)} samples.")
 
-    if args.log_to_wandb and wandb_module is not None and wandb_run is not None:
-        numeric_metrics = {
-            f"eval/{k}": v for k, v in final_metrics.items() if isinstance(v, (int, float, bool))
-        }
-        wandb_module.log(numeric_metrics)
-
-        if generate_model_results and model_generation_records:
-            generation_table = wandb_module.Table(
-                columns=[
-                    "id",
-                    "prompt_source",
-                    "prompt_used",
-                    "ground_truth",
-                    "ground_truth_gaze_target",
-                    "model_prediction",
-                    "gaze_target",
-                    "gaze_detections",
-                    "loss",
-                    "gaze_l2_error",
-                    "gaze_normalized_l2_error",
-                ]
+    if args.log_to_wandb:
+        try:
+            logged_run = log_evaluation_directory(
+                output_dir,
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                min_total_samples=0,
             )
-            for entry in model_generation_records:
-                ground_truth_gaze_target, gaze_target, gaze_l2_error, gaze_normalized_l2_error = (
-                    extract_gaze_metrics_from_generation(entry, focus_phrase=args.focus_loss_phrase)
+            if logged_run is not None:
+                print(f"\n✅ Logged evaluation results to wandb run: {logged_run.run_name}")
+            else:
+                print(
+                    "\n⚠️  Skipped wandb logging: evaluation directory did not meet logging requirements."
                 )
-                generation_table.add_data(
-                    entry.get("id"),
-                    entry.get("prompt_source"),
-                    entry.get("prompt_used"),
-                    entry.get("ground_truth", ""),
-                    ground_truth_gaze_target,
-                    entry.get("model_prediction"),
-                    gaze_target,
-                    json.dumps(entry.get("gaze_detections", {}), ensure_ascii=False),
-                    entry.get("loss"),
-                    gaze_l2_error,
-                    gaze_normalized_l2_error,
-                )
-            wandb_module.log({"model_generation/results": generation_table})
-
-        artifact = wandb_module.Artifact(
-            name=f"evaluation_results_{wandb_run.id}",
-            type="evaluation",
-            description=f"Evaluation results for {args.model_path}",
-        )
-        artifact.add_file(str(metrics_file), name="metrics.json")
-        if args.save_predictions and predictions_file.exists():
-            artifact.add_file(str(predictions_file), name="predictions.json")
-        if failed_samples and failed_file.exists():
-            artifact.add_file(str(failed_file), name="failed_samples.json")
-        artifact.add_file(str(config_file), name="evaluation_config.json")
-        if generate_model_results and model_generation_file and model_generation_file.exists():
-            artifact.add_file(str(model_generation_file), name="model_generation_results.json")
-
-        wandb_module.log_artifact(artifact)
-        print(f"\n✅ Logged evaluation results to wandb run: {wandb_run.name}")
-        wandb_module.finish()
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n⚠️  Failed to log evaluation results to wandb: {exc}")
 
     print("\nEvaluation completed successfully!")
     if failed_samples:
