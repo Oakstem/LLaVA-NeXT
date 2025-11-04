@@ -210,11 +210,12 @@ def prepare_evaluation_run(
         return None
     adapter_path = config.get("adapter_path")
     if not adapter_path:
-        logging.warning(
-            "Skipping %s: evaluation_config.json does not define adapter_path.",
-            eval_dir,
-        )
-        return None
+        adapter_path = "baseline"
+        # logging.warning(
+        #     "Skipping %s: evaluation_config.json does not define adapter_path.",
+        #     eval_dir,
+        # )
+        # return None
 
     run_name = build_run_name_from_adapter(adapter_path)
     mtime = max(metrics_path.stat().st_mtime, config_path.stat().st_mtime)
