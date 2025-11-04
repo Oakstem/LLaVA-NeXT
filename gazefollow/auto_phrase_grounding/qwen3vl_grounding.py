@@ -2,11 +2,46 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+
+def _ensure_torch_pytree_register() -> None:
+    """Backport torch pytree register API expected by newer transformers."""
+    pytree = getattr(getattr(torch, "utils", None), "_pytree", None)
+    if pytree is None:
+        return
+    if not hasattr(pytree, "register_pytree_node") and hasattr(pytree, "_register_pytree_node"):
+        pytree.register_pytree_node = pytree._register_pytree_node  # type: ignore[attr-defined]
+
+
+_ensure_torch_pytree_register()
+
+import transformers
+from transformers import AutoProcessor
+
+try:  # transformers >= 4.44
+    from transformers import Qwen3VLForConditionalGeneration  # type: ignore
+except ImportError:
+    Qwen3VLForConditionalGeneration = None  # type: ignore[assignment]
+
+try:  # transformers >= 4.50 (Qwen2-VL rename)
+    from transformers import Qwen2VLForConditionalGeneration  # type: ignore
+except ImportError:
+    Qwen2VLForConditionalGeneration = None  # type: ignore[assignment]
+
+try:  # fallback for older wheels with trust_remote_code
+    from transformers import AutoModelForVision2Seq  # type: ignore
+except ImportError:
+    AutoModelForVision2Seq = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+    QwenModelT = PreTrainedModel
+else:
+    QwenModelT = Any  # runtime typing
 
 
 class _TorchCompilerStub:
@@ -52,9 +87,8 @@ def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
             return [parsed]
         if isinstance(parsed, list):
             return parsed
-        raise ValueError(f"Parsed payload must be a JSON object or array: {cleaned}")
 
-    raise ValueError(f"Unable to locate a JSON payload in the model response: {cleaned}")
+    return []
 
 
 
@@ -62,15 +96,48 @@ def load_qwen3vl_model(
     model_id: str,
     *,
     device_map: Optional[str] = "auto",
-) -> Tuple[AutoProcessor, Qwen3VLForConditionalGeneration]:
+) -> Tuple[AutoProcessor, QwenModelT]:
     """Load the Qwen3-VL processor and model."""
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_id,
-        dtype=torch.bfloat16,
-        device_map=device_map or "auto",
-        trust_remote_code=True,
-    )
+    if Qwen3VLForConditionalGeneration is not None:
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16,
+            device_map=device_map or "auto",
+            trust_remote_code=True,
+        )
+    elif Qwen2VLForConditionalGeneration is not None:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16,
+            device_map=device_map or "auto",
+            trust_remote_code=True,
+        )
+    elif AutoModelForVision2Seq is not None:
+        try:
+            model = AutoModelForVision2Seq.from_pretrained(  # type: ignore[call-arg]
+                model_id,
+                dtype=torch.bfloat16,
+                device_map=device_map or "auto",
+                trust_remote_code=True,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "does not recognize this architecture" in message and "qwen" in message.lower():
+                raise RuntimeError(
+                    (
+                        f"Transformers {transformers.__version__} cannot load '{model_id}' "
+                        "because the `qwen3_vl` architecture is newer than this environment. "
+                        "Upgrade transformers to >=4.45 (recommended 4.47+) or choose a different "
+                        "GAZE_MODEL_ID such as Qwen/Qwen2-VL-7B-Instruct."
+                    )
+                ) from exc
+            raise
+    else:
+        raise ImportError(
+            "Your transformers installation does not expose Qwen3-VL or AutoModelForVision2Seq. "
+            "Upgrade transformers (>= 4.44) or install the Qwen3-VL integration."
+        )
     return processor, model
 
 
@@ -81,7 +148,7 @@ def run_qwen3vl_grounding(
     max_new_tokens: int = 300,
     *,
     processor: Optional[AutoProcessor] = None,
-    model: Optional[Qwen3VLForConditionalGeneration] = None,
+    model: Optional[QwenModelT] = None,
     device_map: Optional[str] = "auto",
     temperature: float = 0.4,
 ) -> list[dict[str, Any]]:
