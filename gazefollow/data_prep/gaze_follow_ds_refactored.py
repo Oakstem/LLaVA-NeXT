@@ -453,7 +453,7 @@ class PersonMatcher:
             person_bbox = person_data['person']['boxes'][0]
             iou = self.calculate_bbox_iou(gt_person_bbox, person_bbox)
             
-            if iou > 0:
+            if iou > 0.5:
                 all_intersects.append([iou, person_id])
         
         if not all_intersects:
