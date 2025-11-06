@@ -15,6 +15,21 @@ from typing import Dict, List, MutableMapping, Sequence, Tuple
 DEFAULT_PROJECT = "llava-model-eval"
 MIN_TOTAL_SAMPLES = 1000
 MIN_SUCCESS_RATE = 0.5
+MODEL_GENERATION_RESULTS_FILENAME = "model_generation_results.json"
+GENERATION_TABLE_COLUMNS = [
+    "id",
+    "person_description",
+    "ground_truth",
+    "model_prediction",
+    "gaze_predicted_target",
+    "gaze_ground_truth",
+    "predicted_gaze",
+    "gaze_normalized_l2_error",
+    "loss",
+    "image_width",
+    "image_height",
+    "in_out",
+]
 
 
 @dataclass
@@ -29,6 +44,7 @@ class EvaluationRun:
     metrics_path: Path
     config_path: Path
     mtime: float
+    generation_samples: List[Dict[str, object]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,6 +235,7 @@ def prepare_evaluation_run(
 
     run_name = build_run_name_from_adapter(adapter_path)
     mtime = max(metrics_path.stat().st_mtime, config_path.stat().st_mtime)
+    generation_samples = load_generation_samples(eval_dir)
     return EvaluationRun(
         run_name=run_name,
         adapter_path=str(adapter_path),
@@ -228,7 +245,110 @@ def prepare_evaluation_run(
         metrics_path=metrics_path,
         config_path=config_path,
         mtime=mtime,
+        generation_samples=generation_samples,
     )
+
+
+def load_generation_samples(eval_dir: Path) -> List[Dict[str, object]]:
+    results_path = eval_dir / MODEL_GENERATION_RESULTS_FILENAME
+    if not results_path.is_file():
+        logging.debug(
+            "No %s found for %s; skipping generation table logging.",
+            MODEL_GENERATION_RESULTS_FILENAME,
+            eval_dir,
+        )
+        return []
+
+    raw_samples = load_json(results_path)
+    if not isinstance(raw_samples, list):
+        logging.warning(
+            "Expected %s to contain a list, but found %s. Skipping.",
+            results_path,
+            type(raw_samples).__name__,
+        )
+        return []
+
+    formatted: List[Dict[str, object]] = []
+    for sample in raw_samples:
+        if not isinstance(sample, MutableMapping):
+            logging.debug(
+                "Skipping malformed sample in %s: expected mapping, found %s.",
+                results_path,
+                type(sample).__name__,
+            )
+            continue
+        formatted.extend(format_generation_sample(sample))
+    logging.debug(
+        "Prepared %d generation samples from %s.",
+        len(formatted),
+        results_path,
+    )
+    return formatted
+
+
+def format_generation_sample(sample: MutableMapping[str, object]) -> List[Dict[str, object]]:
+    base_ground_truth = sample.get("gaze_ground_truth")
+    gaze_ground_truth: Dict[str, object] | None = None
+    image_width: object | None = None
+    image_height: object | None = None
+    if isinstance(base_ground_truth, MutableMapping):
+        gaze_ground_truth = {
+            "x": base_ground_truth.get("x"),
+            "y": base_ground_truth.get("y"),
+        }
+        image_width = base_ground_truth.get("image_width")
+        image_height = base_ground_truth.get("image_height")
+
+    gaze_detections = sample.get("gaze_detections")
+    detection_entries: List[MutableMapping[str, object] | None] = []
+    if isinstance(gaze_detections, MutableMapping):
+        detection_entries = [
+            detection
+            for detection in gaze_detections.values()
+            if isinstance(detection, MutableMapping)
+        ]
+    if not detection_entries:
+        detection_entries = [None]
+
+    rows: List[Dict[str, object]] = []
+    for detection in detection_entries:
+        row = {
+            "id": sample.get("id"),
+            "person_description": detection.get("person_description") if detection else None,
+            "ground_truth": sample.get("ground_truth"),
+            "model_prediction": sample.get("model_prediction"),
+            "gaze_predicted_target": detection.get("gaze_target") if detection else None,
+            "gaze_ground_truth": gaze_ground_truth,
+            "predicted_gaze": extract_bbox_center(detection) if detection else None,
+            "gaze_normalized_l2_error": detection.get("gaze_normalized_l2_error") if detection else None,
+            "loss": sample.get("loss"),
+            "image_width": image_width,
+            "image_height": image_height,
+            "in_out": sample.get("in_out"),
+        }
+        rows.append(row)
+    return rows
+
+
+def extract_bbox_center(detection: MutableMapping[str, object]) -> object:
+    best_detection = detection.get("best_detection")
+    if isinstance(best_detection, MutableMapping):
+        center = best_detection.get("bbox_center")
+        if isinstance(center, Sequence) and not isinstance(center, (str, bytes)):
+            return list(center)
+
+    detections = detection.get("detections")
+    if isinstance(detections, Sequence) and detections:
+        first_detection = detections[0]
+        if isinstance(first_detection, MutableMapping):
+            center = first_detection.get("bbox_center")
+            if isinstance(center, Sequence) and not isinstance(center, (str, bytes)):
+                return list(center)
+
+    center = detection.get("bbox_center")
+    if isinstance(center, Sequence) and not isinstance(center, (str, bytes)):
+        return list(center)
+    return None
 
 
 def load_json(path: Path) -> MutableMapping[str, object] | None:
@@ -397,6 +517,11 @@ def log_runs_to_wandb(
         wb_run = wandb.init(**init_kwargs)
         try:
             wandb.log(scalar_metrics or {"_placeholder": run.total_samples})
+            if run.generation_samples:
+                table = wandb.Table(columns=GENERATION_TABLE_COLUMNS)
+                for sample in run.generation_samples:
+                    table.add_data(*(sample.get(column) for column in GENERATION_TABLE_COLUMNS))
+                wb_run.log({"generation_results": table})
         finally:
             wb_run.finish()
 
