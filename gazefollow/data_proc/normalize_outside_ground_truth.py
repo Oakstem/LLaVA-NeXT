@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+"""Normalize gaze-follow ground truth records and emit conversation views.
+
+This script standardizes out-of-image ground truth descriptions to a canonical
+"looking at something or someone outside the image" phrasing, annotates a
+predicted in/out flag, prunes intermediate gaze metadata, and produces both
+normalized records and conversation-style datasets for downstream consumption.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -16,6 +24,20 @@ LOOKING_OUTSIDE_PATTERN = re.compile(
 )
 LOOKING_OUTSIDE_BARE_PATTERN = re.compile(r"(?i)(looking)\s+outside([.,;:!?]|$)")
 LOOKING_BARE_PATTERN = re.compile(r"(?i)(looking)(\s*)([.,;:!?]|$)")
+
+
+def contains_outside_phrase(text: str | None) -> bool:
+    """Return True when the text carries an out-of-image gaze phrasing."""
+
+    if not text:
+        return False
+    if TARGET_PHRASE.lower() in text.lower():
+        return True
+    if LOOKING_OUTSIDE_PATTERN.search(text):
+        return True
+    if LOOKING_OUTSIDE_BARE_PATTERN.search(text):
+        return True
+    return False
 
 
 def normalize_ground_truth(text: str) -> tuple[str, bool]:
@@ -74,18 +96,24 @@ def adjust_records(records: list[dict]) -> tuple[int, int]:
     total_out = 0
     adjusted = 0
     for record in records:
-        if record.get("in_out") != 0:
-            continue
-        total_out += 1
         ground_truth = record.get("ground_truth")
-        if not isinstance(ground_truth, str):
-            continue
-        normalized, changed = normalize_ground_truth(ground_truth)
-        if changed:
-            record["ground_truth"] = normalized
-            adjusted += 1
-        record.pop("gaze_ground_truth", None)
-        record.pop("gaze_detections", None)
+        text = ground_truth if isinstance(ground_truth, str) else None
+
+        if record.get("in_out") == 0:
+            total_out += 1
+            if text is not None:
+                normalized, changed = normalize_ground_truth(text)
+                if changed:
+                    record["ground_truth"] = normalized
+                    text = normalized
+                    adjusted += 1
+            record.pop("gaze_ground_truth", None)
+            record.pop("gaze_detections", None)
+
+        if text is None:
+            record.pop("predicted_in_out", None)
+        else:
+            record["predicted_in_out"] = 0 if contains_outside_phrase(text) else 1
     return total_out, adjusted
 
 

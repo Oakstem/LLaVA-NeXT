@@ -13,10 +13,10 @@ import os
 import statistics
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from PIL import Image
@@ -37,6 +37,7 @@ from gazefollow.auto_phrase_grounding.qwen3vl_grounding import (
     run_qwen3vl_grounding,
 )
 from gazefollow.data_proc.add_in_out_labels import load_in_out_lookup
+from gazefollow.data_proc.normalize_outside_ground_truth import contains_outside_phrase
 from gazefollow.gaze_metrics import (
     compute_gaze_errors,
     ensure_ground_truth_gaze,
@@ -68,7 +69,13 @@ from llava.constants import (
 )
 from llava.conversation import conv_templates
 
-from log_wandb_evaluations import DEFAULT_PROJECT, log_evaluation_directory
+from log_wandb_evaluations import (
+    DEFAULT_PROJECT,
+    GENERATION_TABLE_COLUMNS,
+    build_run_name_from_adapter,
+    format_generation_sample,
+    split_metrics,
+)
 
 
 @dataclass
@@ -84,6 +91,23 @@ class EvaluationSampleOutput:
     image_path: str
     image_size: Tuple[int, int]
     loss: Optional[float]
+    predicted_in_out: Optional[int] = None
+
+
+@dataclass
+class GazeEvaluationState:
+    predictions_output: List[Dict[str, Any]] = field(default_factory=list)
+    model_generation_records: List[Dict[str, Any]] = field(default_factory=list)
+    missing_in_out_samples: Set[str] = field(default_factory=set)
+    dataset_gt_updates: List[Dict[str, Any]] = field(default_factory=list)
+    dataset_updated: bool = False
+    combined_cache: Optional[Dict[str, Dict[str, str]]] = None
+    gaze_l2_errors: List[float] = field(default_factory=list)
+    gaze_normalized_l2_errors: List[float] = field(default_factory=list)
+    gaze_angular_errors: List[float] = field(default_factory=list)
+    gaze_iou_scores: List[float] = field(default_factory=list)
+    gaze_modified_l2_errors: List[float] = field(default_factory=list)
+    generation_rows_buffer: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class JsonConversationDataset:
@@ -127,6 +151,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="./evaluation_results", help="Directory to save evaluation results.")
     parser.add_argument("--save-predictions", action="store_true", help="Save individual predictions to JSON.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for evaluation (currently only 1 supported).")
+    parser.add_argument(
+        "--table-log-interval",
+        type=int,
+        default=25,
+        help="Number of samples between generation table streaming logs (<=0 disables periodic streaming).",
+    )
+    parser.add_argument(
+        "--table-log-file",
+        type=str,
+        default=None,
+        help="Optional JSONL file path for streaming generation table rows (defaults to <output_dir>/generation_progress.jsonl).",
+    )
     
     # Other arguments
     parser.add_argument(
@@ -189,7 +225,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional CSV file that provides precomputed in/out labels (via add_in_out_labels.py).",
     )
     parser.add_argument("--disable-optimizations", action="store_true", help="Skip enabling CUDA optimizations.")
-    parser.add_argument("--verbose", action="store_true", help="Print detailed progress information.")
+    parser.add_argument("--verbose", action="store_true", default=True, help="Print detailed progress information.")
     parser.add_argument("--safe-mode", action="store_true", help="Enable safe mode with more aggressive memory cleanup and smaller batches.")
     parser.add_argument("--no-loss", action="store_true", help="Disable loss calculation entirely to avoid CUDA errors.")
     parser.add_argument(
@@ -301,6 +337,16 @@ def build_focus_phrase_token_ids(tokenizer, phrase: str) -> List[List[int]]:
     return token_sequences
 
 
+def infer_predicted_in_out(prediction_text: Optional[str]) -> Optional[int]:
+    """Infer an in/out flag from the model prediction using outside-phrase heuristics."""
+    if prediction_text is None:
+        return None
+    stripped = prediction_text.strip()
+    if not stripped:
+        return None
+    return 0 if contains_outside_phrase(stripped) else 1
+
+
 def select_best_qwen_detection(
     detections: Iterable[Dict[str, Any]],
     score_threshold: Optional[float] = None,
@@ -324,6 +370,238 @@ def select_best_qwen_detection(
         return best_detection
 
     return detections_list[0] if detections_list else None
+
+
+def process_sample_with_qwen_grounding(
+    output: EvaluationSampleOutput,
+    *,
+    args: argparse.Namespace,
+    images_dir: Path,
+    state: GazeEvaluationState,
+    in_out_lookup: Optional[Dict[str, Any]],
+    ensure_gaze_resources: Callable[[], Tuple[Any, Any]],
+    generate_model_results: bool,
+    gaze_device_map: str,
+) -> None:
+    """Process a single sample output, adding gaze grounding metadata and metrics."""
+
+    sample = output.sample
+    sample_id = output.sample_id
+    full_image_path = Path(output.image_path)
+    image_width_px, image_height_px = map(int, output.image_size)
+    dataset_prompt = output.dataset_prompt
+    prompt_used = output.prompt_used
+    prediction_text = output.prediction or ""
+    ground_truth = output.ground_truth
+    predicted_in_out = output.predicted_in_out
+    if predicted_in_out is None:
+        predicted_in_out = infer_predicted_in_out(prediction_text)
+
+    try:
+        relative_image_path = str(full_image_path.relative_to(images_dir))
+    except ValueError:
+        relative_image_path = str(full_image_path)
+    relative_image_path = relative_image_path.replace("\\", "/")
+
+    ground_truth_descriptions = parse_person_descriptions(ground_truth)
+    if not ground_truth_descriptions and ground_truth:
+        ground_truth_descriptions = parse_person_descriptions(f"Person 1: {ground_truth}")
+
+    in_out_value = resolve_in_out_label(sample, in_out_lookup, ground_truth_descriptions)
+    if in_out_value is None and (args.in_out_labels_csv or sample.get("in_out") is not None):
+        state.missing_in_out_samples.add(str(sample_id))
+
+    mapping_ref = state.combined_cache if state.combined_cache is not None else {}
+    ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
+        sample,
+        relative_image_path,
+        image_width_px,
+        image_height_px,
+        mapping_ref,
+    )
+    if ground_truth_gaze is None and state.combined_cache is None:
+        state.combined_cache = load_combined_description_cache()
+        mapping_ref = state.combined_cache or {}
+        ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
+            sample,
+            relative_image_path,
+            image_width_px,
+            image_height_px,
+            mapping_ref,
+        )
+    if gt_updated and ground_truth_gaze:
+        state.dataset_updated = True
+        state.dataset_gt_updates.append(
+            {
+                "id": sample.get("id"),
+                "image": sample.get("image"),
+                "relative_path": relative_image_path,
+                "values": {
+                    "gaze_gt_x": ground_truth_gaze[0],
+                    "gaze_gt_y": ground_truth_gaze[1],
+                    "gaze_gt_width": ground_truth_gaze[2],
+                    "gaze_gt_height": ground_truth_gaze[3],
+                },
+            }
+        )
+
+    ground_truth_point: Optional[Tuple[float, float]] = None
+    if ground_truth_gaze:
+        gt_x, gt_y, _, _ = ground_truth_gaze
+        ground_truth_point = (gt_x, gt_y)
+
+    prediction_entry: Dict[str, Any] = {
+        "id": sample_id,
+        "image_path": str(full_image_path),
+        "prompt": prompt_used,
+        "ground_truth": ground_truth,
+        "prompt_source": output.prompt_source,
+        "success": True,
+    }
+    if dataset_prompt and dataset_prompt != prompt_used:
+        prediction_entry["dataset_prompt"] = dataset_prompt
+    if prediction_text:
+        prediction_entry["prediction"] = prediction_text
+    if output.loss is not None:
+        prediction_entry["loss"] = output.loss
+    if predicted_in_out is not None:
+        prediction_entry["predicted_in_out"] = predicted_in_out
+    if ground_truth_point is not None:
+        prediction_entry["gaze_ground_truth"] = {
+            "x": ground_truth_point[0],
+            "y": ground_truth_point[1],
+            "image_width": image_width_px,
+            "image_height": image_height_px,
+        }
+    if in_out_value is not None:
+        prediction_entry["in_out"] = in_out_value
+    state.predictions_output.append(prediction_entry)
+
+    if generate_model_results:
+        processed_people: Dict[str, Any] = {}
+        person_descriptions = parse_person_descriptions(prediction_text)
+        if not person_descriptions and prediction_text:
+            person_descriptions = parse_person_descriptions(f"Person 1: {prediction_text}")
+
+        processor = qwen_model = None
+        if person_descriptions:
+            processor, qwen_model = ensure_gaze_resources()
+
+        for person in person_descriptions:
+            sanitized_description = normalize_person_description(person.raw_description)
+            description_for_query = sanitized_description or person.raw_description.strip()
+            normalized_gaze_target = normalize_gaze_target_text(person.gaze_target)
+            query = build_qwen_query(
+                person.label,
+                description_for_query,
+                normalized_gaze_target or "",
+                person.person_id,
+            )
+
+            detections: List[Dict[str, Any]] = []
+            raw_response = ""
+            if processor is not None and qwen_model is not None:
+                try:
+                    detections, raw_response = run_qwen3vl_grounding(
+                        image_path=str(full_image_path),
+                        query=query,
+                        model_id=args.gaze_model_id,
+                        max_new_tokens=args.gaze_max_new_tokens,
+                        processor=processor,
+                        model=qwen_model,
+                        device_map=gaze_device_map,
+                        temperature=args.gaze_temperature,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    detections = []
+                    raw_response = ""
+                    if args.verbose:
+                        print(f"[Qwen3-VL] Detection failed for {sample_id}/{person.person_id}: {exc}")
+
+            best_detection = select_best_qwen_detection(detections, args.gaze_box_threshold)
+            best_bbox = extract_bbox(best_detection) if best_detection else None
+            best_score = extract_score(best_detection) if best_detection else None
+
+            person_entry: Dict[str, Any] = {
+                "label": person.label,
+                "person_description": description_for_query,
+                "gaze_target": normalized_gaze_target,
+                "query": query,
+                "detections": detections,
+            }
+            if raw_response:
+                person_entry["raw_response"] = raw_response
+            if best_detection:
+                person_entry["best_detection"] = best_detection
+            if best_bbox is not None:
+                person_entry["gaze_coordinates"] = [float(coord) for coord in best_bbox]
+            if best_score is not None:
+                person_entry["gaze_score"] = float(best_score)
+
+            if ground_truth_point is not None:
+                person_entry["gaze_ground_truth"] = {
+                    "x": ground_truth_point[0],
+                    "y": ground_truth_point[1],
+                }
+                predicted_box = person_entry.get("gaze_coordinates")
+                if predicted_box is not None:
+                    errors = compute_gaze_errors(
+                        predicted_box=predicted_box,
+                        person_box=None,
+                        ground_truth_point=ground_truth_point,
+                        image_width=image_width_px,
+                        image_height=image_height_px,
+                        iou_radius_ratio=args.gaze_iou_radius_ratio,
+                    )
+                    if in_out_value == 0:
+                        sanitized_errors = {key: None for key in errors.keys()}
+                    else:
+                        sanitized_errors = errors
+                    person_entry.update(sanitized_errors)
+                    if in_out_value != 0:
+                        if sanitized_errors.get("gaze_l2_error") is not None:
+                            state.gaze_l2_errors.append(sanitized_errors["gaze_l2_error"])
+                        if sanitized_errors.get("gaze_normalized_l2_error") is not None:
+                            state.gaze_normalized_l2_errors.append(sanitized_errors["gaze_normalized_l2_error"])
+                        if sanitized_errors.get("gaze_angular_error") is not None:
+                            state.gaze_angular_errors.append(sanitized_errors["gaze_angular_error"])
+                        if sanitized_errors.get("gaze_iou") is not None:
+                            state.gaze_iou_scores.append(sanitized_errors["gaze_iou"])
+                        if sanitized_errors.get("gaze_modified_l2_error") is not None:
+                            state.gaze_modified_l2_errors.append(sanitized_errors["gaze_modified_l2_error"])
+
+            processed_people[person.person_id] = person_entry
+
+        model_entry: Dict[str, Any] = {
+            "id": sample_id,
+            "image_path": str(full_image_path),
+            "dataset_prompt": dataset_prompt,
+            "prompt_used": prompt_used,
+            "prompt_source": output.prompt_source,
+            "ground_truth": ground_truth,
+            "model_prediction": prediction_text,
+            "gaze_detections": processed_people,
+        }
+        if output.loss is not None:
+            model_entry["loss"] = output.loss
+        if predicted_in_out is not None:
+            model_entry["predicted_in_out"] = predicted_in_out
+        if ground_truth_point is not None:
+            model_entry["gaze_ground_truth"] = {
+                "x": ground_truth_point[0],
+                "y": ground_truth_point[1],
+                "image_width": image_width_px,
+                "image_height": image_height_px,
+            }
+        if in_out_value is not None:
+            model_entry["in_out"] = in_out_value
+        state.model_generation_records.append(model_entry)
+        new_rows = format_generation_sample(model_entry)
+        if new_rows:
+            state.generation_rows_buffer.extend(new_rows)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def prepare_image_tensor(
@@ -647,6 +925,7 @@ def evaluate_dataset_for_training(
     prompt_override: Optional[str] = None,
     generation_params: Optional[Dict[str, Any]] = None,
     return_outputs: bool = False,
+    qwen_grounding: Optional[Callable[[EvaluationSampleOutput], None]] = None,
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], List[EvaluationSampleOutput], List[Dict[str, Any]]]]:
     """
     Custom evaluation function for training-time evaluation.
@@ -670,6 +949,7 @@ def evaluate_dataset_for_training(
         prompt_override: Optional prompt that replaces dataset prompts.
         generation_params: Optional overrides for generation keyword arguments.
         return_outputs: When True, return per-sample outputs and failure records.
+        qwen_grounding: Optional callable invoked with each successful sample output as it is generated.
 
     Returns:
         metrics dict if return_outputs is False. Otherwise a tuple of:
@@ -795,6 +1075,7 @@ def evaluate_dataset_for_training(
 
             predictions.append(prediction)
             ground_truths.append(ground_truth)
+            predicted_in_out = infer_predicted_in_out(prediction)
 
             sample_loss: Optional[float] = None
             if not no_loss:
@@ -814,22 +1095,25 @@ def evaluate_dataset_for_training(
                     losses.append(loss)
                     sample_loss = loss
 
-            if return_outputs:
-                successful_outputs.append(
-                    EvaluationSampleOutput(
-                        index=idx,
-                        sample=sample,
-                        sample_id=sample_id,
-                        dataset_prompt=dataset_prompt,
-                        prompt_used=prompt_used,
-                        prompt_source=prompt_source,
-                        ground_truth=ground_truth,
-                        prediction=prediction,
-                        image_path=image_file,
-                        image_size=image_size,
-                        loss=sample_loss,
-                    )
+            if return_outputs or qwen_grounding is not None:
+                sample_output = EvaluationSampleOutput(
+                    index=idx,
+                    sample=sample,
+                    sample_id=sample_id,
+                    dataset_prompt=dataset_prompt,
+                    prompt_used=prompt_used,
+                    prompt_source=prompt_source,
+                    ground_truth=ground_truth,
+                    prediction=prediction,
+                    image_path=image_file,
+                    image_size=image_size,
+                    loss=sample_loss,
+                    predicted_in_out=predicted_in_out,
                 )
+                if return_outputs:
+                    successful_outputs.append(sample_output)
+                if qwen_grounding is not None:
+                    qwen_grounding(sample_output)
 
             if isinstance(pil_image, Image.Image):
                 pil_image.close()
@@ -905,6 +1189,13 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    table_log_interval = max(args.table_log_interval, 0)
+    progress_log_path = Path(args.table_log_file) if args.table_log_file else output_dir / "generation_progress.jsonl"
+    table_logging_streamed = False
+    wandb_module = None
+    wandb_run = None
+    wandb_disabled_reason: Optional[str] = None
+
     print("=" * 60)
     print("LLaVA Model Evaluation")
     print("=" * 60)
@@ -925,6 +1216,21 @@ def main():
     print(f"Using conversation template: {conv_template}")
 
     generation_kwargs = build_generation_kwargs(args, tokenizer)
+    wandb_run_name = build_run_name_from_adapter(args.adapter_path or args.model_path)
+    base_wandb_config: Dict[str, Any] = {
+        "model_path": args.model_path,
+        "model_base": args.model_base,
+        "adapter_path": args.adapter_path,
+        "dataset_json": args.dataset_json,
+        "images_dir": args.images_dir,
+        "conv_template": conv_template,
+        "generation_kwargs": generation_kwargs,
+        "limit": args.limit,
+        "table_log_interval": table_log_interval,
+        "table_log_file": str(progress_log_path),
+    }
+    if args.in_out_labels_csv:
+        base_wandb_config["in_out_labels_csv"] = args.in_out_labels_csv
 
     if args.focus_loss_after_looking:
         focus_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, args.focus_loss_phrase)
@@ -943,28 +1249,10 @@ def main():
     images_dir = Path(args.images_dir)
     eval_dataset = JsonConversationDataset(dataset_samples, images_dir, Path(args.dataset_json))
 
-    print("\n3. Running evaluation...")
-    start_time = time.time()
-    metrics_result, sample_outputs, failed_samples = evaluate_dataset_for_training(
-        model=model,
-        tokenizer=tokenizer,
-        image_processor=image_processor,
-        eval_dataset=eval_dataset,
-        conv_template=conv_template,
-        max_new_tokens=args.max_new_tokens,
-        focus_loss_after_looking=args.focus_loss_after_looking,
-        focus_loss_phrase=args.focus_loss_phrase,
-        focus_loss_threshold=args.focus_loss_threshold,
-        no_loss=args.no_loss,
-        verbose=args.verbose,
-        limit=None,
-        prompt_override=args.prompt_override,
-        generation_params=generation_kwargs,
-        return_outputs=True,
-    )
-    evaluation_time = time.time() - start_time
-
     generate_model_results = args.generate_model_results or args.prompt_override is not None
+    if generate_model_results:
+        progress_log_path.parent.mkdir(parents=True, exist_ok=True)
+        progress_log_path.unlink(missing_ok=True)
 
     in_out_lookup: Optional[Dict[str, Any]] = None
     if args.in_out_labels_csv:
@@ -972,18 +1260,6 @@ def main():
         if args.verbose:
             print(f"Loaded in/out labels from {args.in_out_labels_csv} (entries={len(in_out_lookup)})")
 
-    predictions_output: List[Dict[str, Any]] = []
-    model_generation_records: List[Dict[str, Any]] = []
-    missing_in_out_samples: Set[str] = set()
-    dataset_gt_updates: List[Dict[str, Any]] = []
-    dataset_updated = False
-    combined_cache: Optional[Dict[str, Dict[str, str]]] = None
-
-    gaze_l2_errors: List[float] = []
-    gaze_normalized_l2_errors: List[float] = []
-    gaze_angular_errors: List[float] = []
-    gaze_iou_scores: List[float] = []
-    gaze_modified_l2_errors: List[float] = []
 
     gaze_device_map = args.gaze_device or "auto"
     gaze_processor = None
@@ -1008,211 +1284,109 @@ def main():
                 raise
         return gaze_processor, gaze_model
 
-    ensure_gaze_resources()
+    evaluation_state = GazeEvaluationState()
 
-    for output in sample_outputs:
-        sample = output.sample
-        sample_id = output.sample_id
-        full_image_path = Path(output.image_path)
-        image_width_px, image_height_px = map(int, output.image_size)
-        dataset_prompt = output.dataset_prompt
-        prompt_used = output.prompt_used
-        prediction_text = output.prediction or ""
-        ground_truth = output.ground_truth
-
-        try:
-            relative_image_path = str(full_image_path.relative_to(images_dir))
-        except ValueError:
-            relative_image_path = str(full_image_path)
-        relative_image_path = relative_image_path.replace("\\", "/")
-
-        ground_truth_descriptions = parse_person_descriptions(ground_truth)
-        if not ground_truth_descriptions and ground_truth:
-            ground_truth_descriptions = parse_person_descriptions(f"Person 1: {ground_truth}")
-
-        in_out_value = resolve_in_out_label(sample, in_out_lookup, ground_truth_descriptions)
-        if in_out_value is None and (args.in_out_labels_csv or sample.get("in_out") is not None):
-            missing_in_out_samples.add(str(sample_id))
-
-        mapping_ref = combined_cache if combined_cache is not None else {}
-        ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
-            sample,
-            relative_image_path,
-            image_width_px,
-            image_height_px,
-            mapping_ref,
-        )
-        if ground_truth_gaze is None and combined_cache is None:
-            combined_cache = load_combined_description_cache()
-            mapping_ref = combined_cache
-            ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
-                sample,
-                relative_image_path,
-                image_width_px,
-                image_height_px,
-                mapping_ref,
-            )
-        if gt_updated and ground_truth_gaze:
-            dataset_updated = True
-            dataset_gt_updates.append(
-                {
-                    "id": sample.get("id"),
-                    "image": sample.get("image"),
-                    "relative_path": relative_image_path,
-                    "values": {
-                        "gaze_gt_x": ground_truth_gaze[0],
-                        "gaze_gt_y": ground_truth_gaze[1],
-                        "gaze_gt_width": ground_truth_gaze[2],
-                        "gaze_gt_height": ground_truth_gaze[3],
-                    },
-                }
-            )
-
-        ground_truth_point: Optional[Tuple[float, float]] = None
-        if ground_truth_gaze:
-            gt_x, gt_y, _, _ = ground_truth_gaze
-            ground_truth_point = (gt_x, gt_y)
-
-        prediction_entry: Dict[str, Any] = {
-            "id": sample_id,
-            "image_path": str(full_image_path),
-            "prompt": prompt_used,
-            "ground_truth": ground_truth,
-            "prompt_source": output.prompt_source,
-            "success": True,
-        }
-        if dataset_prompt and dataset_prompt != prompt_used:
-            prediction_entry["dataset_prompt"] = dataset_prompt
-        if prediction_text:
-            prediction_entry["prediction"] = prediction_text
-        if output.loss is not None:
-            prediction_entry["loss"] = output.loss
-        if ground_truth_point is not None:
-            prediction_entry["gaze_ground_truth"] = {
-                "x": ground_truth_point[0],
-                "y": ground_truth_point[1],
-                "image_width": image_width_px,
-                "image_height": image_height_px,
+    def ensure_wandb_run() -> Optional[Any]:
+        nonlocal wandb_module, wandb_run, wandb_disabled_reason
+        if not args.log_to_wandb:
+            if wandb_disabled_reason is None:
+                wandb_disabled_reason = "wandb logging disabled"
+            return None
+        if wandb_disabled_reason is not None:
+            return None
+        if wandb_module is None:
+            try:
+                import wandb as wandb_lib
+            except ImportError as exc:
+                wandb_disabled_reason = f"wandb import failed: {exc}"
+                print(f"\n⚠️  wandb logging skipped: {exc}")
+                return None
+            wandb_module = wandb_lib
+        if wandb_run is None:
+            init_config = dict(base_wandb_config)
+            init_config["evaluation_dir"] = str(output_dir)
+            init_kwargs: Dict[str, Any] = {
+                "project": args.wandb_project,
+                "name": wandb_run_name,
+                "config": init_config,
             }
-        if in_out_value is not None:
-            prediction_entry["in_out"] = in_out_value
-        predictions_output.append(prediction_entry)
+            if args.wandb_entity:
+                init_kwargs["entity"] = args.wandb_entity
+            wandb_run = wandb_module.init(**init_kwargs)
+        return wandb_run
+
+    def flush_generation_rows(force: bool = False) -> None:
+        nonlocal table_logging_streamed
+        buffer = evaluation_state.generation_rows_buffer
+        if not buffer:
+            return
+        if not force and (table_log_interval <= 0 or len(buffer) < table_log_interval):
+            return
+
+        rows_to_log = list(buffer)
+        buffer.clear()
 
         if generate_model_results:
-            processed_people: Dict[str, Any] = {}
-            person_descriptions = parse_person_descriptions(prediction_text)
-            if not person_descriptions and prediction_text:
-                person_descriptions = parse_person_descriptions(f"Person 1: {prediction_text}")
+            progress_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with progress_log_path.open("a", encoding="utf-8") as handle:
+                for row in rows_to_log:
+                    handle.write(json.dumps(row, ensure_ascii=False))
+                    handle.write("\n")
 
-            processor = qwen_model = None
-            if person_descriptions:
-                processor, qwen_model = ensure_gaze_resources()
+        wandb_run_instance = ensure_wandb_run()
+        if wandb_run_instance is not None:
+            table = wandb_module.Table(columns=GENERATION_TABLE_COLUMNS)
+            for row in rows_to_log:
+                table.add_data(*(row.get(column) for column in GENERATION_TABLE_COLUMNS))
+            wandb_run_instance.log({"generation_results": table}, commit=False)
+            table_logging_streamed = True
 
-            for person in person_descriptions:
-                sanitized_description = normalize_person_description(person.raw_description)
-                description_for_query = sanitized_description or person.raw_description.strip()
-                normalized_gaze_target = normalize_gaze_target_text(person.gaze_target)
-                query = build_qwen_query(
-                    person.label,
-                    description_for_query,
-                    normalized_gaze_target or "",
-                    person.person_id,
-                )
+    def handle_sample_output(sample_output: EvaluationSampleOutput) -> None:
+        process_sample_with_qwen_grounding(
+            sample_output,
+            args=args,
+            images_dir=images_dir,
+            state=evaluation_state,
+            in_out_lookup=in_out_lookup,
+            ensure_gaze_resources=ensure_gaze_resources,
+            generate_model_results=generate_model_results,
+            gaze_device_map=gaze_device_map,
+        )
+        if generate_model_results:
+            flush_generation_rows()
 
-                detections: List[Dict[str, Any]] = []
-                raw_response = ""
-                if processor is not None and qwen_model is not None:
-                    try:
-                        detections, raw_response = run_qwen3vl_grounding(
-                            image_path=str(full_image_path),
-                            query=query,
-                            model_id=args.gaze_model_id,
-                            max_new_tokens=args.gaze_max_new_tokens,
-                            processor=processor,
-                            model=qwen_model,
-                            device_map=gaze_device_map,
-                            temperature=args.gaze_temperature,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        detections = []
-                        raw_response = ""
-                        if args.verbose:
-                            print(f"[Qwen3-VL] Detection failed for {sample_id}/{person.person_id}: {exc}")
+    print("\n3. Running evaluation...")
+    start_time = time.time()
+    metrics_result, sample_outputs, failed_samples = evaluate_dataset_for_training(
+        model=model,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        eval_dataset=eval_dataset,
+        conv_template=conv_template,
+        max_new_tokens=args.max_new_tokens,
+        focus_loss_after_looking=args.focus_loss_after_looking,
+        focus_loss_phrase=args.focus_loss_phrase,
+        focus_loss_threshold=args.focus_loss_threshold,
+        no_loss=args.no_loss,
+        verbose=args.verbose,
+        limit=None,
+        prompt_override=args.prompt_override,
+        generation_params=generation_kwargs,
+        return_outputs=True,
+        qwen_grounding=handle_sample_output,
+    )
+    evaluation_time = time.time() - start_time
 
-                best_detection = select_best_qwen_detection(detections, args.gaze_box_threshold)
-                best_bbox = extract_bbox(best_detection) if best_detection else None
-                best_score = extract_score(best_detection) if best_detection else None
-
-                person_entry: Dict[str, Any] = {
-                    "label": person.label,
-                    "person_description": description_for_query,
-                    "gaze_target": normalized_gaze_target,
-                    "query": query,
-                    "detections": detections,
-                }
-                if raw_response:
-                    person_entry["raw_response"] = raw_response
-                if best_detection:
-                    person_entry["best_detection"] = best_detection
-                if best_bbox is not None:
-                    person_entry["gaze_coordinates"] = [float(coord) for coord in best_bbox]
-                if best_score is not None:
-                    person_entry["gaze_score"] = float(best_score)
-
-                if ground_truth_point is not None:
-                    person_entry["gaze_ground_truth"] = {
-                        "x": ground_truth_point[0],
-                        "y": ground_truth_point[1],
-                    }
-                    predicted_box = person_entry.get("gaze_coordinates")
-                    if predicted_box is not None:
-                        errors = compute_gaze_errors(
-                            predicted_box=predicted_box,
-                            person_box=None,
-                            ground_truth_point=ground_truth_point,
-                            image_width=image_width_px,
-                            image_height=image_height_px,
-                            iou_radius_ratio=args.gaze_iou_radius_ratio,
-                        )
-                        person_entry.update(errors)
-                        if errors["gaze_l2_error"] is not None:
-                            gaze_l2_errors.append(errors["gaze_l2_error"])
-                        if errors["gaze_normalized_l2_error"] is not None:
-                            gaze_normalized_l2_errors.append(errors["gaze_normalized_l2_error"])
-                        if errors["gaze_angular_error"] is not None:
-                            gaze_angular_errors.append(errors["gaze_angular_error"])
-                        if errors["gaze_iou"] is not None:
-                            gaze_iou_scores.append(errors["gaze_iou"])
-                        if errors["gaze_modified_l2_error"] is not None:
-                            gaze_modified_l2_errors.append(errors["gaze_modified_l2_error"])
-
-                processed_people[person.person_id] = person_entry
-
-            model_entry: Dict[str, Any] = {
-                "id": sample_id,
-                "image_path": str(full_image_path),
-                "dataset_prompt": dataset_prompt,
-                "prompt_used": prompt_used,
-                "prompt_source": output.prompt_source,
-                "ground_truth": ground_truth,
-                "model_prediction": prediction_text,
-                "gaze_detections": processed_people,
-            }
-            if output.loss is not None:
-                model_entry["loss"] = output.loss
-            if ground_truth_point is not None:
-                model_entry["gaze_ground_truth"] = {
-                    "x": ground_truth_point[0],
-                    "y": ground_truth_point[1],
-                    "image_width": image_width_px,
-                    "image_height": image_height_px,
-                }
-            if in_out_value is not None:
-                model_entry["in_out"] = in_out_value
-            model_generation_records.append(model_entry)
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    predictions_output = evaluation_state.predictions_output
+    model_generation_records = evaluation_state.model_generation_records
+    missing_in_out_samples = evaluation_state.missing_in_out_samples
+    dataset_gt_updates = evaluation_state.dataset_gt_updates
+    dataset_updated = evaluation_state.dataset_updated
+    gaze_l2_errors = evaluation_state.gaze_l2_errors
+    gaze_normalized_l2_errors = evaluation_state.gaze_normalized_l2_errors
+    gaze_angular_errors = evaluation_state.gaze_angular_errors
+    gaze_iou_scores = evaluation_state.gaze_iou_scores
+    gaze_modified_l2_errors = evaluation_state.gaze_modified_l2_errors
 
     total_samples = len(dataset_samples)
     processed_samples = len(sample_outputs)
@@ -1329,29 +1503,69 @@ def main():
     }
     if args.in_out_labels_csv:
         config["in_out_labels_csv"] = args.in_out_labels_csv
+    config["table_log_interval"] = table_log_interval
+    config["table_log_file"] = str(progress_log_path)
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     print(f"Evaluation configuration saved to: {config_file}")
 
+    flush_generation_rows(force=True)
+
     if missing_in_out_samples:
         print(f"\n⚠️  Missing in_out labels for {len(missing_in_out_samples)} samples.")
 
+    wandb_logged = False
     if args.log_to_wandb:
         try:
-            logged_run = log_evaluation_directory(
-                output_dir,
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                min_total_samples=0,
-            )
-            if logged_run is not None:
-                print(f"\n✅ Logged evaluation results to wandb run: {logged_run.run_name}")
+            scalar_metrics, non_scalar_metrics = split_metrics(final_metrics)
+            wandb_run_instance = ensure_wandb_run()
+            if wandb_run_instance is None:
+                if wandb_disabled_reason is None:
+                    print("\n⚠️  Skipped wandb logging: unable to initialize wandb run.")
             else:
-                print(
-                    "\n⚠️  Skipped wandb logging: evaluation directory did not meet logging requirements."
+                config_updates: Dict[str, Any] = dict(config)
+                config_updates.update(
+                    {
+                        "evaluation_dir": str(output_dir),
+                        "metrics_path": str(metrics_file),
+                        "config_path": str(config_file),
+                    }
                 )
+                if args.save_predictions:
+                    config_updates["predictions_path"] = str(predictions_file)
+                if model_generation_file is not None:
+                    config_updates["model_generation_path"] = str(model_generation_file)
+                if failed_samples:
+                    config_updates["failed_samples_path"] = str(failed_file)
+                config_updates.update(non_scalar_metrics)
+
+                try:
+                    wandb_run_instance.config.update(config_updates, allow_val_change=True)
+                    wandb_run_instance.log(scalar_metrics or {"_placeholder": final_metrics.get("total_samples", 0)})
+                    if not table_logging_streamed and model_generation_records:
+                        table_rows: List[Dict[str, Any]] = []
+                        for record in model_generation_records:
+                            table_rows.extend(format_generation_sample(record))
+                        if table_rows:
+                            table = wandb_module.Table(columns=GENERATION_TABLE_COLUMNS)
+                            for row in table_rows:
+                                table.add_data(*(row.get(column) for column in GENERATION_TABLE_COLUMNS))
+                            wandb_run_instance.log({"generation_results": table}, commit=False)
+                            table_logging_streamed = True
+                    wandb_logged = True
+                finally:
+                    try:
+                        wandb_run_instance.finish()
+                    except Exception:
+                        pass
+                    wandb_run = None
+                if wandb_logged:
+                    print(f"\n✅ Logged evaluation results to wandb run: {wandb_run_name}")
         except Exception as exc:  # noqa: BLE001
             print(f"\n⚠️  Failed to log evaluation results to wandb: {exc}")
+        if not wandb_logged and wandb_disabled_reason is None and wandb_run is None:
+            # Avoid duplicate messaging when wandb is unavailable; ensure users notice silent skips.
+            print("\n⚠️  Skipped wandb logging: no data was sent.")
 
     print("\nEvaluation completed successfully!")
     if failed_samples:
