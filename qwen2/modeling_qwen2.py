@@ -170,6 +170,36 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def _cached_sequence_length(
+    past_key_values: Optional[Cache],
+    current_query_length: int = 0,
+    layer_idx: Optional[int] = None,
+) -> int:
+    """Return number of cached tokens while remaining compatible across cache APIs."""
+    if past_key_values is None:
+        return 0
+
+    get_seq_length = getattr(past_key_values, "get_seq_length", None)
+    if callable(get_seq_length):
+        try:
+            if layer_idx is None:
+                return int(get_seq_length())
+            return int(get_seq_length(layer_idx))
+        except TypeError:
+            return int(get_seq_length())
+
+    get_usable_length = getattr(past_key_values, "get_usable_length", None)
+    if callable(get_usable_length):
+        if layer_idx is None:
+            try:
+                return int(get_usable_length(current_query_length))
+            except TypeError:
+                return int(get_usable_length())
+        return int(get_usable_length(current_query_length, layer_idx))
+
+    return 0
+
+
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Qwen2
 class Qwen2MLP(nn.Module):
     def __init__(self, config):
@@ -275,7 +305,7 @@ class Qwen2Attention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += _cached_sequence_length(past_key_value, kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -378,7 +408,7 @@ class Qwen2FlashAttention2(Qwen2Attention):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += _cached_sequence_length(past_key_value, kv_seq_len, self.layer_idx)
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
@@ -674,7 +704,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += _cached_sequence_length(past_key_value, kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         # if boost_positions is not None:     # todo: finish testing this
@@ -1302,7 +1332,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+            past_key_values_length = _cached_sequence_length(past_key_values, seq_length)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
