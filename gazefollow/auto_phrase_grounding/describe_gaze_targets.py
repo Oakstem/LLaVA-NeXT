@@ -44,7 +44,7 @@ from gazefollow.gaze_metrics import compute_gaze_errors
 DEFAULT_CSV = Path("gazefollow/data/train_annotations_release.csv")
 DEFAULT_IMAGES_ROOT = Path("/mnt/d/Projects/data/gazefollow")
 DEFAULT_OUTPUT = Path("gazefollow/auto_phrase_grounding/gaze_region_descriptions.json")
-DEFAULT_SAVE_INTERVAL = 50
+DEFAULT_SAVE_INTERVAL = 1
 NUMERIC_PATTERN = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 
 
@@ -648,6 +648,7 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
                     skip_logger.log(
                         f"[skip] conversation entry {image_identifier or 'N/A'}#{annotation_id or '-'}: {reason}"
                     )
+                    print(f"[skip] conversation entry {image_identifier or 'N/A'}#{annotation_id or '-'}: {reason}")
             region_summary = ", ".join(
                 f"{entry['role']}={entry.get('description') or 'N/A'}" for entry in region_descriptions
             ) or "no regions parsed"

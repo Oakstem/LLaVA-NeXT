@@ -21,7 +21,7 @@ DEFAULT_INPUT = Path("gazefollow/auto_phrase_grounding/gaze_region_descriptions.
 DEFAULT_OUTPUT = DEFAULT_INPUT.with_name("gaze_region_conversations.json")
 DEFAULT_IMAGES_ROOT = Path("/mnt/d/Projects/data/gazefollow")
 DEFAULT_SAVE_INTERVAL = 2
-DEFAULT_L2_TARGET_THRESHOLD = 0.2
+DEFAULT_L2_TARGET_THRESHOLD = 0.24
 DEFAULT_L2_SOURCE_THRESHOLD = 0.4
 
 LOOKING_PATTERN = re.compile(r"\blooking\b.*", flags=re.IGNORECASE | re.DOTALL)
