@@ -28,7 +28,10 @@ from PIL import Image
 
 # Add parent directory to path to import docs module
 import sys
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
 from docs.research_utils import fix_wsl_paths
 
 # Configure logging
@@ -437,6 +440,7 @@ class PersonMatcher:
             Tuple of (matched_person_id, best_iou)
         """
         all_intersects = []
+        bad_intersects = []
         
         for person_id, person_data in llava_person_result.items():
             if 'image_shape' in person_id or 'person' not in person_data:
@@ -453,8 +457,10 @@ class PersonMatcher:
             person_bbox = person_data['person']['boxes'][0]
             iou = self.calculate_bbox_iou(gt_person_bbox, person_bbox)
             
-            if iou > 0.5:
+            if iou > 0.25:
                 all_intersects.append([iou, person_id])
+            else:
+                bad_intersects.append([iou, person_id])
         
         if not all_intersects:
             return None, 0.0
@@ -1443,7 +1449,7 @@ def main():
     # Optional: Resume from previous CSV file (convert to WSL format)
     resume_from_csv = r"D:\Projects\data\gazefollow\results\valid_runs\combined_ppl_desc_results.csv"
     # Set to None to start fresh processing
-    # resume_from_csv = None
+    resume_from_csv = None
     
     # Resume from pickle files (faster than reprocessing all files)
     resume_from_pickle = True  # Set to False to reprocess all gaze and person files
