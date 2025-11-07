@@ -464,7 +464,7 @@ def generate_next_token_with_gaze_guidance(
         pass
     
     selection_metrics = {}
-    should_use_guidance = True
+    should_use_guidance = False
     if should_use_guidance:
         # Use gaze-guided selection
         selected_mask = target_mask if apply_only_target_mask else source_mask
@@ -687,6 +687,131 @@ def load_mask_from_file(mask_path: Union[str, Path]) -> np.ndarray:
     else:
         mask = mask_data
 
+    return mask
+
+
+DEFAULT_GT_GAZE_CSV = Path(__file__).resolve().parent / "gazefollow" / "data" / "combined_description_results.csv"
+_GT_GAZE_LOOKUP_CACHE: Dict[str, Dict[str, Tuple[float, float]]] = {}
+
+
+def _normalize_gt_gaze_keys(raw_key: Any) -> List[str]:
+    """Create a set of lookup keys for CSV rows to maximize match robustness."""
+    if raw_key is None or pd.isna(raw_key):
+        return []
+
+    key = str(raw_key).strip().replace("\\", "/")
+    if not key:
+        return []
+    if key.lower() == "nan":
+        return []
+
+    candidates = {key}
+    path_obj = Path(key)
+    candidates.add(path_obj.name)
+    candidates.add(path_obj.stem)
+    parts = [part for part in path_obj.parts if part]
+    if len(parts) >= 3:
+        candidates.add("/".join(parts[-3:]))
+    if len(parts) >= 2:
+        candidates.add("/".join(parts[-2:]))
+
+    return [c for c in candidates if c]
+
+
+def _update_gt_gaze_lookup_entry(
+    lookup: Dict[str, Dict[str, Any]], raw_key: Any, gaze_x: float, gaze_y: float, gaze_error: float
+) -> None:
+    """Register gaze coordinates for all normalized keys, preferring lower errors."""
+    for key in _normalize_gt_gaze_keys(raw_key):
+        existing = lookup.get(key)
+        if existing is None:
+            lookup[key] = {"coords": (gaze_x, gaze_y), "error": gaze_error}
+            continue
+
+        existing_error = existing.get("error", float("nan"))
+        if pd.isna(existing_error) and not pd.isna(gaze_error):
+            lookup[key] = {"coords": (gaze_x, gaze_y), "error": gaze_error}
+        elif not pd.isna(existing_error) and not pd.isna(gaze_error) and gaze_error < existing_error:
+            lookup[key] = {"coords": (gaze_x, gaze_y), "error": gaze_error}
+
+
+def load_gt_gaze_lookup(csv_path: Union[str, Path]) -> Dict[str, Tuple[float, float]]:
+    """Load ground-truth gaze coordinates from CSV and cache the lookup table."""
+    normalized_path = fix_wsl_paths(str(csv_path))
+    if normalized_path in _GT_GAZE_LOOKUP_CACHE:
+        return _GT_GAZE_LOOKUP_CACHE[normalized_path]
+
+    path_obj = Path(normalized_path)
+    if not path_obj.exists():
+        print(f"⚠️ Warning: GT gaze CSV not found at {normalized_path}")
+        _GT_GAZE_LOOKUP_CACHE[normalized_path] = {}
+        return _GT_GAZE_LOOKUP_CACHE[normalized_path]
+
+    df = pd.read_csv(path_obj)
+    if "gaze_x" not in df.columns or "gaze_y" not in df.columns:
+        print(f"⚠️ Warning: Missing 'gaze_x' or 'gaze_y' columns in {normalized_path}")
+        _GT_GAZE_LOOKUP_CACHE[normalized_path] = {}
+        return _GT_GAZE_LOOKUP_CACHE[normalized_path]
+
+    for column in ("gaze_x", "gaze_y", "gaze_error"):
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    df = df.dropna(subset=["gaze_x", "gaze_y"])
+
+    candidate_columns = [col for col in ("image_path", "image_path.1") if col in df.columns]
+    temp_lookup: Dict[str, Dict[str, Any]] = {}
+
+    for _, row in df.iterrows():
+        gaze_x = float(row["gaze_x"])
+        gaze_y = float(row["gaze_y"])
+        gaze_error = float(row["gaze_error"]) if "gaze_error" in df.columns and not pd.isna(row["gaze_error"]) else float("nan")
+
+        for column in candidate_columns:
+            _update_gt_gaze_lookup_entry(temp_lookup, row[column], gaze_x, gaze_y, gaze_error)
+
+    lookup = {key: tuple(info["coords"]) for key, info in temp_lookup.items()}
+    _GT_GAZE_LOOKUP_CACHE[normalized_path] = lookup
+    return lookup
+
+
+def _denormalize_gaze_point(gaze_x: float, gaze_y: float, image_size: Tuple[int, int]) -> Tuple[int, int]:
+    """Convert normalized gaze coordinates (0-1) to pixel coordinates."""
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return 0, 0
+
+    clamped_x = max(0.0, min(1.0, gaze_x))
+    clamped_y = max(0.0, min(1.0, gaze_y))
+
+    pixel_x = int(round(clamped_x * (width - 1)))
+    pixel_y = int(round(clamped_y * (height - 1)))
+    return pixel_x, pixel_y
+
+
+def _create_gaze_mask_from_point(
+    image_size: Tuple[int, int],
+    pixel_coord: Tuple[int, int],
+    radius: Optional[int] = None,
+    radius_ratio: float = 0.02
+) -> np.ndarray:
+    """Create a binary mask centered around the given pixel coordinate."""
+    width, height = image_size
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if width == 0 or height == 0:
+        return mask
+
+    center_x = max(0, min(width - 1, pixel_coord[0]))
+    center_y = max(0, min(height - 1, pixel_coord[1]))
+
+    if radius is None:
+        computed_radius = max(1, int(round(min(width, height) * radius_ratio)))
+    else:
+        computed_radius = max(1, int(radius))
+
+    y_grid, x_grid = np.ogrid[:height, :width]
+    distance_sq = (x_grid - center_x) ** 2 + (y_grid - center_y) ** 2
+    mask[distance_sq <= computed_radius ** 2] = 1
     return mask
 
 
@@ -1256,14 +1381,73 @@ def _prepare_inputs(
     prompt: str,
     image_processor: SigLipImageProcessor,
     tokenizer: PreTrainedTokenizer,
-    model: PreTrainedModel
+    model: PreTrainedModel,
+    *,
+    use_gt_gaze_csv: bool = False,
+    gt_gaze_csv_path: Optional[Union[str, Path]] = None,
+    gt_gaze_mask_radius: Optional[int] = None,
+    gt_gaze_mask_radius_ratio: float = 0.02
 ) -> Tuple[Any, Any, torch.Tensor, List, List[int], Any, torch.Tensor]:
-    """Load and prepare image, mask, and input tensors."""
+    """Load and prepare image, mask, and input tensors.
+
+    Optionally override the gaze target mask using ground-truth coordinates from a CSV.
+    """
     person_mask = None
     person_mask_indices = None
     # Load image and mask
     image = load_image(image_path)
-    mask = load_mask_from_file(mask_path)
+    mask = None
+    gt_mask_used = False
+
+    if use_gt_gaze_csv and "gaze__" in Path(str(mask_path)).name:
+        csv_path = Path(gt_gaze_csv_path) if gt_gaze_csv_path else DEFAULT_GT_GAZE_CSV
+        lookup = load_gt_gaze_lookup(csv_path)
+
+        ordered_candidates: List[str] = []
+
+        def _append_candidates(raw_value: Any) -> None:
+            for candidate in _normalize_gt_gaze_keys(raw_value):
+                if candidate and candidate not in ordered_candidates:
+                    ordered_candidates.append(candidate)
+
+        image_path_str = str(image_path)
+        _append_candidates(image_path_str)
+
+        mask_path_obj = Path(str(mask_path))
+        mask_stem = mask_path_obj.stem
+        _append_candidates(mask_stem)
+
+        stem_without_prefix = mask_stem.replace("gaze__", "")
+        _append_candidates(stem_without_prefix)
+
+        if "_" in stem_without_prefix:
+            _append_candidates(stem_without_prefix.split("_")[0])
+
+        digit_key = "".join(ch for ch in stem_without_prefix if ch.isdigit())
+        _append_candidates(digit_key)
+
+        for candidate_key in ordered_candidates:
+            coords = lookup.get(candidate_key)
+            if coords is None:
+                continue
+
+            pixel_coord = _denormalize_gaze_point(coords[0], coords[1], image.size)
+            mask = _create_gaze_mask_from_point(
+                image.size,
+                pixel_coord,
+                radius=gt_gaze_mask_radius,
+                radius_ratio=gt_gaze_mask_radius_ratio,
+            )
+            gt_mask_used = True
+            print(f"Using GT gaze mask from CSV (key='{candidate_key}') at pixel {pixel_coord}")
+            break
+
+        if not gt_mask_used:
+            print(f"⚠️ Warning: GT gaze entry not found for {image_path}; falling back to mask file {mask_path}")
+
+    if not gt_mask_used:
+        mask = load_mask_from_file(mask_path)
+
     person_mask_path = str(mask_path).replace("gaze__", "person__")
     if Path(person_mask_path).exists():
         person_mask = load_mask_from_file(person_mask_path)
@@ -1776,6 +1960,11 @@ def create_experiment_config(
     output_dir: Union[str, Path],
     generation_config: Optional[Dict[str, Any]] = None,
     attention_config: Optional[Dict[str, Any]] = None,
+    *,
+    use_gt_gaze_csv: bool = False,
+    gt_gaze_csv_path: Optional[Union[str, Path]] = None,
+    gt_gaze_mask_radius: Optional[int] = None,
+    gt_gaze_mask_radius_ratio: float = 0.02,
 ) -> Dict[str, Any]:
     """Build base experiment config dict for bias sweep."""
     return {
@@ -1785,6 +1974,10 @@ def create_experiment_config(
         "output_dir": str(output_dir),
         "generation_config": generation_config or {},
         "attention_config": attention_config or {},
+        "use_gt_gaze_csv": use_gt_gaze_csv,
+        "gt_gaze_csv_path": str(gt_gaze_csv_path) if gt_gaze_csv_path is not None else None,
+        "gt_gaze_mask_radius": gt_gaze_mask_radius,
+        "gt_gaze_mask_radius_ratio": gt_gaze_mask_radius_ratio,
     }
 
 def save_image_results(

@@ -547,7 +547,7 @@ class LlavaMetaForCausalLM(ABC):
         special_tokens_inds = torch.where(cur_input_ids_noim[-1] == 716)
         full_input_len = new_input_embeds.size(1)
         user_prompt_len = len(cur_input_embeds_no_im[-1])
-        if special_tokens_inds[0].numel() > 0:
+        if special_tokens_inds[0].numel() > 0:  # or len(special_tokens_inds) > 0:
             special_tokens_inds = full_input_len - user_prompt_len + special_tokens_inds[0]
             # Add ±1 indices to the special token positions
             expanded_inds = []
@@ -567,6 +567,9 @@ class LlavaMetaForCausalLM(ABC):
             elif special_tokens_inds.numel() == 2:
                 tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0]],
                                                   'target': [special_tokens_inds[1]]}
+            else:
+                tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0]], 
+                                                  'target': []}
         else:
             tokens_indexing['insert_embd'] = None
 
