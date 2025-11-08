@@ -17,10 +17,10 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     set -euo pipefail
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/llava/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/.ground-uv/bin/python}"
 
 CSV_PATH="${CSV_PATH:-gazefollow/data/train_annotations_release.csv}"
-IMAGES_ROOT="${IMAGES_ROOT:-/mnt/d/Projects/data/gazefollow}"
+IMAGES_ROOT="${IMAGES_ROOT:-/galitylab/students/alonmardi/gazefollow}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
@@ -29,16 +29,18 @@ TARGET_BOX_SIZE="${TARGET_BOX_SIZE:-60}"
 LIMIT="${LIMIT:-}"
 IMAGE_ID="${IMAGE_ID:-}"
 USE_TARGET_POINT="${USE_TARGET_POINT:-false}"
-USE_HEAD_BBOX="${USE_HEAD_BBOX:-false}"
+USE_HEAD_BBOX="${USE_HEAD_BBOX:-true}"
 GROUNDING_EVAL="${GROUNDING_EVAL:-true}"
-BUILD_CONVERSATIONS="${BUILD_CONVERSATIONS:-false}"
+BUILD_CONVERSATIONS="${BUILD_CONVERSATIONS:-true}"
 CONVERSATION_OUTPUT_JSON="${CONVERSATION_OUTPUT_JSON:-}"
-CONVERSATION_SAVE_INTERVAL="${CONVERSATION_SAVE_INTERVAL:-50}"
+CONVERSATION_SAVE_INTERVAL="${CONVERSATION_SAVE_INTERVAL:-10}"
 CONVERSATION_MAX_NORMALIZED_L2="${CONVERSATION_MAX_NORMALIZED_L2:-0.2}"
 CONVERSATION_MAX_SOURCE_NORMALIZED_L2="${CONVERSATION_MAX_SOURCE_NORMALIZED_L2:-0.4}"
-CONVERSATION_MAX_TARGET_NORMALIZED_L2="${CONVERSATION_MAX_TARGET_NORMALIZED_L2:-0.2}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
+CONVERSATION_MAX_TARGET_NORMALIZED_L2="${CONVERSATION_MAX_TARGET_NORMALIZED_L2:-0.24}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 LOG_FILE="${LOG_FILE:-gazefollow/auto_phrase_grounding/describe_gaze_targets.log}"
+RESUME_FROM="${RESUME_FROM:-}"
+START_ROW="${START_ROW:-0}"
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_JSON="${OUTPUT_JSON:-gazefollow/auto_phrase_grounding/gaze_region_descriptions_${timestamp}.json}"
@@ -64,6 +66,7 @@ ARGS+=("--output-json" "$OUTPUT_JSON")
 ARGS+=("--target-box-size" "$TARGET_BOX_SIZE")
 ARGS+=("--save-interval" "$SAVE_INTERVAL")
 ARGS+=("--log-file" "$LOG_FILE")
+ARGS+=("--start-row" "$START_ROW")
 
 if [ -n "$LIMIT" ]; then
     ARGS+=("--limit" "$LIMIT")
@@ -87,6 +90,10 @@ fi
 
 if [ "$BUILD_CONVERSATIONS" = "true" ]; then
     ARGS+=("--build-conversations")
+fi
+
+if [ -n "$RESUME_FROM" ]; then
+    ARGS+=("--resume-from" "$RESUME_FROM")
 fi
 
 if [ -n "$CONVERSATION_OUTPUT_JSON" ]; then

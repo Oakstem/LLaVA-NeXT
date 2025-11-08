@@ -79,6 +79,53 @@ class RegionRequest:
     use_point: bool = False
 
 
+def normalize_key_component(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value_str = str(value).strip()
+    if not value_str:
+        return None
+    return value_str.replace("\\", "/")
+
+
+def build_sample_key(primary: Optional[str], secondary: Optional[str], annotation_id: Optional[str]) -> Tuple[str, str]:
+    normalized_primary = normalize_key_component(primary)
+    normalized_secondary = normalize_key_component(secondary)
+    key_component = normalized_primary or normalized_secondary or ""
+    key_annotation = str(annotation_id).strip() if annotation_id is not None else ""
+    return key_component, key_annotation
+
+
+def load_resume_state(resume_path: Optional[Path]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], set[Tuple[str, str]]]:
+    results: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    seen_keys: set[Tuple[str, str]] = set()
+
+    if resume_path is None:
+        return results, failures, seen_keys
+
+    resume_path = Path(resume_path)
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Resume JSON not found: {resume_path}")
+
+    with resume_path.open("r") as fp:
+        summary = json.load(fp)
+
+    previous_results = summary.get("results") or []
+    previous_failures = summary.get("failures") or []
+    if not isinstance(previous_results, list) or not isinstance(previous_failures, list):
+        raise ValueError(f"Resume JSON does not contain list-based results/failures: {resume_path}")
+
+    results = list(previous_results)
+    failures = list(previous_failures)
+
+    for entry in results:
+        seen_keys.add(build_sample_key(entry.get("relative_path"), entry.get("image_id"), entry.get("annotation_id")))
+
+    print(f"[resume] Loaded {len(results)} results and {len(failures)} failures from {resume_path}")
+    return results, failures, seen_keys
+
+
 def coerce_float(value: Any) -> Optional[float]:
     if value in (None, ""):
         return None
@@ -360,15 +407,15 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
     csv_path = Path(args.csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
+    if args.start_row < 0:
+        raise ValueError("--start-row must be >= 0")
 
     processor, model = load_qwen3vl_model(args.model_id, device_map=args.device_map)
     images_root = Path(args.images_root)
     output_path = Path(args.output_json)
-    results: List[Dict[str, Any]] = []
-    failures: List[Dict[str, Any]] = []
-    processed = 0
+    results, failures, seen_keys = load_resume_state(args.resume_from)
+    processed = len(results)
     handled_rows = 0
-    seen_keys: set[Tuple[str, str]] = set()
     conversation_entries: List[Dict[str, Any]] = []
     conversation_output_path: Optional[Path] = None
     conversation_interval = (
@@ -390,6 +437,19 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
             if args.conversation_output_json
             else output_path.with_name(f"{output_path.stem}_conversation.json")
         )
+        if args.resume_from and conversation_output_path.exists():
+            with conversation_output_path.open("r") as fp:
+                existing_conversations = json.load(fp)
+            if isinstance(existing_conversations, list):
+                conversation_entries = existing_conversations
+                print(
+                    f"[resume] Loaded {len(conversation_entries)} conversation entries from {conversation_output_path}"
+                )
+            else:
+                print(
+                    f"[warn] Conversation resume file is not a list; starting fresh: {conversation_output_path}"
+                )
+                conversation_entries = []
     skip_logger = SkipLogger(args.log_file)
 
     def build_summary() -> Dict[str, Any]:
@@ -398,6 +458,7 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
             "images_root": str(args.images_root),
             "model_id": args.model_id,
             "image_id_filter": args.image_id,
+            "start_row": args.start_row,
             "limit": args.limit,
             "target_box_size": args.target_box_size,
             "use_head_bbox": args.use_head_bbox,
@@ -418,6 +479,12 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
     save_interval = args.save_interval if args.save_interval and args.save_interval > 0 else None
 
     rows_iterator = list(iter_rows(csv_path, image_id=args.image_id))
+    if args.start_row:
+        if args.start_row >= len(rows_iterator):
+            rows_iterator = []
+        else:
+            rows_iterator = rows_iterator[args.start_row :]
+        print(f"[start] Skipping first {args.start_row} rows before processing")
     progress_total = args.limit if args.limit is not None else len(rows_iterator)
     with ExitStack() as stack:
         progress_bar = stack.enter_context(
@@ -428,10 +495,16 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
             if args.limit is not None and processed >= args.limit:
                 break
 
-            image_identifier = extract_relative_path(row) or str(row.get("image_path") or "").strip()
+            relative_key = extract_relative_path(row)
+            image_identifier = relative_key or str(row.get("image_path") or "").strip()
             annotation_id = str(row.get("id") or "")
             handled_rows += 1
-            relative_key = extract_relative_path(row)
+            sample_key = build_sample_key(relative_key, image_identifier, annotation_id)
+            if sample_key in seen_keys:
+                skip_logger.log(
+                    f"[{handled_rows}] {image_identifier or 'N/A'}#{annotation_id or '-'} SKIP: already processed (resume)"
+                )
+                continue
             if not relative_key:
                 reason = "missing image path columns"
                 failures.append({"image_id": image_identifier, "annotation_id": annotation_id, "reason": reason})
@@ -631,6 +704,8 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
                 "in_or_out": row.get("in_or_out"),
             }
             results.append(record)
+            seen_keys.add(sample_key)
+            seen_keys.add(build_sample_key(relative_path, image_identifier, annotation_id))
             if args.build_conversations and conversation_output_path is not None:
                 convo_entry, reason = build_conversation_entry(
                     record,
@@ -681,6 +756,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=256, help="Maximum tokens to generate.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
     parser.add_argument("--output-json", type=Path, default=DEFAULT_OUTPUT, help="Destination JSON file for the results.")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Path to a prior JSON summary; when provided, already processed samples are skipped and appended to the new output.",
+    )
+    parser.add_argument(
+        "--start-row",
+        type=int,
+        default=0,
+        help="0-based row index in the CSV to begin processing from (rows before this index are skipped).",
+    )
     parser.add_argument("--target-box-size", type=float, default=60.0, help="Bounding box size (in 0-1000 space) for gaze target points.")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit on number of rows to process.")
     parser.add_argument("--image-id", type=str, default=None, help="Process a single image_id (matches image_path column).")

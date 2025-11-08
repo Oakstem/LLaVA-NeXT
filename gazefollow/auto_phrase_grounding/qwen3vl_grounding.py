@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import re
 from pathlib import Path
@@ -9,12 +10,33 @@ from PIL import Image
 
 
 def _ensure_torch_pytree_register() -> None:
-    """Backport torch pytree register API expected by newer transformers."""
+    """Shim torch's pytree register API to ignore new kwargs the installed torch does not know."""
     pytree = getattr(getattr(torch, "utils", None), "_pytree", None)
     if pytree is None:
         return
-    if not hasattr(pytree, "register_pytree_node") and hasattr(pytree, "_register_pytree_node"):
-        pytree.register_pytree_node = pytree._register_pytree_node  # type: ignore[attr-defined]
+
+    register_impl = getattr(pytree, "register_pytree_node", None)
+    if register_impl is None and hasattr(pytree, "_register_pytree_node"):
+        register_impl = pytree._register_pytree_node  # type: ignore[attr-defined]
+        pytree.register_pytree_node = register_impl  # type: ignore[attr-defined]
+
+    if register_impl is None:
+        return
+
+    try:
+        signature = inspect.signature(register_impl)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature and "serialized_type_name" in signature.parameters:
+        return
+
+    def _shim_register_pytree_node(*args: Any, **kwargs: Any) -> None:
+        kwargs.pop("serialized_type_name", None)
+        kwargs.pop("serialized_type_version", None)
+        register_impl(*args, **kwargs)
+
+    pytree.register_pytree_node = _shim_register_pytree_node  # type: ignore[attr-defined]
 
 
 _ensure_torch_pytree_register()
