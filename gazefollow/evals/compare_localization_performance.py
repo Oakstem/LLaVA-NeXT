@@ -52,10 +52,16 @@ def find_localization_files(root: Path) -> List[Path]:
 
     candidates = [
         path
+        # for path in root.rglob("dataset_*localization*.json")
+        for path in root.rglob("model_generation*.json")
+        if path.is_file()
+    ]
+    candidates2 = [
+        path
         for path in root.rglob("dataset_*localization*.json")
         if path.is_file()
     ]
-    return sorted(candidates)
+    return sorted(candidates + candidates2)
 
 
 def normalize_in_out(raw_value: object) -> Optional[int]:
@@ -338,11 +344,14 @@ def main() -> int:
     args = parse_args()
     files = find_localization_files(args.root)
 
+    print(f"Found {len(files)} localization result file(s) under {args.root}")
+
     if not files:
         print(f"No localization result JSON files found under {args.root}")
         return 1
 
     datasets = [load_dataset_metrics(path) for path in files]
+    datasets = [ds for ds in datasets if ds.total_samples > 100]
     intersection = compute_intersection_metrics(datasets)
     baseline = select_baseline(datasets, args.baseline_substring)
 

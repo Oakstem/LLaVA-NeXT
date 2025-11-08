@@ -50,6 +50,11 @@ from gazefollow.qwen3vl_utils import (
     extract_score,
     resolve_in_out_label,
 )
+from gazefollow.evals.in_out_metrics import (
+    BinaryPrecisionResult,
+    compute_binary_precision,
+    serialize_binary_precision,
+)
 
 from generation_utils import (
     enable_inference_optimizations,
@@ -1441,6 +1446,30 @@ def main():
         final_metrics["gaze_modified_l2_median"] = statistics.median(gaze_modified_l2_errors)
         final_metrics["gaze_modified_l2_count"] = len(gaze_modified_l2_errors)
 
+    binary_precision_result: Optional[BinaryPrecisionResult] = None
+    in_out_predictions: List[int] = []
+    in_out_labels: List[int] = []
+    for entry in predictions_output:
+        gt_label = entry.get("in_out")
+        predicted_flag = entry.get("predicted_in_out")
+        if not isinstance(predicted_flag, int) or not isinstance(gt_label, int):
+            continue
+        in_out_predictions.append(predicted_flag)
+        in_out_labels.append(gt_label)
+
+    if in_out_predictions and in_out_labels:
+        binary_precision_result = compute_binary_precision(
+            in_out_predictions,
+            in_out_labels,
+            positive_label=1,
+        )
+        precision_value = binary_precision_result.precision
+        if precision_value is not None:
+            final_metrics["in_out_precision"] = precision_value
+        final_metrics["in_out_precision_support"] = binary_precision_result.predicted_positives
+        final_metrics["in_out_positive_label"] = binary_precision_result.positive_label
+        final_metrics["in_out_precision_total"] = binary_precision_result.total_samples
+
     print("\n4. Calculating metrics...")
     print("\nEvaluation summary:")
     print(f"  Total samples: {total_samples}")
@@ -1454,6 +1483,12 @@ def main():
         print(f"  Loss range: {min(loss_values):.6f} - {max(loss_values):.6f}")
     if gaze_l2_errors:
         print(f"  Gaze L2 mean: {final_metrics['gaze_l2_error_mean']:.4f}")
+    if binary_precision_result is not None:
+        precision_value = binary_precision_result.precision
+        if precision_value is not None:
+            print(f"  In/out precision: {precision_value:.4f}")
+        else:
+            print("  In/out precision: undefined (no predicted positives)")
 
     if dataset_updated and dataset_gt_updates:
         try:
@@ -1466,6 +1501,13 @@ def main():
     print(f"\n5. Saving results to {output_dir}...")
 
     metrics_file = output_dir / "metrics.json"
+    precision_metrics_file = output_dir / "in_out_precision_metrics.json"
+    if binary_precision_result is not None:
+        metrics_payload = serialize_binary_precision(binary_precision_result)
+        with open(precision_metrics_file, "w", encoding="utf-8") as f:
+            json.dump(metrics_payload, f, indent=2, ensure_ascii=False)
+        print(f"In/out precision metrics saved to: {precision_metrics_file}")
+
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(final_metrics, f, indent=2, ensure_ascii=False)
     print(f"Metrics saved to: {metrics_file}")

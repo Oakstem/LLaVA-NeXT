@@ -23,7 +23,7 @@ PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/.ground-uv/bin/python}"
 # Model configuration
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-ADAPTER_PATH="${ADAPTER_PATH:-training_outputs/llava-20251103_222942/checkpoint-5000}"
+ADAPTER_PATH="${ADAPTER_PATH:-training_outputs/llava-20251104_230921/checkpoint-16000}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 LOAD_4BIT="${LOAD_4BIT:-false}"
 LOAD_8BIT="${LOAD_8BIT:-false}"
@@ -48,6 +48,7 @@ SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-true}"
 GENERATE_MODEL_RESULTS="${GENERATE_MODEL_RESULTS:-true}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 PROMPT_OVERRIDE="${PROMPT_OVERRIDE:-}"
+WANDB="${WANDB:-true}"
 
 # Qwen3-VL grounding options
 GAZE_MODEL_ID="${GAZE_MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
@@ -132,11 +133,27 @@ if [ -n "$GAZE_DEVICE" ]; then
     ARGS+=("--gaze-device" "$GAZE_DEVICE")
 fi
 
+if [ "$WANDB" = "true" ]; then
+    ARGS+=("--log-to-wandb")
+fi
+
 echo "=========================================="
 echo "Executing Qwen3-VL evaluation:"
 printf '%s ' "$PYTHON_BIN" "gazefollow/evals/evaluate_model_qwen3vl.py"
 printf '%q ' "${ARGS[@]}"
 echo ""
+echo "Node hostname: $(hostname)"
+echo "SLURM job id: ${SLURM_JOB_ID:-N/A}"
+echo "CPUs per task: ${SLURM_CPUS_PER_TASK:-N/A}"
+echo "CPUs on node: ${SLURM_CPUS_ON_NODE:-N/A}"
+echo "GPUs requested (job): ${SLURM_JOB_GPUS:-N/A}"
+echo "GPUs visible: ${CUDA_VISIBLE_DEVICES:-N/A}"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "GPU inventory:"
+    nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader
+else
+    echo "GPU inventory: nvidia-smi not available"
+fi
 echo "Output dir: $OUTPUT_DIR"
 echo "=========================================="
 
