@@ -37,6 +37,8 @@ from gazefollow.auto_phrase_grounding.build_conversation_json import (
     DEFAULT_SAVE_INTERVAL as DEFAULT_CONVO_SAVE_INTERVAL,
     DEFAULT_L2_TARGET_THRESHOLD as DEFAULT_CONVO_L2_TARGET_THRESHOLD,
     DEFAULT_L2_SOURCE_THRESHOLD as DEFAULT_CONVO_L2_SOURCE_THRESHOLD,
+    OUTSIDE_FRAME_TARGET_DESCRIPTION,
+    is_outside_frame,
 )
 from gazefollow.gaze_metrics import compute_gaze_errors
 
@@ -703,6 +705,8 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
                 "grounding_eval": grounding_eval,
                 "in_or_out": row.get("in_or_out"),
             }
+            if is_outside_frame(record.get("in_or_out")):
+                record["target"]["description"] = OUTSIDE_FRAME_TARGET_DESCRIPTION
             results.append(record)
             seen_keys.add(sample_key)
             seen_keys.add(build_sample_key(relative_path, image_identifier, annotation_id))

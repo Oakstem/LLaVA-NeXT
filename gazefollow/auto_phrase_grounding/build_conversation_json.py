@@ -10,11 +10,21 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PIL import Image
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from gazefollow.auto_phrase_grounding.conversation_utils import (  # noqa: E402
+    OUTSIDE_FRAME_TARGET_DESCRIPTION,
+    clean_question_phrase,
+    is_outside_frame,
+    load_image_dims,
+    sanitize_person_description,
+)
 
 
 DEFAULT_INPUT = Path("gazefollow/auto_phrase_grounding/gaze_region_descriptions.json")
@@ -23,42 +33,6 @@ DEFAULT_IMAGES_ROOT = Path("/mnt/d/Projects/data/gazefollow")
 DEFAULT_SAVE_INTERVAL = 2
 DEFAULT_L2_TARGET_THRESHOLD = 0.24
 DEFAULT_L2_SOURCE_THRESHOLD = 0.4
-
-LOOKING_PATTERN = re.compile(r"\blooking\b.*", flags=re.IGNORECASE | re.DOTALL)
-DUPLICATE_WORD_PATTERN = re.compile(r"\b(\w+)\s+\1\b", flags=re.IGNORECASE)
-ARTICLE_PATTERN = re.compile(r"^(a|an)\s+", flags=re.IGNORECASE)
-
-
-def sanitize_person_description(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-    text = raw.strip()
-    if not text:
-        return None
-    if "," in text:
-        text = text.split(",", 1)[0]
-    text = LOOKING_PATTERN.sub("", text).strip(" ,.;:")
-    return text or None
-
-
-def clean_question_phrase(description: str) -> str:
-    if not description:
-        return description
-    text = ARTICLE_PATTERN.sub("", description).strip()
-    while True:
-        deduped = DUPLICATE_WORD_PATTERN.sub(r"\1 ", text)
-        if deduped == text:
-            break
-        text = deduped.strip()
-    return text
-
-
-def load_image_dims(images_root: Path, relative_path: str) -> tuple[int, int]:
-    image_path = images_root / relative_path
-    with Image.open(image_path) as img:
-        return img.width, img.height
-
-
 def build_conversation_entry(
     record: Dict[str, Any],
     images_root: Path,
@@ -73,11 +47,19 @@ def build_conversation_entry(
     source = record.get("source") or {}
     target = record.get("target") or {}
     source_desc = sanitize_person_description(source.get("description"))
-    target_desc = target.get("description")
     target_point = target.get("point")
+    outside_frame = is_outside_frame(record.get("in_or_out"))
 
-    if not source_desc or not target_desc or not target_point:
-        return None, "missing source or target description/point"
+    if not source_desc:
+        return None, "missing source description"
+    if not target_point:
+        return None, "missing target point"
+    if outside_frame:
+        target_desc = OUTSIDE_FRAME_TARGET_DESCRIPTION
+    else:
+        target_desc = target.get("description")
+        if not target_desc:
+            return None, "missing target description"
     grounding_eval = record.get("grounding_eval") or {}
     source_eval = grounding_eval.get("source") or {}
     target_eval = grounding_eval.get("target") or {}
@@ -85,13 +67,13 @@ def build_conversation_entry(
     target_bbox = target_eval.get("predicted_bbox")
     source_l2 = (source_eval.get("errors") or {}).get("gaze_normalized_l2_error")
     target_l2 = (target_eval.get("errors") or {}).get("gaze_normalized_l2_error")
-    if not source_bbox or not target_bbox:
+    if not source_bbox or (not outside_frame and not target_bbox):
         return None, "missing grounding bounding boxes"
-    if source_l2 is None or target_l2 is None:
+    if source_l2 is None or (not outside_frame and target_l2 is None):
         return None, "missing grounding L2 errors"
     if source_l2 > source_l2_threshold:
         return None, f"source normalized L2 too high ({source_l2:.3f}>{source_l2_threshold:.3f})"
-    if target_l2 > target_l2_threshold:
+    if not outside_frame and target_l2 > target_l2_threshold:
         return None, f"target normalized L2 too high ({target_l2:.3f}>{target_l2_threshold:.3f})"
 
     if precomputed_size is None:
