@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,10 @@ from gazefollow.auto_phrase_grounding.build_conversation_json import (  # noqa: 
 
 from gazefollow.auto_phrase_grounding.conversation_utils import (
     OUTSIDE_FRAME_TARGET_DESCRIPTION,
+    build_conversation_entry,
     build_outside_frame_conversation,
+    extract_question_subject,
+    has_looking_at_phrase,
     strip_helper_keys,
 )
 
@@ -74,8 +78,19 @@ def parse_args() -> argparse.Namespace:
 def load_samples(files: Iterable[Path]) -> List[dict]:
     combined: List[dict] = []
     for path in files:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            print(
+                f"JSON decode error in {path}: {exc}. Attempting to recover partial data."
+            )
+            recovered = recover_truncated_json(path)
+            if not recovered:
+                print(f"Skipping {path}: unable to recover valid samples.")
+                continue
+            combined.extend(recovered)
+            continue
         if isinstance(data, list):
             combined.extend(data)
             continue
@@ -90,6 +105,55 @@ def load_samples(files: Iterable[Path]) -> List[dict]:
                 continue
         print(f"Skipping {path}: unsupported top-level JSON type {type(data).__name__}")
     return combined
+
+
+def recover_truncated_json(path: Path) -> List[dict]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"Failed to read {path}: {exc}")
+        return []
+
+    images_root = None
+    match = re.search(r'"images_root"\\s*:\\s*"([^"]+)"', text)
+    if match:
+        images_root = match.group(1)
+
+    array_start = locate_array_start(text)
+    if array_start is None:
+        return []
+
+    decoder = json.JSONDecoder()
+    index = array_start + 1
+    recovered: List[dict] = []
+    while index < len(text):
+        while index < len(text) and text[index] in " \r\n\t,":
+            index += 1
+        if index >= len(text) or text[index] == "]":
+            break
+        try:
+            obj, offset = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            # Hit a truncated object; stop recovering.
+            break
+        if isinstance(obj, dict) and images_root and "_images_root" not in obj:
+            obj["_images_root"] = images_root
+        recovered.append(obj)
+        index = offset
+
+    if recovered:
+        print(f"Recovered {len(recovered)} samples from truncated JSON {path}.")
+    return recovered
+
+
+def locate_array_start(text: str) -> Optional[int]:
+    results_key = text.find('"results"')
+    if results_key != -1:
+        bracket_index = text.find("[", results_key)
+        if bracket_index != -1:
+            return bracket_index
+    # Fall back to the first array in the document if "results" is missing.
+    return text.find("[")
 
 
 def get_identifier(
@@ -125,6 +189,53 @@ def override_with_outside_answer(entry: Dict[str, Any], outside_answer: str) -> 
             turn["value"] = outside_answer
             return True
     return False
+
+
+def normalize_gpt_answers(conversation_samples: List[Dict[str, Any]]) -> Dict[str, int]:
+    stats: Dict[str, int] = {
+        "processed_gpt_turns": 0,
+        "updated_answers": 0,
+        "missing_subject": 0,
+        "missing_gpt_value": 0,
+    }
+    for sample in conversation_samples:
+        conversation = sample.get("conversations")
+        if not isinstance(conversation, list):
+            continue
+        last_subject: Optional[str] = None
+        for turn in conversation:
+            speaker = (turn.get("from") or "").lower()
+            if speaker == "human":
+                question_value = turn.get("value")
+                if isinstance(question_value, str):
+                    last_subject = extract_question_subject(question_value)
+                else:
+                    last_subject = None
+                continue
+            if speaker != "gpt":
+                continue
+            answer_value = turn.get("value")
+            if not isinstance(answer_value, str):
+                stats["missing_gpt_value"] += 1
+                continue
+            stats["processed_gpt_turns"] += 1
+            if has_looking_at_phrase(answer_value):
+                continue
+            if not last_subject:
+                stats["missing_subject"] += 1
+                continue
+            target_desc = answer_value.strip()
+            if not target_desc:
+                stats["missing_gpt_value"] += 1
+                continue
+            try:
+                formatted = build_conversation_entry(last_subject, target_desc)
+            except ValueError:
+                stats["missing_subject"] += 1
+                continue
+            turn["value"] = formatted["value"]
+            stats["updated_answers"] += 1
+    return stats
 
 
 def apply_outside_frame_overrides(
@@ -230,6 +341,7 @@ def main() -> None:
             combined_non_conversations,
             source_l2_threshold=args.source_l2_threshold,
         )
+    format_stats = normalize_gpt_answers(combined_conversations)
     total_samples = len(combined_conversations)
     in_samples = sum(
         1 for sample in combined_conversations if str(sample.get("in_or_out", "0")) == "1"
@@ -265,6 +377,10 @@ def main() -> None:
         "outside_missing_identifier": override_stats["missing_identifier"],
         "outside_created_conversations": override_stats["created_conversations"],
         "outside_creation_failures": len(override_stats["creation_failures"]),
+        "looking_at_checked_turns": format_stats["processed_gpt_turns"],
+        "looking_at_updated_answers": format_stats["updated_answers"],
+        "looking_at_missing_subjects": format_stats["missing_subject"],
+        "looking_at_missing_gpt_values": format_stats["missing_gpt_value"],
     }
     metrics_path = output_dir / "set_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as fh:
@@ -301,6 +417,18 @@ def main() -> None:
                 )
     else:
         print("No non-conversation files were combined.")
+
+    if format_stats["updated_answers"]:
+        print(
+            "Normalized GPT answers to include 'looking at': "
+            f"{format_stats['updated_answers']} updates out of {format_stats['processed_gpt_turns']} checked turns."
+        )
+    if format_stats["missing_subject"] or format_stats["missing_gpt_value"]:
+        print(
+            "Formatting skips — "
+            f"missing subject: {format_stats['missing_subject']}, "
+            f"missing GPT value: {format_stats['missing_gpt_value']}"
+        )
 
 
 if __name__ == "__main__":
