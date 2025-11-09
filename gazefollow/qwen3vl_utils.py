@@ -117,15 +117,9 @@ class PersistedPaths:
 
 
 def build_qwen_query(
-    person_label: str,
-    person_description: str,
-    gaze_target: str,
-    person_id: str,
+    gaze_target: str
 ) -> str:
     """Construct a prompt for Qwen3-VL grounding."""
-    description = person_description or person_label
-    gaze_json = json.dumps(gaze_target)
-    person_id_json = json.dumps(person_id)
     return (
         f"Locate the {gaze_target}. "
         "Return a JSON array with a single object following the schema: "

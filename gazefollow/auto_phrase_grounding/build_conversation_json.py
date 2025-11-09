@@ -90,7 +90,7 @@ def build_conversation_entry(
         },
         {
             "from": "gpt",
-            "value": target_desc,
+            "value": f"The {question_subject} is looking at {target_desc}",
         },
     ]
 

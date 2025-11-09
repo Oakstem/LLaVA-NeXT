@@ -201,12 +201,29 @@ def run_qwen3vl_grounding(
     detections = parse_grounding_predictions(pred)
     raw_response = pred[pred.find('assistant\n'):].strip("assistant\n")
 
-    for detection in detections:
-        bbox_key = next((key for key in detection.keys() if "bbox" in key), None)
+    cleaned_detections: list[dict[str, Any]] = []
+    for raw_detection in detections:
+        detection: Any = raw_detection
+        # Some generations output bare lists like [x1, y1, x2, y2]; wrap them.
+        if isinstance(detection, list) and len(detection) == 4 and all(isinstance(val, (int, float)) for val in detection):
+            detection = {"bbox": detection}
+        if not isinstance(detection, dict):
+            continue
+
+        bbox_key = next((key for key in detection.keys() if isinstance(key, str) and "bbox" in key.lower()), None)
         if not bbox_key:
             continue
 
-        x1_norm, y1_norm, x2_norm, y2_norm = detection[bbox_key]
+        bbox_value = detection.get(bbox_key)
+        if (
+            not isinstance(bbox_value, (list, tuple))
+            or len(bbox_value) != 4
+        ):
+            continue
+        try:
+            x1_norm, y1_norm, x2_norm, y2_norm = [float(coord) for coord in bbox_value]
+        except (TypeError, ValueError):
+            continue
         abs_bbox = [
             int((x1_norm / 1000.0) * img_width),
             int((y1_norm / 1000.0) * img_height),
@@ -221,7 +238,9 @@ def run_qwen3vl_grounding(
         if bbox_key != 'bbox':
             detection.pop(bbox_key, None)
 
-    return detections, raw_response
+        cleaned_detections.append(detection)
+
+    return cleaned_detections, raw_response
 
 
 def main() -> None:

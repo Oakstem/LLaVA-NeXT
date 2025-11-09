@@ -80,13 +80,23 @@ def parse_person_descriptions(text: str) -> List[PersonDescription]:
     persons: List[PersonDescription] = []
     for raw_label, description in PERSON_PATTERN.findall(text):
         person_id = normalize_person_id(raw_label)
-        persons.append(
-            PersonDescription(
-                person_id=person_id,
-                label=raw_label.strip(),
-                raw_description=description.strip(),
-                gaze_target=extract_gaze_target(description),
-            )
+        has_gaze_pattern = bool(GAZE_PATTERN.search(description))
+        if not has_gaze_pattern:
+            persons.append(
+                PersonDescription(
+                    person_id=person_id,
+                    label=raw_label.strip(),
+                    raw_description="",
+                    gaze_target=description.strip(),
+                ))
+        else:
+            persons.append(
+                PersonDescription(
+                    person_id=person_id,
+                    label=raw_label.strip(),
+                    raw_description=description.strip(),
+                    gaze_target=extract_gaze_target(description),
+                )
         )
     return persons
 

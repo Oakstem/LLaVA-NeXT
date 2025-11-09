@@ -16,8 +16,13 @@ except ModuleNotFoundError:  # pragma: no cover - Pillow may be unavailable in s
 
 OUTSIDE_FRAME_TARGET_DESCRIPTION = "something or someone outside the frame"
 LOOKING_PATTERN = re.compile(r"\blooking\b.*", flags=re.IGNORECASE | re.DOTALL)
+LOOKING_AT_PHRASE_PATTERN = re.compile(r"\blooking\s+at\b", flags=re.IGNORECASE)
 DUPLICATE_WORD_PATTERN = re.compile(r"\b(\w+)\s+\1\b", flags=re.IGNORECASE)
 ARTICLE_PATTERN = re.compile(r"^(a|an)\s+", flags=re.IGNORECASE)
+QUESTION_SUBJECT_PATTERN = re.compile(
+    r"describe\s+where\s+(?:the\s+)?(?P<subject>.+?)\s+is\s+looking(?:\s+at)?",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 def sanitize_person_description(raw: Optional[str]) -> Optional[str]:
@@ -42,6 +47,42 @@ def clean_question_phrase(description: str) -> str:
             break
         text = deduped.strip()
     return text
+
+
+def has_looking_at_phrase(value: Optional[str]) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    return bool(LOOKING_AT_PHRASE_PATTERN.search(value))
+
+
+def extract_question_subject(prompt: Optional[str]) -> Optional[str]:
+    if not prompt:
+        return None
+    text = prompt.replace("<image>", " ").strip()
+    match = QUESTION_SUBJECT_PATTERN.search(text)
+    if not match:
+        return None
+    subject = match.group("subject").strip()
+    subject = subject.rstrip(" ?.!:,;")
+    if subject.lower().startswith("the "):
+        subject = subject[4:].strip()
+    subject = clean_question_phrase(subject)
+    return subject or None
+
+
+def build_conversation_entry(question_subject: str, target_desc: str) -> Dict[str, str]:
+    if not question_subject or not target_desc:
+        raise ValueError("question_subject and target_desc must be provided")
+    cleaned_subject = clean_question_phrase(question_subject)
+    if cleaned_subject.lower().startswith("the "):
+        cleaned_subject = cleaned_subject[4:].strip()
+    cleaned_desc = target_desc.strip()
+    if not cleaned_desc:
+        raise ValueError("target_desc must not be empty")
+    return {
+        "from": "gpt",
+        "value": f"The {cleaned_subject} is looking at {cleaned_desc}",
+    }
 
 
 def is_outside_frame(value: Any) -> bool:
@@ -225,10 +266,7 @@ def build_outside_frame_conversation(
             "from": "human",
             "value": f"<image>\nDescribe where the {question_subject} is looking at",
         },
-        {
-            "from": "gpt",
-            "value": outside_answer,
-        },
+        build_conversation_entry(question_subject, outside_answer),
     ]
 
     return (

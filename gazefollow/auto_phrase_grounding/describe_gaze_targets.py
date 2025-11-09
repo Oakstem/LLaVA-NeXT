@@ -91,11 +91,69 @@ def normalize_key_component(value: Optional[str]) -> Optional[str]:
 
 
 def build_sample_key(primary: Optional[str], secondary: Optional[str], annotation_id: Optional[str]) -> Tuple[str, str]:
-    normalized_primary = normalize_key_component(primary)
-    normalized_secondary = normalize_key_component(secondary)
-    key_component = normalized_primary or normalized_secondary or ""
-    key_annotation = str(annotation_id).strip() if annotation_id is not None else ""
-    return key_component, key_annotation
+    """Backward-compatible wrapper that returns the first generated sample key."""
+    variants = generate_sample_key_variants(
+        primary_candidates=[primary],
+        secondary_candidates=[secondary],
+        annotation_candidates=[annotation_id],
+    )
+    return variants[0] if variants else ("", "")
+
+
+def normalize_annotation_component(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value_str = str(value).strip()
+    return value_str or None
+
+
+def strip_key_extension(component: str) -> Optional[str]:
+    if "." not in component:
+        return None
+    slash_index = component.rfind("/")
+    after_slash = component[slash_index + 1 :] if slash_index >= 0 else component
+    if "." not in after_slash:
+        return None
+    base = after_slash.rsplit(".", 1)[0]
+    prefix = component[: slash_index + 1] if slash_index >= 0 else ""
+    stripped = f"{prefix}{base}"
+    return stripped or None
+
+
+def generate_key_component_variants(value: Optional[str]) -> List[str]:
+    normalized = normalize_key_component(value)
+    if not normalized:
+        return []
+    variants = [normalized]
+    stripped = strip_key_extension(normalized)
+    if stripped and stripped not in variants:
+        variants.append(stripped)
+    return variants
+
+
+def generate_sample_key_variants(
+    *,
+    primary_candidates: Sequence[Optional[str]] = (),
+    secondary_candidates: Sequence[Optional[str]] = (),
+    annotation_candidates: Sequence[Optional[str]] = (),
+) -> List[Tuple[str, str]]:
+    components: List[str] = []
+    for candidate in list(primary_candidates) + list(secondary_candidates):
+        for variant in generate_key_component_variants(candidate):
+            if variant not in components:
+                components.append(variant)
+    if not components:
+        components = [""]
+
+    annotations: List[str] = []
+    for candidate in annotation_candidates:
+        normalized = normalize_annotation_component(candidate)
+        if normalized and normalized not in annotations:
+            annotations.append(normalized)
+    if not annotations:
+        annotations = [""]
+
+    return [(component, annotation) for component in components for annotation in annotations]
 
 
 def load_resume_state(resume_path: Optional[Path]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], set[Tuple[str, str]]]:
@@ -113,8 +171,15 @@ def load_resume_state(resume_path: Optional[Path]) -> Tuple[List[Dict[str, Any]]
     with resume_path.open("r") as fp:
         summary = json.load(fp)
 
-    previous_results = summary.get("results") or []
-    previous_failures = summary.get("failures") or []
+    if isinstance(summary, list):
+        previous_results = summary
+        previous_failures: list[dict[str, Any]] = []
+    elif isinstance(summary, dict):
+        previous_results = summary.get("results") or []
+        previous_failures = summary.get("failures") or []
+    else:
+        raise ValueError(f"Resume JSON must be an object or list: {resume_path}")
+
     if not isinstance(previous_results, list) or not isinstance(previous_failures, list):
         raise ValueError(f"Resume JSON does not contain list-based results/failures: {resume_path}")
 
@@ -122,9 +187,29 @@ def load_resume_state(resume_path: Optional[Path]) -> Tuple[List[Dict[str, Any]]
     failures = list(previous_failures)
 
     for entry in results:
-        seen_keys.add(build_sample_key(entry.get("relative_path"), entry.get("image_id"), entry.get("annotation_id")))
+        variants = generate_sample_key_variants(
+            primary_candidates=[
+                entry.get("relative_path"),
+                entry.get("image_path"),
+                entry.get("image_id"),
+                entry.get("image"),
+            ],
+            secondary_candidates=[
+                entry.get("image_id"),
+                entry.get("image_path"),
+                entry.get("relative_path"),
+                entry.get("image"),
+            ],
+            annotation_candidates=[
+                entry.get("annotation_id"),
+                entry.get("id"),
+            ],
+        )
+        seen_keys.update(variants)
 
-    print(f"[resume] Loaded {len(results)} results and {len(failures)} failures from {resume_path}")
+    print(
+        f"[resume] Loaded {len(results)} results and {len(failures)} failures from {resume_path}; derived {len(seen_keys)} unique sample keys"
+    )
     return results, failures, seen_keys
 
 
@@ -501,12 +586,19 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
             image_identifier = relative_key or str(row.get("image_path") or "").strip()
             annotation_id = str(row.get("id") or "")
             handled_rows += 1
-            sample_key = build_sample_key(relative_key, image_identifier, annotation_id)
-            if sample_key in seen_keys:
+            sample_keys = generate_sample_key_variants(
+                primary_candidates=[relative_key, image_identifier],
+                secondary_candidates=[image_identifier, relative_key],
+                annotation_candidates=[annotation_id],
+            )
+            if any(key in seen_keys for key in sample_keys):
                 skip_logger.log(
                     f"[{handled_rows}] {image_identifier or 'N/A'}#{annotation_id or '-'} SKIP: already processed (resume)"
                 )
+                print(f"[skip] {image_identifier or 'N/A'}#{annotation_id or '-'}: already processed (resume)")
                 continue
+            else:
+                print(f"[process] {image_identifier or 'N/A'}#{annotation_id or '-'}")
             if not relative_key:
                 reason = "missing image path columns"
                 failures.append({"image_id": image_identifier, "annotation_id": annotation_id, "reason": reason})
@@ -708,8 +800,14 @@ def process_csv(args: argparse.Namespace) -> Tuple[Dict[str, Any], Path, Optiona
             if is_outside_frame(record.get("in_or_out")):
                 record["target"]["description"] = OUTSIDE_FRAME_TARGET_DESCRIPTION
             results.append(record)
-            seen_keys.add(sample_key)
-            seen_keys.add(build_sample_key(relative_path, image_identifier, annotation_id))
+            seen_keys.update(sample_keys)
+            seen_keys.update(
+                generate_sample_key_variants(
+                    primary_candidates=[relative_path],
+                    secondary_candidates=[image_identifier, relative_path],
+                    annotation_candidates=[annotation_id],
+                )
+            )
             if args.build_conversations and conversation_output_path is not None:
                 convo_entry, reason = build_conversation_entry(
                     record,
