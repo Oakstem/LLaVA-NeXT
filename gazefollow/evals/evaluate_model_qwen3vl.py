@@ -497,10 +497,7 @@ def process_sample_with_qwen_grounding(
             description_for_query = sanitized_description or person.raw_description.strip()
             normalized_gaze_target = normalize_gaze_target_text(person.gaze_target)
             query = build_qwen_query(
-                person.label,
-                description_for_query,
                 normalized_gaze_target or "",
-                person.person_id,
             )
 
             detections: List[Dict[str, Any]] = []
