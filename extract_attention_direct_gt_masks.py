@@ -47,6 +47,7 @@ from generation_utils import (
     summarize_batch_results,
     log_generation_step,
     DEFAULT_GT_GAZE_CSV,
+    save_mask_overlay_image,
     # New gaze guidance functions
     select_token_by_gaze_correlation,
     generate_next_token_with_gaze_guidance,
@@ -64,6 +65,7 @@ from generation_utils import (
     calculate_correlation_metrics,
     update_generation_state,
     create_generation_results,
+    set_gt_annotation_lookup_use_body_bbox,
 )
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
@@ -120,6 +122,8 @@ def run_generation_with_attention(
     gt_gaze_csv_path: Optional[Union[str, Path]] = None,
     gt_gaze_mask_radius: Optional[int] = None,
     gt_gaze_mask_radius_ratio: float = 0.02,
+    save_mask_overlays: bool = False,
+    mask_overlay_alpha: float = 0.4,
 ) -> Dict[str, Any]:
     """
     Run generation with attention extraction and optional gaze guidance.
@@ -144,6 +148,8 @@ def run_generation_with_attention(
         gt_gaze_csv_path: Optional override path for the GT CSV
         gt_gaze_mask_radius: Optional fixed radius (pixels) for generated mask
         gt_gaze_mask_radius_ratio: Relative radius fallback (fraction of min dimension)
+        save_mask_overlays: Generate and save person/target overlay visualization
+        mask_overlay_alpha: Alpha blend to use for overlay visualization
 
     Returns:
         Dictionary containing generation results and analysis
@@ -154,7 +160,7 @@ def run_generation_with_attention(
     image_path = fix_wsl_paths(str(image_path))
 
     print(f"Processing image: {image_path}")
-    print(f"Using mask: {mask_path}")
+    # print(f"Using mask: {mask_path}")
     print(f"Prompt: {prompt}")
     print(f"Gaze guidance enabled: {use_gaze_guidance}")
 
@@ -162,6 +168,7 @@ def run_generation_with_attention(
     output_directories = _setup_output_directories(output_dir)
     (output_dir, vis_output_dir_raw, vis_output_dir_processed, 
      tensor_output_dir, collage_output_dir, similarity_output_dir) = output_directories
+    mask_overlay_dir = Path(output_dir) / "mask_overlays"
 
     # Prepare inputs
     (image, input_masks, image_tensor, image_sizes, atten_indices,
@@ -178,6 +185,28 @@ def run_generation_with_attention(
         gt_gaze_mask_radius_ratio=gt_gaze_mask_radius_ratio,
     )
 
+    target_mask_raw = input_masks.get('target_mask_raw')
+    person_mask_raw = input_masks.get('person_mask_raw')
+
+    overlay_path: Optional[Path] = None
+    if save_mask_overlays:
+        overlay_path = save_mask_overlay_image(
+            image=image,
+            target_mask_raw=target_mask_raw,
+            person_mask_raw=person_mask_raw,
+            output_dir=mask_overlay_dir,
+            filename_prefix=Path(image_path).stem,
+            alpha=mask_overlay_alpha
+        )
+        if overlay_path:
+            print(f"Saved mask overlay visualization to {overlay_path}")
+        else:
+            print("⚠️ Warning: Unable to create mask overlay (missing mask data).")
+
+    # Raw masks are only needed for visualization; remove them before passing to the model
+    input_masks.pop('target_mask_raw', None)
+    input_masks.pop('person_mask_raw', None)
+
     # Setup model configuration
     boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
     num_patches, grid_size, image_token_start_index_in_llm, image_token_end_index_in_llm = _determine_image_patch_info(model, input_ids)
@@ -185,6 +214,27 @@ def run_generation_with_attention(
     # Initialize generation state
     print("Starting generation with attention extraction and advanced evaluation...")
     state = initialize_generation_state(gen_config, tokenizer, input_ids)
+
+    repr_layer_map = None
+    repr_source_layer_idx = None
+    repr_target_layer_idx = None
+    if attn_config:
+        repr_source_layer_idx = attn_config.get("repr_source_layer_idx")
+        repr_target_layer_idx = attn_config.get("repr_target_layer_idx")
+        repr_layer_map = attn_config.get("repr_layer_idx")
+        multi_layer_requested = (
+            repr_source_layer_idx is not None or repr_target_layer_idx is not None
+        )
+        if multi_layer_requested:
+            fallback_layer = repr_layer_map
+            if fallback_layer is None:
+                fallback_layer = attn_config.get("layer_idx")
+            if fallback_layer is None:
+                fallback_layer = -1
+            repr_layer_map = {
+                "source": repr_source_layer_idx if repr_source_layer_idx is not None else fallback_layer,
+                "target": repr_target_layer_idx if repr_target_layer_idx is not None else fallback_layer,
+            }
 
     # Main generation loop
     for i in range(state["max_new_tokens"]):
@@ -200,6 +250,7 @@ def run_generation_with_attention(
                 "boost_positions": boost_positions,
                 "bias_strength": bias_strength,
                 "query_indices": attn_config.get("query_indices", None),
+                "repr_layer_idx": repr_layer_map,
                 "target_mask_embedding": prev_run_last_hidden_state,
                 "base_image_token_inds": [image_token_start_index_in_llm, image_token_start_index_in_llm + num_patches],
                 "input_masks": input_masks,
@@ -208,6 +259,30 @@ def run_generation_with_attention(
             }
             if i == 0:
                 model_inputs.update({"images": image_tensor, "image_sizes": image_sizes, "modalities": ["image"]})
+
+            ## Todo: remove after testing
+            # decoded = []
+            # for ind, val in enumerate(model_inputs["input_ids"][0]):
+            #     if val == tokenizer.convert_tokens_to_ids("<image>"):
+            #         print(f"Image token at position {ind}")
+            #     if val < tokenizer.vocab_size and val >= 0:
+            #         decoded.append(tokenizer.convert_ids_to_tokens([val]))
+            #         print(f"Text token '{tokenizer.convert_ids_to_tokens([val])}' at position {ind}")
+            target_mask_embedding = model_inputs.get("target_mask_embedding", None)
+            if isinstance(target_mask_embedding, dict):
+                for key, tensor in target_mask_embedding.items():
+                    if tensor is None:
+                        continue
+                    print(
+                        f"Using {key} target mask embedding from previous run for guidance with mean: {tensor.mean().item():.4f}, "
+                        f"min: {tensor.min().item():.4f}, max: {tensor.max().item():.4f}"
+                    )
+            elif target_mask_embedding is not None:
+                print(
+                    f"Using target mask embedding from previous run for guidance with mean: {target_mask_embedding.mean().item():.4f}, "
+                    f"min: {target_mask_embedding.min().item():.4f}, max: {target_mask_embedding.max().item():.4f}"
+                )
+
 
             # Generate next token with gaze guidance
             next_token_id, token_text, outputs, evaluation_metrics = generate_next_token_with_gaze_guidance(
@@ -221,6 +296,19 @@ def run_generation_with_attention(
                 guidance_config=guidance_config
             )
             state["all_step_metrics"].append(evaluation_metrics)
+            
+            print(f"Step {i+1}: Hidden state -1: mean {outputs.hidden_states[-1].mean().item():.4f}, min {outputs.hidden_states[-1].min().item():.4f}, max {outputs.hidden_states[-1].max().item():.4f}")
+            # ## Todo: remove after testing
+            # decoded = []
+            # all_probs = torch.softmax(outputs.logits[0, :, :], dim=-1)
+            # predall_probs = all_probs.argmax(dim=-1)
+            # for ind, val in enumerate(predall_probs):
+            #     if val == tokenizer.convert_tokens_to_ids("<image>"):
+            #         print(f"Image token at position {ind}")
+            #     if val < tokenizer.vocab_size and val >= 0:
+            #         decoded.append(tokenizer.convert_ids_to_tokens([val]))
+            #         print(f"Text token '{tokenizer.convert_ids_to_tokens([val])}' at position {ind}")
+
 
             # Process hidden states and extract embeddings
             set_layer_image_embeddings = process_hidden_states_and_embeddings(
@@ -267,11 +355,16 @@ def run_generation_with_attention(
         "tensors": str(tensor_output_dir),
         "collages": str(collage_output_dir),
     }
+    if save_mask_overlays:
+        output_directories_dict["mask_overlays"] = str(mask_overlay_dir)
     
     results = create_generation_results(
         state, tokenizer, output_directories_dict, 
         gen_config, attn_config, guidance_config
     )
+
+    if overlay_path:
+        results["mask_overlay_path"] = str(overlay_path)
 
     # Print summary
     print_summary(
@@ -476,6 +569,8 @@ def process_batch_from_json(
     gt_gaze_csv_path: Optional[Union[str, Path]] = None,
     gt_gaze_mask_radius: Optional[int] = None,
     gt_gaze_mask_radius_ratio: float = 0.02,
+    save_mask_overlays: bool = False,
+    mask_overlay_alpha: float = 0.4,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process multiple images, performing bias sweeps for each image.
@@ -647,6 +742,8 @@ def process_batch_from_json(
             gt_gaze_csv_path=gt_gaze_csv_path,
             gt_gaze_mask_radius=gt_gaze_mask_radius,
             gt_gaze_mask_radius_ratio=gt_gaze_mask_radius_ratio,
+            save_mask_overlays=save_mask_overlays,
+            mask_overlay_alpha=mask_overlay_alpha,
         )
         bias_sweep_results = run_bias_sweep_experiment(
             base_experiment_config=base_config,
@@ -738,6 +835,8 @@ def run_bias_sweep_experiment(
             gt_gaze_csv_path=experiment_config.get("gt_gaze_csv_path"),
             gt_gaze_mask_radius=experiment_config.get("gt_gaze_mask_radius"),
             gt_gaze_mask_radius_ratio=experiment_config.get("gt_gaze_mask_radius_ratio", 0.02),
+            save_mask_overlays=experiment_config.get("save_mask_overlays", False),
+            mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
         )
 
     for bias_i in bias_range:
@@ -769,6 +868,8 @@ def run_bias_sweep_experiment(
             gt_gaze_csv_path=experiment_config.get("gt_gaze_csv_path"),
             gt_gaze_mask_radius=experiment_config.get("gt_gaze_mask_radius"),
             gt_gaze_mask_radius_ratio=experiment_config.get("gt_gaze_mask_radius_ratio", 0.02),
+            save_mask_overlays=experiment_config.get("save_mask_overlays", False),
+            mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
         )
         results.pop('first_step_hidden_state', None)
         all_results[bias_i] = results
@@ -779,6 +880,299 @@ def run_bias_sweep_experiment(
 
     return all_results
 
+
+def run_repr_layer_sweep_experiment(
+    base_experiment_config: Dict[str, Any],
+    model,
+    tokenizer,
+    image_processor,
+    repr_layer_indices: List[int],
+    bias_strength: Optional[float] = None,
+    use_gaze_guidance: bool = True,
+    guidance_config: Optional[Dict[str, Any]] = None,
+    repr_target_layer_indices: Optional[List[int]] = None,
+    enable_pairwise_sweep: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Runs the generation experiment across different representation layer indices.
+    """
+    if not repr_layer_indices:
+        raise ValueError("repr_layer_indices must contain at least one layer index to sweep.")
+    repr_layer_indices = [int(idx) for idx in repr_layer_indices]
+    if repr_target_layer_indices is None and enable_pairwise_sweep:
+        repr_target_layer_indices = repr_layer_indices
+    target_indices = [int(idx) for idx in repr_target_layer_indices] if repr_target_layer_indices else repr_layer_indices
+
+    combos: List[Tuple[int, int]]
+    if enable_pairwise_sweep:
+        combos = [(src, tgt) for src in repr_layer_indices for tgt in target_indices]
+    else:
+        combos = [(idx, idx) for idx in repr_layer_indices]
+
+    if not combos:
+        raise ValueError("No representation layer combinations computed for sweep.")
+
+    all_results: Dict[str, Dict[str, Any]] = {}
+    base_output_dir = base_experiment_config.get("output_dir", "attention_output/repr_sweep")
+    base_output_dir_path = Path(base_output_dir)
+    base_output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    print("Running generation passes to cache hidden-state embeddings for repr layer sweep...")
+    init_bias = bias_strength if bias_strength is not None else base_experiment_config.get(
+        "generation_config", {}
+    ).get("bias_strength", 0.0)
+
+    effective_bias = bias_strength if bias_strength is not None else base_experiment_config.get(
+        "generation_config", {}
+    ).get("bias_strength", 0.0)
+
+    required_cache_layers = sorted({idx for combo in combos for idx in combo})
+    layer_hidden_state_cache: Dict[int, torch.Tensor] = {}
+    for layer_idx in required_cache_layers:
+        print(f" - Caching hidden state for layer {layer_idx}")
+        cache_config = copy.deepcopy(base_experiment_config)
+        cache_config["output_dir"] = f"{base_output_dir}/repr_cache_layer_{layer_idx}"
+        cache_config.setdefault("generation_config", {})["bias_strength"] = effective_bias
+        attn_cfg = copy.deepcopy(cache_config.get("attention_config", {}))
+        attn_cfg.pop("repr_source_layer_idx", None)
+        attn_cfg.pop("repr_target_layer_idx", None)
+        attn_cfg["repr_layer_idx"] = layer_idx
+        cache_config["attention_config"] = attn_cfg
+        init_run_results = run_generation_with_attention(
+            model=model,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            image_path=cache_config["image_path"],
+            mask_path=cache_config["mask_path"],
+            prompt="",
+            output_dir=cache_config["output_dir"],
+            generation_config=cache_config["generation_config"],
+            attention_config=cache_config.get("attention_config"),
+            bias_strength=init_bias,
+            break_after_first_step=True,
+            use_gaze_guidance=use_gaze_guidance,
+            guidance_config=guidance_config,
+            save_debug_files=base_experiment_config.get("save_debug_files", False),
+            use_gt_gaze_csv=cache_config.get("use_gt_gaze_csv", False),
+            gt_gaze_csv_path=cache_config.get("gt_gaze_csv_path"),
+            gt_gaze_mask_radius=cache_config.get("gt_gaze_mask_radius"),
+            gt_gaze_mask_radius_ratio=cache_config.get("gt_gaze_mask_radius_ratio", 0.02),
+            save_mask_overlays=cache_config.get("save_mask_overlays", False),
+            mask_overlay_alpha=cache_config.get("mask_overlay_alpha", 0.4),
+        )
+        cached_hidden_state = init_run_results.get("first_step_hidden_state")
+        if isinstance(cached_hidden_state, dict):
+            cached_hidden_state = cached_hidden_state.get("target") or cached_hidden_state.get("source")
+        if cached_hidden_state is None:
+            raise RuntimeError(f"Failed to cache hidden state for layer {layer_idx}")
+        layer_hidden_state_cache[layer_idx] = cached_hidden_state.detach().cpu()
+
+    for source_idx, target_idx in combos:
+        print(f"\n{'='*60}")
+        if enable_pairwise_sweep:
+            print(
+                f"Running repr-layer sweep experiment with source layer {source_idx} -> target layer {target_idx}"
+            )
+        else:
+            print(f"Running repr-layer sweep experiment with repr_layer_idx: {target_idx}")
+
+        experiment_config = copy.deepcopy(base_experiment_config)
+        combo_label = f"src{source_idx}_tgt{target_idx}" if enable_pairwise_sweep else f"layer_{target_idx}"
+        experiment_config["output_dir"] = f"{base_output_dir}/{combo_label}"
+        experiment_config.setdefault("generation_config", {})["bias_strength"] = effective_bias
+        attn_cfg = copy.deepcopy(experiment_config.get("attention_config", {}))
+        attn_cfg["repr_layer_idx"] = target_idx
+        if enable_pairwise_sweep:
+            attn_cfg["repr_source_layer_idx"] = source_idx
+            attn_cfg["repr_target_layer_idx"] = target_idx
+        else:
+            attn_cfg.pop("repr_source_layer_idx", None)
+            attn_cfg.pop("repr_target_layer_idx", None)
+        experiment_config["attention_config"] = attn_cfg
+
+        if enable_pairwise_sweep:
+            prev_hidden_state: Union[torch.Tensor, Dict[str, torch.Tensor]] = {
+                "source": layer_hidden_state_cache[source_idx],
+                "target": layer_hidden_state_cache[target_idx],
+            }
+        else:
+            prev_hidden_state = layer_hidden_state_cache[target_idx]
+
+        results = run_generation_with_attention(
+            model=model,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            image_path=experiment_config["image_path"],
+            mask_path=experiment_config["mask_path"],
+            prompt=experiment_config["prompt"],
+            output_dir=experiment_config["output_dir"],
+            generation_config=experiment_config["generation_config"],
+            attention_config=experiment_config.get("attention_config"),
+            bias_strength=experiment_config["generation_config"].get("bias_strength", 0.0),
+            prev_run_last_hidden_state=prev_hidden_state,
+            use_gaze_guidance=use_gaze_guidance,
+            guidance_config=guidance_config,
+            save_debug_files=base_experiment_config.get(
+                "save_debug_files",
+                base_experiment_config.get("generation_config", {}).get("save_debug_files", False)
+            ),
+            use_gt_gaze_csv=experiment_config.get("use_gt_gaze_csv", False),
+            gt_gaze_csv_path=experiment_config.get("gt_gaze_csv_path"),
+            gt_gaze_mask_radius=experiment_config.get("gt_gaze_mask_radius"),
+            gt_gaze_mask_radius_ratio=experiment_config.get("gt_gaze_mask_radius_ratio", 0.02),
+            save_mask_overlays=experiment_config.get("save_mask_overlays", False),
+            mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
+        )
+        results.pop("first_step_hidden_state", None)
+        results["repr_source_layer_idx"] = source_idx if enable_pairwise_sweep else target_idx
+        results["repr_target_layer_idx"] = target_idx
+        all_results[combo_label] = results
+        print(f"Finished experiment for {combo_label}. Results saved to: {results['output_directories']['main']}")
+
+    if not all_results:
+        print("No representation layer sweep results were generated.")
+        return {}
+
+    print(f"\n{'='*80}")
+    print("REPRESENTATION LAYER SWEEP SUMMARY")
+    print(f"{'='*80}")
+
+    performance_summary: List[Dict[str, Any]] = []
+    for _, result in all_results.items():
+        evaluation_summary = result.get("evaluation_summary") or {}
+        quality_analysis = result.get("quality_analysis") or {}
+        attention_correlation = result.get("attention_correlation") or {}
+
+        avg_confidence = (evaluation_summary.get("average_confidence") or {}).get("confidence_score", 0.0)
+        avg_entropy = (evaluation_summary.get("average_confidence") or {}).get("entropy", float("inf"))
+        correlation_score = attention_correlation.get("normalized_correlation_score", 0.0)
+        generated_text = result.get("generated_text", "") or ""
+        num_tokens = result.get("num_tokens", 0)
+        overall_quality_score = quality_analysis.get("overall_quality_score", 0.0) if quality_analysis else 0.0
+        source_idx = result.get("repr_source_layer_idx")
+        target_idx = result.get("repr_target_layer_idx", source_idx)
+
+        if correlation_score == 0.0:
+            continue
+        if "looking" not in generated_text.lower():
+            continue
+
+        performance_summary.append({
+            "repr_source_layer_idx": source_idx,
+            "repr_target_layer_idx": target_idx,
+            "overall_quality_score": overall_quality_score,
+            "avg_confidence": avg_confidence,
+            "avg_entropy": avg_entropy,
+            "correlation_score": correlation_score,
+            "generated_text": generated_text,
+            "num_tokens": num_tokens,
+            "quality_analysis": quality_analysis
+        })
+
+    performance_summary.sort(key=lambda x: x["overall_quality_score"], reverse=True)
+
+    if performance_summary:
+        heading = "TOP 5 REPRESENTATION LAYERS"
+        print(f"\n{heading}:")
+        if enable_pairwise_sweep:
+            print(
+                f"{'Rank':<4} {'Src':<5} {'Tgt':<5} {'Quality':<8} {'Confidence':<11} "
+                f"{'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}"
+            )
+        else:
+            print(
+                f"{'Rank':<4} {'Layer':<7} {'Quality':<8} {'Confidence':<11} "
+                f"{'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}"
+            )
+        print("-" * 105)
+        for i, result in enumerate(performance_summary[:5], 1):
+            display_source = result.get("repr_source_layer_idx")
+            display_target = result.get("repr_target_layer_idx")
+            if enable_pairwise_sweep:
+                print(
+                    f"{i:<4} {display_source:<5} {display_target:<5} {result['overall_quality_score']:<8.2f} "
+                    f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
+                    f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
+                    f"{result['generated_text'][:30]:<30}"
+                )
+            else:
+                print(
+                    f"{i:<4} {display_target:<7} {result['overall_quality_score']:<8.2f} "
+                    f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
+                    f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
+                    f"{result['generated_text'][:30]:<30}"
+                )
+
+        print(f"\nWORST 3 REPRESENTATION LAYERS:")
+        if enable_pairwise_sweep:
+            print(
+                f"{'Rank':<4} {'Src':<5} {'Tgt':<5} {'Quality':<8} {'Confidence':<11} "
+                f"{'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}"
+            )
+        else:
+            print(
+                f"{'Rank':<4} {'Layer':<7} {'Quality':<8} {'Confidence':<11} "
+                f"{'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}"
+            )
+        print("-" * 105)
+        worst_start = max(len(performance_summary) - 3, 0)
+        for i, result in enumerate(performance_summary[worst_start:], worst_start + 1):
+            display_source = result.get("repr_source_layer_idx")
+            display_target = result.get("repr_target_layer_idx")
+            if enable_pairwise_sweep:
+                print(
+                    f"{i:<4} {display_source:<5} {display_target:<5} {result['overall_quality_score']:<8.2f} "
+                    f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
+                    f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
+                    f"{result['generated_text'][:30]:<30}"
+                )
+            else:
+                print(
+                    f"{i:<4} {display_target:<7} {result['overall_quality_score']:<8.2f} "
+                    f"{result['avg_confidence']:<11.3f} {result['avg_entropy']:<8.3f} "
+                    f"{result['correlation_score']:<11.3f} {result['num_tokens']:<7} "
+                    f"{result['generated_text'][:30]:<30}"
+                )
+
+        best_result = performance_summary[0]
+        if enable_pairwise_sweep:
+            print(
+                f"\n🏆 RECOMMENDED REPR LAYERS: "
+                f"source={best_result['repr_source_layer_idx']} -> target={best_result['repr_target_layer_idx']}"
+            )
+        else:
+            print(f"\n🏆 RECOMMENDED REPR LAYER: {best_result['repr_target_layer_idx']}")
+        print(f"   • Overall Quality Score: {best_result['overall_quality_score']:.2f}/10")
+        print(f"   • Average Confidence: {best_result['avg_confidence']:.3f}")
+        print(f"   • Average Entropy: {best_result['avg_entropy']:.3f}")
+        print(f"   • Attention Correlation: {best_result['correlation_score']:.3f}")
+        print(f"   • Generated Text: '{best_result['generated_text']}'")
+    else:
+        best_result = None
+        print("No representation layers met the filtering criteria (non-zero correlation and containing 'looking').")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sweep_payload = {
+        "timestamp": timestamp,
+        "repr_layer_indices": repr_layer_indices,
+        "repr_target_layer_indices": target_indices,
+        "pairwise_sweep_enabled": enable_pairwise_sweep,
+        "bias_strength_used": effective_bias,
+        "repr_layer_results": all_results,
+        "performance_summary": performance_summary,
+        "best_repr_source_layer_idx": best_result["repr_source_layer_idx"] if best_result else None,
+        "best_repr_target_layer_idx": best_result["repr_target_layer_idx"] if best_result else None,
+    }
+    saved_results_path = save_image_results(
+        sweep_payload,
+        base_output_dir_path,
+        prefix="repr_layer_sweep_results",
+        append_mode=False
+    )
+    print(f"\n📁 Representation layer sweep results saved to: {saved_results_path}")
+    print(f"{'='*80}")
+
+    return all_results
 
 def print_resume_usage_examples():
     """Print usage examples for the resume functionality."""
@@ -870,8 +1264,8 @@ if __name__ == '__main__':
     enable_inference_optimizations()
     
     parser = argparse.ArgumentParser(description="Run LLaVA-NeXT generation with attention extraction.")
-    parser.add_argument('--mode', type=str, default='sweep', choices=['single', 'batch', 'sweep'],
-                        help="Execution mode: 'single' for one image, 'batch' for multiple images from a JSON file, 'sweep' for a bias strength sweep.")
+    parser.add_argument('--mode', type=str, default='repr_sweep', choices=['single', 'batch', 'sweep', 'repr_sweep'],
+                        help="Execution mode: 'single' (one image), 'batch' (JSON list), 'sweep' (bias sweep), 'repr_sweep' (representation layer sweep).")
 
     # --- Model Loading Arguments ---
     parser.add_argument('--model_path', type=str, default="lmms-lab/llava-onevision-qwen2-7b-ov-chat", help="Path to the base model or fully merged checkpoint.")
@@ -880,7 +1274,11 @@ if __name__ == '__main__':
     parser.add_argument('--attn_implementation', type=str, default="sdpa", help="Attention implementation ('sdpa' or 'eager').")
     parser.add_argument('--load_4bit', action='store_true', help="Load model in 4-bit.")
     parser.add_argument('--load_8bit', action='store_true', help="Load model in 8-bit.")
-    parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index to extract from.")
+    parser.add_argument('--attn_layer_ind', type=int, default=23, help="Attention layer index for attention maps and default similarity.")
+    parser.add_argument(
+        '--repr_layer_idx', type=int, default=None,
+        help="Hidden-state layer index used for similarity/representation computations (defaults to attn_layer_ind)."
+    )
 
     # --- Single Experiment Arguments ---
     parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000093\00093143.jpg", help="Path to the input image.")
@@ -888,15 +1286,32 @@ if __name__ == '__main__':
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="The _ is looking at _ . Where is the _ person looking?", help="Input prompt.")
-    parser.add_argument('--prompt', type=str, default="Describe the person _ which is looking at _", help="Input prompt.")
+    # parser.add_argument('--prompt', type=str, default="Describe the person _ which is looking at _", help="Input prompt.")
+#     parser.add_argument('--prompt', type=str, default="""Complete the sentence in the following format, examples:
+# a woman looking at a red mug → a woman in a cream sweater with straight dark hair, looking at a small red ceramic mug
+# a guy looking at a laptop → a guy in a gray hoodie and jeans, looking at an open silver laptop
+# a girl looking at a book → a girl with a ponytail and a denim jacket, looking at a thick hardcover book
+# a boy looking at another boy → a boy in a blue t-shirt with curly hair, looking at a shorter boy in a yellow hoodie
+# a man looking at a woman → a man in a black jacket and glasses, looking at a woman in a long beige coat
+# a woman looking at a child → a woman with wavy brown hair and a green coat, looking at a small child in a red jacket
+# a person looking at a dog → a person in a puffer vest and beanie, looking at a small brown dog
+# The sentence: a _ looking at _ → """, help="Input prompt.")
+    parser.add_argument('--prompt', type=str, default="""Complete the sentence in the following format, for example:
+                        a guy → a guy in a gray hoodie and ripped jeans, sitting on a worn wooden bench. 
+                        a woman → a woman in a beige coat and ankle boots, holding a phone. 
+                        a man → a man in a black leather jacket and glasses. 
+                        a woman → a woman in a dark green sweater and black jeans, carrying a tan shoulder bag
+                        The sentence: a _ → """, help="Input prompt.")
     parser.add_argument('--use-gt-gaze-csv', action=argparse.BooleanOptionalAction, default=True,
                         dest='use_gt_gaze_csv', help="Use ground-truth gaze CSV to override gaze masks (default: enabled).")
     parser.add_argument('--gt_gaze_csv_path', type=str, default=str(DEFAULT_GT_GAZE_CSV),
                         help="Path to the ground-truth gaze CSV file.")
     parser.add_argument('--gt_gaze_mask_radius', type=int, default=None,
                         help="Optional fixed radius (pixels) for GT gaze mask blobs.")
-    parser.add_argument('--gt_gaze_mask_radius_ratio', type=float, default=0.02,
+    parser.add_argument('--gt_gaze_mask_radius_ratio', type=float, default=0.1,
                         help="Relative radius used when no fixed radius is provided for GT gaze mask blobs.")
+    parser.add_argument('--use-body-bbox', action='store_true', default=False,
+                        help="Use normalized body bounding boxes from the GT CSV instead of head boxes when creating person masks.")
     # parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
     # " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \
     # "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
@@ -914,11 +1329,27 @@ if __name__ == '__main__':
     parser.add_argument('--skip_first', type=int, default=0, help="Skip the first X images in the dataset (applied after filtering and sorting).")
     parser.add_argument('--sgl_conversation_path', type=str, default='sgl_conversation_data.json', help="Path to SGL conversation data JSON file for filtering already processed images.")
     parser.add_argument('--save_debug_files', action='store_true', default=True, help="Save debug files during generation.")
+    parser.add_argument('--save-mask-overlays', action=argparse.BooleanOptionalAction, default=False,
+                        help="Save visualization overlays that show person and gaze target masks.")
+    parser.add_argument('--mask-overlay-alpha', type=float, default=0.6,
+                        help="Alpha blending factor (0-1) for mask overlay visualization.")
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
     parser.add_argument('--bias_max', type=float, default=3.5, help="Maximum bias strength for the sweep.")
     parser.add_argument('--bias_steps', type=int, default=5, help="Number of steps in the bias sweep.")
+    parser.add_argument('--repr_sweep_layers', type=int, nargs='*', default=None,
+                        help="List of repr_layer_idx values to sweep (defaults to all decoder layers, e.g., 0-27).")
+    parser.add_argument('--repr_sweep_start_idx', type=int, default=None,
+                        help="Optional starting layer index; when set and no explicit repr_sweep_layers are provided, sweeps all layers from this index onward.")
+    parser.add_argument('--repr_sweep_bias', type=float, default=2.5,
+                        help="Bias strength to use during repr layer sweep (defaults to generation bias).")
+    parser.add_argument('--repr_combo_sweep', action='store_true',
+                        help="When provided, performs a pairwise sweep over source/target repr layers instead of a single shared index.")
+    parser.add_argument('--repr_source_layers', type=int, nargs='*', default=None,
+                        help="Optional override for source/person representation layers used during combo sweeps.")
+    parser.add_argument('--repr_target_layers', type=int, nargs='*', default=None,
+                        help="Optional override for target/gaze representation layers used during combo sweeps.")
 
     # --- Gaze Guidance Arguments ---
     parser.add_argument('--use_gaze_guidance', action='store_true', help="Enable gaze-guided token selection.")
@@ -930,6 +1361,7 @@ if __name__ == '__main__':
     parser.add_argument('--show_resume_examples', action='store_true', help="Show usage examples for resume functionality and exit.")
 
     args = parser.parse_args()
+    set_gt_annotation_lookup_use_body_bbox(args.use_body_bbox)
 
     model_path = fix_wsl_paths(args.model_path)
     adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
@@ -960,6 +1392,26 @@ if __name__ == '__main__':
         "adapter_path": adapter_path
     }
     tokenizer, model, image_processor, max_length = load_model_and_setup(**MODEL_CONFIG)
+    total_decoder_layers = getattr(model.config, "num_hidden_layers", None)
+    if total_decoder_layers is None or total_decoder_layers <= 0:
+        decoder = getattr(model, "model", None)
+        total_decoder_layers = len(getattr(decoder, "layers", [])) if decoder is not None else 28
+    repr_start_idx = args.repr_sweep_start_idx if args.repr_sweep_start_idx is not None else 0
+    if repr_start_idx < 0:
+        repr_start_idx = 0
+    if repr_start_idx >= total_decoder_layers:
+        raise ValueError(
+            f"repr_sweep_start_idx ({repr_start_idx}) must be less than total decoder layers ({total_decoder_layers})."
+        )
+    default_repr_layers = list(range(repr_start_idx, total_decoder_layers))
+    if args.repr_sweep_layers is None:
+        args.repr_sweep_layers = default_repr_layers
+
+    repr_source_layers = args.repr_source_layers if args.repr_source_layers is not None else args.repr_sweep_layers
+    repr_target_layers = (
+        args.repr_target_layers if args.repr_target_layers is not None else
+        (args.repr_sweep_layers if args.repr_combo_sweep else None)
+    )
 
     # --- Common Generation & Attention Configs ---
     # These can be further customized or exposed as arguments if needed
@@ -978,6 +1430,8 @@ if __name__ == '__main__':
         "layer_idx": args.attn_layer_ind,
         "save_tensors": False
     }
+    if args.repr_layer_idx is not None:
+        attention_config["repr_layer_idx"] = args.repr_layer_idx
 
     # New guidance configuration
     guidance_config = {
@@ -1009,6 +1463,8 @@ if __name__ == '__main__':
              gt_gaze_csv_path=args.gt_gaze_csv_path,
              gt_gaze_mask_radius=args.gt_gaze_mask_radius,
              gt_gaze_mask_radius_ratio=args.gt_gaze_mask_radius_ratio,
+             save_mask_overlays=args.save_mask_overlays,
+             mask_overlay_alpha=args.mask_overlay_alpha,
         )
 
     elif args.mode == 'batch':
@@ -1040,6 +1496,8 @@ if __name__ == '__main__':
             gt_gaze_csv_path=args.gt_gaze_csv_path,
             gt_gaze_mask_radius=args.gt_gaze_mask_radius,
             gt_gaze_mask_radius_ratio=args.gt_gaze_mask_radius_ratio,
+            save_mask_overlays=args.save_mask_overlays,
+            mask_overlay_alpha=args.mask_overlay_alpha,
         )
 
     elif args.mode == 'sweep':
@@ -1055,6 +1513,8 @@ if __name__ == '__main__':
             gt_gaze_csv_path=args.gt_gaze_csv_path,
             gt_gaze_mask_radius=args.gt_gaze_mask_radius,
             gt_gaze_mask_radius_ratio=args.gt_gaze_mask_radius_ratio,
+            save_mask_overlays=args.save_mask_overlays,
+            mask_overlay_alpha=args.mask_overlay_alpha,
         )
         base_experiment_config["save_debug_files"] = args.save_debug_files
         bias_range = np.linspace(args.bias_min, args.bias_max, args.bias_steps)
@@ -1065,6 +1525,35 @@ if __name__ == '__main__':
             image_processor=image_processor,
             bias_range=bias_range,
             save_summary=True,
+            use_gaze_guidance=args.use_gaze_guidance,
+            guidance_config=guidance_config,
+        )
+    elif args.mode == 'repr_sweep':
+        if not args.repr_sweep_layers:
+            raise ValueError("Mode 'repr_sweep' requires --repr_sweep_layers to specify layer indices.")
+        print("--- Running Representation Layer Sweep Experiment ---")
+        base_experiment_config = create_experiment_config(
+            args.image_path,
+            args.mask_path,
+            args.prompt,
+            args.output_dir,
+            generation_config,
+            attention_config,
+            use_gt_gaze_csv=args.use_gt_gaze_csv,
+            gt_gaze_csv_path=args.gt_gaze_csv_path,
+            gt_gaze_mask_radius=args.gt_gaze_mask_radius,
+            gt_gaze_mask_radius_ratio=args.gt_gaze_mask_radius_ratio,
+            save_mask_overlays=args.save_mask_overlays,
+            mask_overlay_alpha=args.mask_overlay_alpha,
+        )
+        base_experiment_config["save_debug_files"] = args.save_debug_files
+        run_repr_layer_sweep_experiment(
+            base_experiment_config=base_experiment_config,
+            model=model,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            repr_layer_indices=args.repr_sweep_layers,
+            bias_strength=args.repr_sweep_bias,
             use_gaze_guidance=args.use_gaze_guidance,
             guidance_config=guidance_config,
         )

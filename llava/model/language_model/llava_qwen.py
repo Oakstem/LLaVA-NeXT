@@ -115,24 +115,66 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     )
 
                 if kwargs.get("target_mask_embedding", None) is not None:
-                    mask_embedding = kwargs["target_mask_embedding"]
-                    input_masks = kwargs.get("input_masks", {})
-                    target_attn_mask_indices = input_masks['target_mask'].flatten()
-                    person_attn_mask_indices = input_masks['person_mask'].flatten() 
-                    target_attn_mask_indices = np.where(target_attn_mask_indices > 0)[0]
-                    person_attn_mask_indices = np.where(person_attn_mask_indices > 0)[0]
-                    if len(target_attn_mask_indices) > 0:
-                        # Use the first mask index to get the person (source) mask embedding
-                        person_mask_embedding = mask_embedding[person_attn_mask_indices, :].mean(dim=0)
-                        # only for testing:
-                        # person_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
-                        inputs_embeds[:, self.tokens_indexing['insert_embd']['source'], :] = person_mask_embedding
-                        final_ids_to_attend['gaze_source'] += [int(val.cpu().numpy()) for val in self.tokens_indexing['insert_embd']['source']]  # Add source position to ids_to_attend
-                    if len(person_attn_mask_indices) > 0 and len(self.tokens_indexing['insert_embd']['target']) > 0:
-                        # Use the second mask index to get the target mask embedding
-                        target_mask_embedding = mask_embedding[target_attn_mask_indices, :].mean(dim=0)
-                        # inputs_embeds[:, -6, :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _
-                        inputs_embeds[:, self.tokens_indexing['insert_embd']['target'], :] = target_mask_embedding     # this is hardcoded for the prompt "... is looking at _"
+                    mask_hidden_state_repr = kwargs["target_mask_embedding"]
+                    if isinstance(mask_hidden_state_repr, dict):
+                        mask_hidden_state_source = mask_hidden_state_repr.get("source")
+                        mask_hidden_state_target = mask_hidden_state_repr.get("target")
+                    else:
+                        mask_hidden_state_source = mask_hidden_state_repr
+                        mask_hidden_state_target = mask_hidden_state_repr
+
+                    target_attn_mask_indices = kwargs['boost_positions']['gaze_target']
+                    person_attn_mask_indices = kwargs['boost_positions']['gaze_source']
+                    insert_positions = (
+                        self.tokens_indexing.get('insert_embd', None)
+                        if getattr(self, "tokens_indexing", None) is not None else None
+                    )
+                    repr_layer_idx = kwargs.get("repr_layer_idx", None)
+                    use_layer_injection = repr_layer_idx is not None and insert_positions is not None
+                    layer_injection_data = None
+
+                    has_source_tokens = (
+                        person_attn_mask_indices is not None and len(person_attn_mask_indices) > 0
+                        and insert_positions is not None and insert_positions.get('source')
+                    )
+                    has_target_tokens = (
+                        target_attn_mask_indices is not None and len(target_attn_mask_indices) > 0
+                        and insert_positions is not None and insert_positions.get('target')
+                    )
+
+                    if mask_hidden_state_source is not None and has_source_tokens:
+                        person_mask_repr = mask_hidden_state_source[person_attn_mask_indices, :][0]
+                        person_mask_repr = person_mask_repr.to(inputs_embeds.device, dtype=inputs_embeds.dtype)
+                        if use_layer_injection:
+                            layer_injection_data = layer_injection_data or {}
+                            layer_injection_data["source"] = {
+                                "positions": torch.as_tensor(
+                                    insert_positions['source'], device=inputs_embeds.device, dtype=torch.long
+                                ),
+                                "embedding": person_mask_repr
+                            }
+                        elif insert_positions is not None:
+                            inputs_embeds[:, insert_positions['source'], :] = person_mask_repr
+                        final_ids_to_attend['gaze_source'] += [
+                            int(val.cpu().numpy()) for val in self.tokens_indexing['insert_embd']['source']
+                        ]
+
+                    if mask_hidden_state_target is not None and has_target_tokens:
+                        target_mask_embedding = mask_hidden_state_target[target_attn_mask_indices, :].mean(dim=0)
+                        target_mask_embedding = target_mask_embedding.to(inputs_embeds.device, dtype=inputs_embeds.dtype)
+                        if use_layer_injection:
+                            layer_injection_data = layer_injection_data or {}
+                            layer_injection_data["target"] = {
+                                "positions": torch.as_tensor(
+                                    insert_positions['target'], device=inputs_embeds.device, dtype=torch.long
+                                ),
+                                "embedding": target_mask_embedding
+                            }
+                        elif insert_positions is not None and insert_positions['target']:
+                            inputs_embeds[:, insert_positions['target'], :] = target_mask_embedding
+
+                    if use_layer_injection and layer_injection_data is not None:
+                        kwargs["repr_injection"] = layer_injection_data
 
             else:
                 # Unpack 6 values when images are not present (e.g., subsequent generation steps)
@@ -160,8 +202,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             #         target_mask_embedding = mask_embedding[person_attn_mask_indices, :].mean(dim=0)
             #         inputs_embeds = target_mask_embedding.unsqueeze(0).expand(1, -1, -1)
             #         input_ids = None
-
         # if inputs_embeds is not None:   # todo: uncomment once done testing, commenting out to get custom mask during generation too
+        # kwargs["repr_injection"] = None
         if inputs_embeds is None: # or kwargs.get("target_tokens", 0) == 2:
             input_embeds_shape = torch.Size([1, past_key_values[0][0].shape[2]+1, 1])
             input_device = past_key_values[0][0].device

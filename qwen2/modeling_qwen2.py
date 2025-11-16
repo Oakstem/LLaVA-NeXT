@@ -21,7 +21,7 @@
 import inspect
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -831,6 +831,7 @@ class Qwen2DecoderLayer(nn.Module):
         bsz, q_len = hidden_size[0], hidden_size[1]
         # debug print
         # print(f"hidden states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape if attention_mask is not None else None}, position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        kwargs['boost_positions'] = None
         if kwargs.get("boost_positions", None) is not None:
             gaze_target_boost_positions = kwargs.get('boost_positions', None).get('gaze_target', None)
             gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
@@ -1274,6 +1275,65 @@ class Qwen2Model(Qwen2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def _apply_repr_injection(
+        self,
+        hidden_states: torch.Tensor,
+        repr_injection: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+    ) -> torch.Tensor:
+        """
+        Optionally overwrite specific token positions in the hidden states with
+        precomputed embeddings (e.g., person/target representations).
+        """
+        if not repr_injection:
+            return hidden_states
+
+        updated_states = hidden_states
+        modified = False
+        batch_size = hidden_states.size(0)
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        for key in ("source", "target"):
+            entry = repr_injection.get(key)
+            if not entry:
+                continue
+            positions = entry.get("positions")
+            embedding = entry.get("embedding")
+            if embedding is None or positions is None:
+                continue
+            if not torch.is_tensor(positions):
+                positions = torch.as_tensor(positions, device=device, dtype=torch.long)
+            else:
+                positions = positions.to(device=device, dtype=torch.long)
+            if positions.numel() == 0:
+                continue
+
+            value = embedding.to(device=device, dtype=dtype)
+            if value.dim() == 1:
+                value = value.unsqueeze(0).unsqueeze(0)
+            elif value.dim() == 2:
+                value = value.unsqueeze(0)
+            elif value.dim() != 3:
+                raise ValueError(f"Unsupported embedding shape for repr injection: {value.shape}")
+
+            seq_dim = value.size(1)
+            target_seq = positions.numel()
+            if seq_dim == 1 and target_seq > 1:
+                value = value.expand(-1, target_seq, -1)
+            elif seq_dim != target_seq:
+                raise ValueError(
+                    f"Representation embedding length ({seq_dim}) does not match "
+                    f"number of target positions ({target_seq})."
+                )
+
+            value = value.expand(batch_size, -1, -1).contiguous()
+            if not modified:
+                updated_states = hidden_states.clone()
+                modified = True
+            updated_states[:, positions, :] = value
+
+        return updated_states
+
     @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
     def forward(
         self,
@@ -1388,6 +1448,30 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 kwargs["source_attention_mask"] = source_attention_mask
         
         hidden_states = inputs_embeds
+        num_hidden_layers = len(self.layers)
+        repr_injection = kwargs.pop("repr_injection", None)
+        repr_layer_idx = kwargs.get("repr_layer_idx", None)
+        repr_layer_schedule: Dict[int, List[str]] = {}
+        if repr_injection and repr_layer_idx is not None:
+            def _normalize(idx: int) -> int:
+                normalized_idx = idx
+                if normalized_idx < 0:
+                    normalized_idx = num_hidden_layers + normalized_idx
+                if normalized_idx < 0 or normalized_idx >= num_hidden_layers:
+                    raise ValueError(
+                        f"repr_layer_idx {idx} out of range for {num_hidden_layers} decoder layers"
+                    )
+                return normalized_idx
+
+            if isinstance(repr_layer_idx, dict):
+                for key, raw_idx in repr_layer_idx.items():
+                    if raw_idx is None:
+                        continue
+                    normalized = _normalize(raw_idx)
+                    repr_layer_schedule.setdefault(normalized, []).append(key)
+            else:
+                normalized = _normalize(repr_layer_idx)
+                repr_layer_schedule[normalized] = ["source", "target"]
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1400,6 +1484,18 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # query_indices = kwargs.get("query_indices", None)
 
         for layer_ind, decoder_layer in enumerate(self.layers):
+            if repr_layer_schedule and repr_injection:
+                keys_for_layer = repr_layer_schedule.get(layer_ind)
+                if keys_for_layer:
+                    payload = {
+                        key: repr_injection.get(key)
+                        for key in keys_for_layer
+                        if repr_injection.get(key) is not None
+                    }
+                    if payload:
+                        hidden_states = self._apply_repr_injection(hidden_states, payload)
+                        for key in keys_for_layer:
+                            repr_injection.pop(key, None)
             if layer_ind == getattr(self.config, 'attn_layer_ind', 0):
                 output_attentions = True
             else:
