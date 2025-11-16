@@ -202,3 +202,118 @@ def _pixel_to_token_indices_helper_anyres(
 
 
     return sorted(list(set(token_indices))), resized_mask
+
+
+def _pixel_to_token_indices_helper_anyres_inference(
+    pixel_coords: List[Tuple[int, int]],
+    original_image_size: Tuple[int, int],
+    possible_resolutions: List[Tuple[int, int]],
+    final_patch_division_size: int = 384,
+    image_token_start_index_in_embeds: int = 14,
+    patch_size: int = 14,
+    add_system_prompt_tokens: bool = False,
+    add_user_prompt_tokens: bool = False,
+    user_prompt_len: Optional[int] = 20,
+    system_prompt_len: Optional[int] = 14,
+    user_prompt_range: Optional[Union[int, Tuple[int, int]]] = [1849, 1869],
+    bias_offset: int = 0,
+) -> Tuple[List[int], np.ndarray]:
+    """
+    Alternative implementation that mirrors the actual inference-time preprocessing.
+
+    The pipeline (see ``llava/mm_utils.py``) first selects ``best_processing_resolution``,
+    resizes the image while preserving aspect ratio, pads it to the target canvas, splits
+    that canvas into ``final_patch_division_size`` (e.g. 384) crops, encodes each crop with a
+    ViT of ``patch_size`` (e.g. 14), then flattens the resulting token grid row-wise while
+    inserting a newline token after every row. The very first tokens correspond to the base
+    image that is resized directly to ``final_patch_division_size``.
+    """
+    original_w, original_h = original_image_size
+    best_w, best_h = select_best_resolution((original_w, original_h), possible_resolutions)
+
+    # Base image (resized square) scaling factors
+    base_scale_w = final_patch_division_size / max(original_w, 1)
+    base_scale_h = final_patch_division_size / max(original_h, 1)
+
+    # Determine how the anyres preprocessing resized & padded the image.
+    scale_w_factor = best_w / max(original_w, 1)
+    scale_h_factor = best_h / max(original_h, 1)
+    if scale_w_factor < scale_h_factor:
+        scaled_w = best_w
+        scaled_h = min(int(math.ceil(original_h * scale_w_factor)), best_h)
+    else:
+        scaled_h = best_h
+        scaled_w = min(int(math.ceil(original_w * scale_h_factor)), best_w)
+
+    pad_left = max((best_w - scaled_w) // 2, 0)
+    pad_top = max((best_h - scaled_h) // 2, 0)
+
+    # Token-grid bookkeeping
+    tokens_per_patch_side = max(final_patch_division_size // patch_size, 1)
+    base_patch_tokens = tokens_per_patch_side ** 2
+    num_width_patches = max(int(math.ceil(best_w / final_patch_division_size)), 1)
+    num_height_patches = max(int(math.ceil(best_h / final_patch_division_size)), 1)
+    width_tokens = num_width_patches * tokens_per_patch_side
+    height_tokens = num_height_patches * tokens_per_patch_side
+    anyres_row_stride = width_tokens + 1  # +1 for the newline token appended per row
+    anyres_base_offset = image_token_start_index_in_embeds + base_patch_tokens
+
+    token_indices = set()
+    resized_mask = np.zeros(
+        [final_patch_division_size // patch_size, final_patch_division_size // patch_size],
+        dtype=np.float32,
+    )
+
+    for y_pixel_orig, x_pixel_orig in pixel_coords:
+        # Base image token (direct resize to final_patch_division_size)
+        x_on_base = x_pixel_orig * base_scale_w
+        y_on_base = y_pixel_orig * base_scale_h
+
+        base_patch_col = int(np.clip(x_on_base // patch_size, 0, tokens_per_patch_side - 1))
+        base_patch_row = int(np.clip(y_on_base // patch_size, 0, tokens_per_patch_side - 1))
+        base_linear_idx = base_patch_row * tokens_per_patch_side + base_patch_col
+        final_base_idx = image_token_start_index_in_embeds + base_linear_idx
+        token_indices.add(int(final_base_idx))
+        resized_mask[base_patch_row, base_patch_col] = 1.0
+
+        # Anyres token: map pixel -> scaled (pre-pad) -> padded canvas -> ViT token
+        x_scaled = (x_pixel_orig / max(original_w, 1)) * max(scaled_w - 1, 1)
+        y_scaled = (y_pixel_orig / max(original_h, 1)) * max(scaled_h - 1, 1)
+        x_padded = np.clip(x_scaled + pad_left, 0, best_w - 1)
+        y_padded = np.clip(y_scaled + pad_top, 0, best_h - 1)
+
+        # Determine patch-aligned token coordinates within the concatenated grid
+        patch_col = int(x_padded // final_patch_division_size)
+        patch_row = int(y_padded // final_patch_division_size)
+        patch_col = min(patch_col, num_width_patches - 1)
+        patch_row = min(patch_row, num_height_patches - 1)
+        token_col_within_patch = int((x_padded % final_patch_division_size) // patch_size)
+        token_row_within_patch = int((y_padded % final_patch_division_size) // patch_size)
+
+        token_col = np.clip(
+            patch_col * tokens_per_patch_side + token_col_within_patch, 0, width_tokens - 1
+        )
+        token_row = np.clip(
+            patch_row * tokens_per_patch_side + token_row_within_patch, 0, height_tokens - 1
+        )
+
+        anyres_linear_idx = int(anyres_base_offset + token_row * anyres_row_stride + token_col)
+        token_indices.add(anyres_linear_idx)
+
+    # Make deterministic & apply optional offsets/prompts
+    token_indices = sorted(token_indices)
+    token_indices = (np.array(token_indices) + bias_offset).tolist()
+
+    if add_system_prompt_tokens:
+        for i in range(system_prompt_len):
+            token_indices.append(i)
+    if add_user_prompt_tokens:
+        if isinstance(user_prompt_range, int):
+            user_prompt_len = user_prompt_range
+            for i in range(system_prompt_len, system_prompt_len + user_prompt_len):
+                token_indices.append(i)
+        elif isinstance(user_prompt_range, (list, tuple)) and len(user_prompt_range) == 2:
+            for i in range(user_prompt_range[0], user_prompt_range[1]):
+                token_indices.append(i)
+
+    return sorted(set(token_indices)), resized_mask
