@@ -27,7 +27,7 @@ from llava.constants import (
 )
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.utils import disable_torch_init
-from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres
+from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres, _pixel_to_token_indices_helper_anyres_inference
 import traceback
 
 from llava.model.llava_arch import unpad_image
@@ -690,8 +690,9 @@ def load_mask_from_file(mask_path: Union[str, Path]) -> np.ndarray:
     return mask
 
 
-DEFAULT_GT_GAZE_CSV = Path(__file__).resolve().parent / "gazefollow" / "data" / "combined_description_results.csv"
-_GT_GAZE_LOOKUP_CACHE: Dict[str, Dict[str, Tuple[float, float]]] = {}
+DEFAULT_GT_GAZE_CSV = Path(__file__).resolve().parent / "gazefollow" / "data" / "train_annotations_release.csv"
+_GT_ANNOTATION_LOOKUP_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_GT_ANNOTATION_USE_BODY_BBOX: bool = False
 
 
 def _normalize_gt_gaze_keys(raw_key: Any) -> List[str]:
@@ -718,40 +719,71 @@ def _normalize_gt_gaze_keys(raw_key: Any) -> List[str]:
     return [c for c in candidates if c]
 
 
-def _update_gt_gaze_lookup_entry(
-    lookup: Dict[str, Dict[str, Any]], raw_key: Any, gaze_x: float, gaze_y: float, gaze_error: float
+def _update_gt_annotation_lookup_entry(
+    lookup: Dict[str, Dict[str, Any]],
+    raw_key: Any,
+    coords: Tuple[float, float],
+    gaze_error: float,
+    bbox: Optional[Tuple[float, float, float, float]],
+    bbox_is_normalized: bool = False
 ) -> None:
-    """Register gaze coordinates for all normalized keys, preferring lower errors."""
+    """Register gaze/person annotations for all normalized keys, preferring lower errors."""
     for key in _normalize_gt_gaze_keys(raw_key):
         existing = lookup.get(key)
         if existing is None:
-            lookup[key] = {"coords": (gaze_x, gaze_y), "error": gaze_error}
+            lookup[key] = {
+                "coords": coords,
+                "error": gaze_error,
+                "bbox": bbox,
+                "bbox_is_normalized": bbox_is_normalized,
+            }
             continue
 
         existing_error = existing.get("error", float("nan"))
         if pd.isna(existing_error) and not pd.isna(gaze_error):
-            lookup[key] = {"coords": (gaze_x, gaze_y), "error": gaze_error}
+            lookup[key] = {
+                "coords": coords,
+                "error": gaze_error,
+                "bbox": bbox,
+                "bbox_is_normalized": bbox_is_normalized,
+            }
         elif not pd.isna(existing_error) and not pd.isna(gaze_error) and gaze_error < existing_error:
-            lookup[key] = {"coords": (gaze_x, gaze_y), "error": gaze_error}
+            lookup[key] = {
+                "coords": coords,
+                "error": gaze_error,
+                "bbox": bbox,
+                "bbox_is_normalized": bbox_is_normalized,
+            }
 
 
-def load_gt_gaze_lookup(csv_path: Union[str, Path]) -> Dict[str, Tuple[float, float]]:
-    """Load ground-truth gaze coordinates from CSV and cache the lookup table."""
+def set_gt_annotation_lookup_use_body_bbox(enabled: bool) -> None:
+    """Enable or disable preferring normalized body bbox columns when loading GT annotations."""
+    global _GT_ANNOTATION_USE_BODY_BBOX
+    _GT_ANNOTATION_USE_BODY_BBOX = bool(enabled)
+
+
+def load_gt_annotation_lookup(
+    csv_path: Union[str, Path],
+    *,
+    use_body_bbox: Optional[bool] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Load ground-truth gaze/person annotations from CSV and cache the lookup table."""
     normalized_path = fix_wsl_paths(str(csv_path))
-    if normalized_path in _GT_GAZE_LOOKUP_CACHE:
-        return _GT_GAZE_LOOKUP_CACHE[normalized_path]
+    cached = _GT_ANNOTATION_LOOKUP_CACHE.get(normalized_path)
+    if cached is not None:
+        return cached
 
     path_obj = Path(normalized_path)
     if not path_obj.exists():
         print(f"⚠️ Warning: GT gaze CSV not found at {normalized_path}")
-        _GT_GAZE_LOOKUP_CACHE[normalized_path] = {}
-        return _GT_GAZE_LOOKUP_CACHE[normalized_path]
+        _GT_ANNOTATION_LOOKUP_CACHE[normalized_path] = {}
+        return _GT_ANNOTATION_LOOKUP_CACHE[normalized_path]
 
     df = pd.read_csv(path_obj)
     if "gaze_x" not in df.columns or "gaze_y" not in df.columns:
         print(f"⚠️ Warning: Missing 'gaze_x' or 'gaze_y' columns in {normalized_path}")
-        _GT_GAZE_LOOKUP_CACHE[normalized_path] = {}
-        return _GT_GAZE_LOOKUP_CACHE[normalized_path]
+        _GT_ANNOTATION_LOOKUP_CACHE[normalized_path] = {}
+        return _GT_ANNOTATION_LOOKUP_CACHE[normalized_path]
 
     for column in ("gaze_x", "gaze_y", "gaze_error"):
         if column in df.columns:
@@ -759,20 +791,61 @@ def load_gt_gaze_lookup(csv_path: Union[str, Path]) -> Dict[str, Tuple[float, fl
 
     df = df.dropna(subset=["gaze_x", "gaze_y"])
 
+    use_body_bbox_flag = use_body_bbox if use_body_bbox is not None else _GT_ANNOTATION_USE_BODY_BBOX
     candidate_columns = [col for col in ("image_path", "image_path.1") if col in df.columns]
+    head_bbox_columns = ("head_bbox_x_min", "head_bbox_y_min", "head_bbox_x_max", "head_bbox_y_max")
+    body_bbox_columns = ("body_bbox_x", "body_bbox_y", "body_bbox_width", "body_bbox_height")
+    has_head_bbox_columns = all(col in df.columns for col in head_bbox_columns)
+    has_body_bbox_columns = all(col in df.columns for col in body_bbox_columns)
+    if use_body_bbox_flag and not has_body_bbox_columns:
+        print(f"⚠️ Warning: Requested body bounding boxes but required columns missing. Falling back to head bbox columns.")
+        use_body_bbox_flag = False
     temp_lookup: Dict[str, Dict[str, Any]] = {}
 
     for _, row in df.iterrows():
-        gaze_x = float(row["gaze_x"])
-        gaze_y = float(row["gaze_y"])
+        coords = (float(row["gaze_x"]), float(row["gaze_y"]))
         gaze_error = float(row["gaze_error"]) if "gaze_error" in df.columns and not pd.isna(row["gaze_error"]) else float("nan")
+        bbox: Optional[Tuple[float, float, float, float]] = None
+        bbox_is_normalized = False
+        if use_body_bbox_flag and has_body_bbox_columns:
+            body_values = (
+                row["body_bbox_x"],
+                row["body_bbox_y"],
+                row["body_bbox_width"],
+                row["body_bbox_height"],
+            )
+            if not any(pd.isna(v) for v in body_values):
+                x_min = float(body_values[0])
+                y_min = float(body_values[1])
+                width_val = float(body_values[2])
+                height_val = float(body_values[3])
+                x_max = x_min + width_val
+                y_max = y_min + height_val
+                bbox = (
+                    max(0.0, min(1.0, x_min)),
+                    max(0.0, min(1.0, y_min)),
+                    max(0.0, min(1.0, x_max)),
+                    max(0.0, min(1.0, y_max)),
+                )
+                bbox_is_normalized = True
+        elif has_head_bbox_columns:
+            bbox_values = (
+                row["head_bbox_x_min"],
+                row["head_bbox_y_min"],
+                row["head_bbox_x_max"],
+                row["head_bbox_y_max"],
+            )
+            if not any(pd.isna(v) for v in bbox_values):
+                bbox = tuple(float(v) for v in bbox_values)  # type: ignore[arg-type]
+                bbox_is_normalized = False
 
         for column in candidate_columns:
-            _update_gt_gaze_lookup_entry(temp_lookup, row[column], gaze_x, gaze_y, gaze_error)
+            _update_gt_annotation_lookup_entry(
+                temp_lookup, row[column], coords, gaze_error, bbox, bbox_is_normalized=bbox_is_normalized
+            )
 
-    lookup = {key: tuple(info["coords"]) for key, info in temp_lookup.items()}
-    _GT_GAZE_LOOKUP_CACHE[normalized_path] = lookup
-    return lookup
+    _GT_ANNOTATION_LOOKUP_CACHE[normalized_path] = temp_lookup
+    return temp_lookup
 
 
 def _denormalize_gaze_point(gaze_x: float, gaze_y: float, image_size: Tuple[int, int]) -> Tuple[int, int]:
@@ -813,6 +886,156 @@ def _create_gaze_mask_from_point(
     distance_sq = (x_grid - center_x) ** 2 + (y_grid - center_y) ** 2
     mask[distance_sq <= computed_radius ** 2] = 1
     return mask
+
+
+def _create_person_mask_from_bbox(
+    image_size: Tuple[int, int],
+    bbox: Tuple[float, float, float, float],
+    *,
+    scale: float = 1.,
+) -> np.ndarray:
+    """Create a binary mask covering the provided head bounding box.
+
+    The optional ``scale`` argument expands (>1.0) or shrinks (<1.0) the bbox
+    around its center before rasterizing the mask.
+    """
+    width, height = image_size
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if width == 0 or height == 0:
+        return mask
+
+    x_min, y_min, x_max, y_max = bbox
+
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+
+    if scale != 1.0:
+        cx = (x_min + x_max) / 2.0
+        cy = (y_min + y_max) / 2.0
+        half_w = (x_max - x_min) * scale / 2.0
+        half_h = (y_max - y_min) * scale / 2.0
+        x_min = cx - half_w
+        x_max = cx + half_w
+        y_min = cy - half_h
+        y_max = cy + half_h
+
+    x0 = max(0, min(width - 1, int(np.floor(x_min))))
+    y0 = max(0, min(height - 1, int(np.floor(y_min))))
+    x1 = max(0, min(width - 1, int(np.ceil(x_max))))
+    y1 = max(0, min(height - 1, int(np.ceil(y_max))))
+
+    if x1 < x0 or y1 < y0:
+        return mask
+
+    mask[y0 : y1 + 1, x0 : x1 + 1] = 1
+    return mask
+
+
+def _mask_array_to_binary(mask_data: Optional[np.ndarray], image_size: Tuple[int, int]) -> Optional[np.ndarray]:
+    """Convert raw mask formats (binary map or coordinate list) into an image-sized binary array."""
+    if mask_data is None:
+        return None
+
+    arr = np.asarray(mask_data)
+    if arr.size == 0:
+        return None
+
+    width, height = image_size
+
+    if arr.ndim >= 1 and arr.shape[-1] == 2:
+        coords = arr.reshape(-1, 2)
+        coords = np.round(coords).astype(int)
+        xs = np.clip(coords[:, 0], 0, width - 1)
+        ys = np.clip(coords[:, 1], 0, height - 1)
+        binary = np.zeros((height, width), dtype=np.uint8)
+        binary[ys, xs] = 1
+        return binary
+
+    arr_2d = np.squeeze(arr)
+    if arr_2d.ndim != 2:
+        return None
+
+    if arr_2d.shape != (height, width):
+        arr_to_resize = arr_2d
+        if arr_to_resize.dtype != np.uint8:
+            finite_vals = arr_to_resize[np.isfinite(arr_to_resize)]
+            arr_min = float(finite_vals.min()) if finite_vals.size > 0 else 0.0
+            arr_max = float(finite_vals.max()) if finite_vals.size > 0 else 1.0
+            if arr_max - arr_min > 0:
+                arr_norm = (arr_to_resize - arr_min) / (arr_max - arr_min)
+            else:
+                arr_norm = (arr_to_resize > 0).astype(np.float32)
+            arr_to_resize = (arr_norm * 255).astype(np.uint8)
+        mask_img = Image.fromarray(arr_to_resize)
+        mask_img = mask_img.resize((width, height), Image.NEAREST)
+        arr_2d = np.array(mask_img)
+
+    binary = (arr_2d > 0).astype(np.uint8)
+    return binary
+
+
+def save_mask_overlay_image(
+    image: Image.Image,
+    target_mask_raw: Optional[np.ndarray],
+    person_mask_raw: Optional[np.ndarray],
+    output_dir: Union[str, Path],
+    filename_prefix: Optional[str] = None,
+    *,
+    target_color: Tuple[int, int, int] = (255, 82, 82),
+    person_color: Tuple[int, int, int] = (65, 160, 255),
+    overlap_color: Tuple[int, int, int] = (255, 255, 255),
+    alpha: float = 0.4
+) -> Optional[Path]:
+    """Create and save an overlay image highlighting person and target masks."""
+    target_mask = _mask_array_to_binary(target_mask_raw, image.size)
+    person_mask = _mask_array_to_binary(person_mask_raw, image.size)
+
+    if target_mask is None and person_mask is None:
+        return None
+
+    base = np.array(image.convert("RGB"), dtype=np.float32)
+    overlay = base.copy()
+    alpha = float(max(0.0, min(1.0, alpha)))
+    applied = False
+
+    target_bool = target_mask.astype(bool) if target_mask is not None else None
+    person_bool = person_mask.astype(bool) if person_mask is not None else None
+
+    overlap_bool = None
+    if target_bool is not None and person_bool is not None:
+        overlap_bool = target_bool & person_bool
+        if overlap_bool.any():
+            overlay[overlap_bool] = (
+                overlay[overlap_bool] * (1 - alpha)
+                + np.array(overlap_color, dtype=np.float32) * alpha
+            )
+            applied = True
+            target_bool = target_bool & ~overlap_bool
+            person_bool = person_bool & ~overlap_bool
+
+    def _blend(mask_bool: Optional[np.ndarray], color: Tuple[int, int, int]) -> None:
+        nonlocal applied
+        if mask_bool is None or not mask_bool.any():
+            return
+        overlay[mask_bool] = (
+            overlay[mask_bool] * (1 - alpha)
+            + np.array(color, dtype=np.float32) * alpha
+        )
+        applied = True
+
+    _blend(target_bool, target_color)
+    _blend(person_bool, person_color)
+
+    if not applied:
+        return None
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    overlay_img = Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
+    filename = f"{filename_prefix or 'mask_overlay'}_mask_overlay.png"
+    output_path = output_dir / filename
+    overlay_img.save(output_path)
+    return output_path
 
 
 def calculate_coordinate_mapping(original_img_shape, patch_boxes, patched_final_dim, patched_resized_before_pad_dim, vision_tower):
@@ -957,27 +1180,30 @@ def get_attention_indices_from_mask(
         add_user_prompt_tokens= False,
         user_prompt_range=[1849, 1860]
     )
-    if apply_for_anyres_patches:
-        anyres_token2pixel_map = calculate_coordinate_mapping(
-            original_img_shape,
-            patch_boxes,
-            patched_final_dim,
-            patched_resized_before_pad_dim,
-            vision_tower
-        )
+    # atten_indices, resized_mask = _pixel_to_token_indices_helper_anyres_inference(
+    #     mask_coords, image_size, possible_resolutions=model_config.image_grid_pinpoints)
+    
+    # if apply_for_anyres_patches:
+    #     anyres_token2pixel_map = calculate_coordinate_mapping(
+    #         original_img_shape,
+    #         patch_boxes,
+    #         patched_final_dim,
+    #         patched_resized_before_pad_dim,
+    #         vision_tower
+    #     )
 
-        # add additional patch tokens form anyres structure to attention indices
-        add_tokens = []
-        for coord in mask_coords:
-            pixel_coord = tuple(coord)
-            if pixel_coord in anyres_token2pixel_map[1]:
-                token_idx = anyres_token2pixel_map[1][pixel_coord]
-                if token_idx not in atten_indices:
-                    add_tokens.append(token_idx)
+    #     # add additional patch tokens form anyres structure to attention indices
+    #     add_tokens = []
+    #     for coord in mask_coords:
+    #         pixel_coord = tuple(coord)
+    #         if pixel_coord in anyres_token2pixel_map[1]:
+    #             token_idx = anyres_token2pixel_map[1][pixel_coord]
+    #             if token_idx not in atten_indices:
+    #                 add_tokens.append(token_idx)
 
-        # Add additional tokens to the attention indices
-        atten_indices.extend(add_tokens)
-        atten_indices = sorted(set(atten_indices))
+    #     # Add additional tokens to the attention indices
+    #     atten_indices.extend(add_tokens)
+    #     atten_indices = sorted(set(atten_indices))
 
     return atten_indices, resized_mask
 
@@ -1375,6 +1601,51 @@ def _setup_output_directories(output_dir: Union[str, Path]) -> Tuple[Path, Path,
 
     return output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir
 
+def _find_gt_annotation_entry(
+    mask_path: Union[str, Path],
+    image_path: Union[str, Path],
+    csv_path: Optional[Path]
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Return the GT annotation entry and the key that matched it."""
+    if not csv_path:
+        return None, None
+
+    lookup = load_gt_annotation_lookup(csv_path)
+    if not lookup:
+        return None, None
+
+    ordered_candidates: List[str] = []
+
+    def _append_candidates(raw_value: Any) -> None:
+        for candidate in _normalize_gt_gaze_keys(raw_value):
+            if candidate and candidate not in ordered_candidates:
+                ordered_candidates.append(candidate)
+
+    image_path_str = str(image_path)
+    _append_candidates(image_path_str)
+
+    mask_path_obj = Path(str(mask_path))
+    mask_stem = mask_path_obj.stem
+    _append_candidates(mask_stem)
+
+    stem_without_prefix = mask_stem.replace("gaze__", "")
+    _append_candidates(stem_without_prefix)
+
+    if "_" in stem_without_prefix:
+        _append_candidates(stem_without_prefix.split("_")[0])
+
+    digit_key = "".join(ch for ch in stem_without_prefix if ch.isdigit())
+    _append_candidates(digit_key)
+
+    for candidate_key in ordered_candidates:
+        entry = lookup.get(candidate_key)
+        if entry is None:
+            continue
+        return entry, candidate_key
+
+    return None, None
+
+
 def _prepare_inputs(
     image_path: Union[str, Path],
     mask_path: Union[str, Path],
@@ -1394,63 +1665,73 @@ def _prepare_inputs(
     """
     person_mask = None
     person_mask_indices = None
+    csv_path: Optional[Path] = None
+    if use_gt_gaze_csv:
+        csv_path = Path(gt_gaze_csv_path) if gt_gaze_csv_path else DEFAULT_GT_GAZE_CSV
+
+    should_apply_gt_overrides = bool(csv_path and "gaze__" in Path(str(mask_path)).name)
+
     # Load image and mask
     image = load_image(image_path)
     mask = None
     gt_mask_used = False
+    target_mask_raw: Optional[np.ndarray] = None
 
-    if use_gt_gaze_csv and "gaze__" in Path(str(mask_path)).name:
-        csv_path = Path(gt_gaze_csv_path) if gt_gaze_csv_path else DEFAULT_GT_GAZE_CSV
-        lookup = load_gt_gaze_lookup(csv_path)
+    gt_annotation_entry: Optional[Dict[str, Any]] = None
+    matched_lookup_key = None
+    if should_apply_gt_overrides:
+        gt_annotation_entry, matched_lookup_key = _find_gt_annotation_entry(
+            mask_path=mask_path,
+            image_path=image_path,
+            csv_path=csv_path,
+        )
 
-        ordered_candidates: List[str] = []
+    if gt_annotation_entry and gt_annotation_entry.get("coords"):
+        coords = gt_annotation_entry["coords"]
+        pixel_coord = _denormalize_gaze_point(coords[0], coords[1], image.size)
+        mask = _create_gaze_mask_from_point(
+            image.size,
+            pixel_coord,
+            radius=gt_gaze_mask_radius,
+            radius_ratio=gt_gaze_mask_radius_ratio,
+        )
+        gt_mask_used = True
+        lookup_key = matched_lookup_key or "unknown"
+        print(f"Using GT gaze mask from CSV (key='{lookup_key}') at pixel {pixel_coord}")
 
-        def _append_candidates(raw_value: Any) -> None:
-            for candidate in _normalize_gt_gaze_keys(raw_value):
-                if candidate and candidate not in ordered_candidates:
-                    ordered_candidates.append(candidate)
-
-        image_path_str = str(image_path)
-        _append_candidates(image_path_str)
-
-        mask_path_obj = Path(str(mask_path))
-        mask_stem = mask_path_obj.stem
-        _append_candidates(mask_stem)
-
-        stem_without_prefix = mask_stem.replace("gaze__", "")
-        _append_candidates(stem_without_prefix)
-
-        if "_" in stem_without_prefix:
-            _append_candidates(stem_without_prefix.split("_")[0])
-
-        digit_key = "".join(ch for ch in stem_without_prefix if ch.isdigit())
-        _append_candidates(digit_key)
-
-        for candidate_key in ordered_candidates:
-            coords = lookup.get(candidate_key)
-            if coords is None:
-                continue
-
-            pixel_coord = _denormalize_gaze_point(coords[0], coords[1], image.size)
-            mask = _create_gaze_mask_from_point(
-                image.size,
-                pixel_coord,
-                radius=gt_gaze_mask_radius,
-                radius_ratio=gt_gaze_mask_radius_ratio,
-            )
-            gt_mask_used = True
-            print(f"Using GT gaze mask from CSV (key='{candidate_key}') at pixel {pixel_coord}")
-            break
-
-        if not gt_mask_used:
-            print(f"⚠️ Warning: GT gaze entry not found for {image_path}; falling back to mask file {mask_path}")
+    if should_apply_gt_overrides and not gt_mask_used:
+        print(f"⚠️ Warning: GT gaze entry not found for {image_path}; falling back to mask file {mask_path}")
 
     if not gt_mask_used:
         mask = load_mask_from_file(mask_path)
 
+    if mask is not None:
+        target_mask_raw = np.copy(mask)
+
     person_mask_path = str(mask_path).replace("gaze__", "person__")
-    if Path(person_mask_path).exists():
+    person_mask_from_gt = False
+    person_mask_raw: Optional[np.ndarray] = None
+    if gt_annotation_entry and gt_annotation_entry.get("bbox") is not None:
+        bbox = gt_annotation_entry["bbox"]
+        if gt_annotation_entry.get("bbox_is_normalized", False):
+            img_width, img_height = image.size
+            x_min = max(0.0, min(img_width, bbox[0] * img_width))
+            y_min = max(0.0, min(img_height, bbox[1] * img_height))
+            x_max = max(0.0, min(img_width, bbox[2] * img_width))
+            y_max = max(0.0, min(img_height, bbox[3] * img_height))
+            bbox = (x_min, y_min, x_max, y_max)
+        person_mask = _create_person_mask_from_bbox(image.size, bbox)
+        person_mask_from_gt = True
+        lookup_key = matched_lookup_key or "unknown"
+        print(f"Using GT person mask from CSV (key='{lookup_key}') with bbox {bbox}")
+    elif should_apply_gt_overrides:
+        print(f"⚠️ Warning: GT person entry not found for {image_path}; falling back to mask file {person_mask_path}")
+
+    if not person_mask_from_gt and Path(person_mask_path).exists():
         person_mask = load_mask_from_file(person_mask_path)
+
+    if person_mask is not None:
+        person_mask_raw = np.copy(person_mask)
 
 
     print(f"Image size: {image.size}")
@@ -1485,6 +1766,7 @@ def _prepare_inputs(
     if person_mask is not None:
         person_mask_indices, person_mask = get_attention_indices_from_mask(
             mask=person_mask,
+            # mask=mask,       # temp switch
             image_size=image.size,
             model_config=model.config,
             original_img_shape=image.size,
@@ -1495,7 +1777,12 @@ def _prepare_inputs(
             apply_for_anyres_patches=False
         )
     print(f"Initial attention indices: {len(atten_indices)} tokens")
-    masks = {'target_mask': target_mask, 'person_mask': person_mask}        # masks in [model's] input image resolution 
+    masks = {
+        'target_mask': target_mask,
+        'person_mask': person_mask,
+        'target_mask_raw': target_mask_raw,
+        'person_mask_raw': person_mask_raw
+    }        # masks in [model's] input image resolution 
     # Prepare conversation
     conv_template = "qwen_1_5"  # Default for the model
 
@@ -1965,6 +2252,8 @@ def create_experiment_config(
     gt_gaze_csv_path: Optional[Union[str, Path]] = None,
     gt_gaze_mask_radius: Optional[int] = None,
     gt_gaze_mask_radius_ratio: float = 0.02,
+    save_mask_overlays: bool = False,
+    mask_overlay_alpha: float = 0.4,
 ) -> Dict[str, Any]:
     """Build base experiment config dict for bias sweep."""
     return {
@@ -1978,6 +2267,8 @@ def create_experiment_config(
         "gt_gaze_csv_path": str(gt_gaze_csv_path) if gt_gaze_csv_path is not None else None,
         "gt_gaze_mask_radius": gt_gaze_mask_radius,
         "gt_gaze_mask_radius_ratio": gt_gaze_mask_radius_ratio,
+        "save_mask_overlays": save_mask_overlays,
+        "mask_overlay_alpha": mask_overlay_alpha,
     }
 
 def save_image_results(
@@ -2246,27 +2537,70 @@ def process_hidden_states_and_embeddings(
     """
     if not outputs.hidden_states:
         return None
-        
-    last_hidden_state = outputs.hidden_states[-1].squeeze(0)
+
+    attn_cfg = attn_config or {}
+    hidden_states = outputs.hidden_states
+    num_layers = len(hidden_states)
+
+    def _normalize_layer_idx(idx: Optional[int], label: str) -> int:
+        if idx is None:
+            raise ValueError(f"{label} must be specified when using representation injections")
+        normalized = idx
+        if normalized < 0:
+            normalized = num_layers + normalized
+        if normalized < 0 or normalized >= num_layers:
+            raise ValueError(
+                f"Requested hidden-state layer {idx} ({label}) is out of range for {num_layers} layers"
+            )
+        return normalized
+
+    base_layer_idx = attn_cfg.get("repr_layer_idx")
+    if base_layer_idx is None:
+        base_layer_idx = attn_cfg.get("layer_idx")
+    if base_layer_idx is None:
+        base_layer_idx = -1
+
+    source_layer_idx_raw = attn_cfg.get("repr_source_layer_idx", base_layer_idx)
+    target_layer_idx_raw = attn_cfg.get("repr_target_layer_idx", base_layer_idx)
+
+    similarity_layer_idx_raw = base_layer_idx
+    if similarity_layer_idx_raw is None:
+        similarity_layer_idx_raw = target_layer_idx_raw if target_layer_idx_raw is not None else source_layer_idx_raw
+    if similarity_layer_idx_raw is None:
+        similarity_layer_idx_raw = -1
+
+    source_layer_idx = _normalize_layer_idx(source_layer_idx_raw, "repr_source_layer_idx")
+    target_layer_idx = _normalize_layer_idx(target_layer_idx_raw, "repr_target_layer_idx")
+    similarity_layer_idx = _normalize_layer_idx(similarity_layer_idx_raw, "repr_layer_idx")
+
+    selected_hidden_state = hidden_states[similarity_layer_idx].squeeze(0)
+    source_hidden_state = hidden_states[source_layer_idx].squeeze(0)
+    target_hidden_state = hidden_states[target_layer_idx].squeeze(0)
     
     if state["image_embeddings"] is None:  # First step only
+        print(f"Extracting representation tokens from hidden layer {target_layer_idx} for injection")
         # Store the first step hidden state for later output
-        state["first_step_hidden_state"] = last_hidden_state
-        state["image_embeddings"] = last_hidden_state[
+        use_multi_layer_repr = (
+            attn_cfg.get("repr_source_layer_idx") is not None
+            or attn_cfg.get("repr_target_layer_idx") is not None
+            or source_layer_idx != target_layer_idx
+        )
+
+        if use_multi_layer_repr:
+            repr_payload: Dict[str, torch.Tensor] = {
+                "source": source_hidden_state,
+                "target": target_hidden_state,
+            }
+            state["first_step_hidden_state"] = repr_payload
+        else:
+            state["first_step_hidden_state"] = selected_hidden_state
+        state["image_embeddings"] = selected_hidden_state[
             image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches
         ]
         
-        # Get embeddings from specified layer for similarity computation
-        # This will be reused for all subsequent steps
-        set_layer_hidden_state = outputs.hidden_states[-1].squeeze(0)
-        set_layer_image_embeddings = set_layer_hidden_state[
-            image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches
-        ]
-        
-        # Store these embeddings for reuse in all steps
-        state["set_layer_image_embeddings"] = set_layer_image_embeddings
-        
-        return set_layer_image_embeddings
+        # Store embeddings for reuse in all steps
+        state["set_layer_image_embeddings"] = state["image_embeddings"]
+        return state["set_layer_image_embeddings"]
     
     # For subsequent steps, return the stored embeddings from first step
     return state.get("set_layer_image_embeddings", None)

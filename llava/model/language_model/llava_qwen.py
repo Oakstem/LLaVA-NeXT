@@ -143,7 +143,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     )
 
                     if mask_hidden_state_source is not None and has_source_tokens:
-                        person_mask_repr = mask_hidden_state_source[person_attn_mask_indices, :][0]
+                        person_mask_repr = mask_hidden_state_source[person_attn_mask_indices, :].mean(dim=0)       # todo: reset back to .mean(dim=0) later
+                        # person_mask_repr = mask_hidden_state_source[[0,1], :].mean(dim=0)   
                         person_mask_repr = person_mask_repr.to(inputs_embeds.device, dtype=inputs_embeds.dtype)
                         if use_layer_injection:
                             layer_injection_data = layer_injection_data or {}
