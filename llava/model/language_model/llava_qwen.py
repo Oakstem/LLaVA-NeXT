@@ -32,10 +32,13 @@ from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config        #, Qwen2Model, Qwen2ForCausalLM
 from qwen2.modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from llava.mm_utils import select_best_resolution # Import the helper from mm_utils
+from llava.constants import IMAGE_TOKEN_INDEX
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
 
+
+INSERT_EMBED_TOKEN_ID = 716
 
 class LlavaQwenConfig(Qwen2Config):
     model_type = "llava_qwen"
@@ -71,6 +74,43 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
     def get_model(self):
         return self.model
+
+    def _build_tokens_indexing_from_ids(
+        self, reference_input_ids: torch.LongTensor, seq_len: int
+    ) -> Dict[str, List[torch.Tensor]]:
+        """
+        Approximate tokens_indexing metadata from raw input IDs when image processing is skipped.
+        """
+        if reference_input_ids.dim() == 1:
+            reference_input_ids = reference_input_ids.unsqueeze(0)
+
+        tokens_indexing: Dict[str, List[torch.Tensor]] = {"image": [], "text": []}
+        for row in reference_input_ids:
+            image_inds = (row == IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+            text_inds = (row != IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+            tokens_indexing["image"].append(image_inds)
+            tokens_indexing["text"].append(text_inds)
+
+        special_inds = (reference_input_ids[-1] == INSERT_EMBED_TOKEN_ID).nonzero(as_tuple=False).flatten()
+        if special_inds.numel() > 0:
+            special_inds = torch.unique(special_inds)
+            special_inds = special_inds[(special_inds >= 0) & (special_inds < seq_len)]
+            if special_inds.numel() > 2:
+                tokens_indexing["insert_embd"] = {
+                    "source": [special_inds[0].item(), special_inds[2].item()],
+                    "target": [special_inds[1].item()],
+                }
+            elif special_inds.numel() == 2:
+                tokens_indexing["insert_embd"] = {
+                    "source": [special_inds[0].item()],
+                    "target": [special_inds[1].item()],
+                }
+            elif special_inds.numel() == 1:
+                tokens_indexing["insert_embd"] = {"source": [special_inds[0].item()], "target": []}
+        else:
+            tokens_indexing["insert_embd"] = None
+
+        return tokens_indexing
 
     def forward(
         self,
@@ -143,8 +183,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     )
 
                     if mask_hidden_state_source is not None and has_source_tokens:
-                        person_mask_repr = mask_hidden_state_source[person_attn_mask_indices, :].mean(dim=0)       # todo: reset back to .mean(dim=0) later
-                        # person_mask_repr = mask_hidden_state_source[[0,1], :].mean(dim=0)   
+                        person_mask_repr = mask_hidden_state_source[person_attn_mask_indices, :].mean(dim=0)       # todo: reset back to .mean(dim=0) later 
                         person_mask_repr = person_mask_repr.to(inputs_embeds.device, dtype=inputs_embeds.dtype)
                         if use_layer_injection:
                             layer_injection_data = layer_injection_data or {}
@@ -205,6 +244,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             #         input_ids = None
         # if inputs_embeds is not None:   # todo: uncomment once done testing, commenting out to get custom mask during generation too
         # kwargs["repr_injection"] = None
+        if inputs_embeds is None and past_key_values is None and input_ids is not None:
+            # No modality inputs were provided for the first step; fall back to token embeddings.
+            inputs_embeds = self.get_model().embed_tokens(input_ids)
+            input_ids = None
+
         if inputs_embeds is None: # or kwargs.get("target_tokens", 0) == 2:
             input_embeds_shape = torch.Size([1, past_key_values[0][0].shape[2]+1, 1])
             input_device = past_key_values[0][0].device
@@ -215,31 +259,49 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             input_embeds_shape = inputs_embeds.shape
             input_device = inputs_embeds.device
             input_dtype = inputs_embeds.dtype
-        # Only build custom mask if final_ids_to_attend is populated.
-        # Otherwise, the attention_mask from prepare_inputs_labels_for_multimodal (which should be causal) or passed in, is used.
+
+        if getattr(self, "tokens_indexing", None) is None and original_input_ids is not None:
+            try:
+                self.tokens_indexing = self._build_tokens_indexing_from_ids(
+                    original_input_ids, input_embeds_shape[1]
+                )
+            except Exception as exc:
+                print(f"Warning: failed to build tokens_indexing from prompt tokens: {exc}")
+        # Only build custom mask if final_ids_to_attend is populated and token indexing information is available.
+        tokens_indexing = getattr(self, "tokens_indexing", None)
+        image_index_list = None
+        if isinstance(tokens_indexing, dict):
+            image_index_list = tokens_indexing.get("image")
+        has_image_indices = (
+            isinstance(image_index_list, list)
+            and len(image_index_list) > 0
+            and isinstance(image_index_list[0], torch.Tensor)
+            and image_index_list[0].numel() > 0
+        )
+        can_build_custom_mask = has_image_indices
         if isinstance(final_ids_to_attend, dict):
             source_ids_to_attend = final_ids_to_attend.get("gaze_source", None)
             final_ids_to_attend = final_ids_to_attend.get("gaze_target", None)
         else:
             source_ids_to_attend = None
             
-        if final_ids_to_attend:
+        if can_build_custom_mask and final_ids_to_attend:
             attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
                 input_embeds=inputs_embeds,
                 inputs_embeds_shape=input_embeds_shape,
                 ids_to_attend=final_ids_to_attend,
-                tokens_indexing=self.tokens_indexing,
+                tokens_indexing=tokens_indexing,
                 device=input_device,
                 dtype=input_dtype,
             )
-        if source_ids_to_attend is not None:
+        if can_build_custom_mask and source_ids_to_attend is not None:
             # If source_ids_to_attend is provided, we also build a mask for it.
             # This is useful for cases where we want to boost attention to specific tokens.
             source_attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
                 input_embeds=inputs_embeds,
                 inputs_embeds_shape=input_embeds_shape,
                 ids_to_attend=source_ids_to_attend,
-                tokens_indexing=self.tokens_indexing,
+                tokens_indexing=tokens_indexing,
                 device=input_device,
                 dtype=input_dtype,
                 mask_all_image=True,  # Assuming we want to mask all image tokens in the source attention
@@ -367,13 +429,24 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         mask = torch.full((seq_len, seq_len), float("0"), device=device, dtype=dtype)
         causal_indices = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
         mask[causal_indices] = 1.
-        if mask_all_image:
-            mask[:, tokens_indexing['image'][0]] = 0.
+        image_token_indices = []
+        if isinstance(tokens_indexing, dict):
+            image_list = tokens_indexing.get("image")
+            if (
+                isinstance(image_list, list)
+                and len(image_list) > 0
+                and isinstance(image_list[0], torch.Tensor)
+                and image_list[0].numel() > 0
+            ):
+                image_token_indices = image_list[0].to(device=device, dtype=torch.long)
 
-        if input_embeds is None:
+        if mask_all_image and len(image_token_indices) > 0:
+            mask[:, image_token_indices] = 0.
+
+        if input_embeds is None and len(image_token_indices) > 0:
              # lets mask all the image tokens
-            mask[:, tokens_indexing['image'][0]] = 0.
-            # mask[tokens_indexing['image'][0], :] = 0.
+            mask[:, image_token_indices] = 0.
+            # mask[image_token_indices, :] = 0.
         
         # Modify the last row for specific attention if ids_to_attend is provided
         if ids_to_attend and seq_len > 0:

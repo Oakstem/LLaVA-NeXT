@@ -1657,11 +1657,14 @@ def _prepare_inputs(
     use_gt_gaze_csv: bool = False,
     gt_gaze_csv_path: Optional[Union[str, Path]] = None,
     gt_gaze_mask_radius: Optional[int] = None,
-    gt_gaze_mask_radius_ratio: float = 0.02
+    gt_gaze_mask_radius_ratio: float = 0.02,
+    insert_image_token: bool = True,
 ) -> Tuple[Any, Any, torch.Tensor, List, List[int], Any, torch.Tensor]:
     """Load and prepare image, mask, and input tensors.
 
     Optionally override the gaze target mask using ground-truth coordinates from a CSV.
+    When ``insert_image_token`` is False, the textual prompt is left untouched (no automatic
+    ``<image>`` token insertion) which is useful for subsequent runs that omit image features.
     """
     person_mask = None
     person_mask_indices = None
@@ -1786,7 +1789,7 @@ def _prepare_inputs(
     # Prepare conversation
     conv_template = "qwen_1_5"  # Default for the model
 
-    if DEFAULT_IMAGE_TOKEN not in prompt:
+    if insert_image_token and DEFAULT_IMAGE_TOKEN not in prompt:
         full_prompt = f"{DEFAULT_IMAGE_TOKEN}\\n{prompt}"
     else:
         full_prompt = prompt

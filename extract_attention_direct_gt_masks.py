@@ -124,6 +124,7 @@ def run_generation_with_attention(
     gt_gaze_mask_radius_ratio: float = 0.02,
     save_mask_overlays: bool = False,
     mask_overlay_alpha: float = 0.4,
+    include_image_inputs: bool = True,
 ) -> Dict[str, Any]:
     """
     Run generation with attention extraction and optional gaze guidance.
@@ -150,6 +151,7 @@ def run_generation_with_attention(
         gt_gaze_mask_radius_ratio: Relative radius fallback (fraction of min dimension)
         save_mask_overlays: Generate and save person/target overlay visualization
         mask_overlay_alpha: Alpha blend to use for overlay visualization
+        include_image_inputs: Whether to send image tensors to the model on the first decoding step
 
     Returns:
         Dictionary containing generation results and analysis
@@ -183,6 +185,7 @@ def run_generation_with_attention(
         gt_gaze_csv_path=gt_gaze_csv_path,
         gt_gaze_mask_radius=gt_gaze_mask_radius,
         gt_gaze_mask_radius_ratio=gt_gaze_mask_radius_ratio,
+        insert_image_token=include_image_inputs,
     )
 
     target_mask_raw = input_masks.get('target_mask_raw')
@@ -247,7 +250,7 @@ def run_generation_with_attention(
                 "output_attentions": True,
                 "output_hidden_states": True,
                 "atten_ids": None,
-                "boost_positions": boost_positions,
+                "boost_positions": boost_positions if include_image_inputs else None,
                 "bias_strength": bias_strength,
                 "query_indices": attn_config.get("query_indices", None),
                 "repr_layer_idx": repr_layer_map,
@@ -257,7 +260,7 @@ def run_generation_with_attention(
                 "apply_only_target_mask": state["apply_only_target_mask"],
                 "target_tokens": state["target_tokens"],
             }
-            if i == 0:
+            if i == 0 and include_image_inputs:
                 model_inputs.update({"images": image_tensor, "image_sizes": image_sizes, "modalities": ["image"]})
 
             ## Todo: remove after testing
@@ -870,6 +873,7 @@ def run_bias_sweep_experiment(
             gt_gaze_mask_radius_ratio=experiment_config.get("gt_gaze_mask_radius_ratio", 0.02),
             save_mask_overlays=experiment_config.get("save_mask_overlays", False),
             mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
+            include_image_inputs=False,
         )
         results.pop('first_step_hidden_state', None)
         all_results[bias_i] = results
@@ -1022,6 +1026,7 @@ def run_repr_layer_sweep_experiment(
             gt_gaze_mask_radius_ratio=experiment_config.get("gt_gaze_mask_radius_ratio", 0.02),
             save_mask_overlays=experiment_config.get("save_mask_overlays", False),
             mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
+            include_image_inputs=False,
         )
         results.pop("first_step_hidden_state", None)
         results["repr_source_layer_idx"] = source_idx if enable_pairwise_sweep else target_idx
@@ -1297,11 +1302,10 @@ if __name__ == '__main__':
 # a person looking at a dog → a person in a puffer vest and beanie, looking at a small brown dog
 # The sentence: a _ looking at _ → """, help="Input prompt.")
     parser.add_argument('--prompt', type=str, default="""Complete the sentence in the following format, for example:
-                        a guy → a guy in a gray hoodie and ripped jeans, sitting on a worn wooden bench. 
-                        a woman → a woman in a beige coat and ankle boots, holding a phone. 
-                        a man → a man in a black leather jacket and glasses. 
-                        a woman → a woman in a dark green sweater and black jeans, carrying a tan shoulder bag
-                        The sentence: a _ → """, help="Input prompt.")
+                        woman → a woman in a beige coat and ankle boots, holding a phone. 
+                        man → a man in a black leather jacket and glasses. 
+                        woman → a woman in a dark green sweater and black jeans, carrying a tan shoulder bag
+                        The sentence: _ → """, help="Input prompt.")
     parser.add_argument('--use-gt-gaze-csv', action=argparse.BooleanOptionalAction, default=True,
                         dest='use_gt_gaze_csv', help="Use ground-truth gaze CSV to override gaze masks (default: enabled).")
     parser.add_argument('--gt_gaze_csv_path', type=str, default=str(DEFAULT_GT_GAZE_CSV),
@@ -1310,7 +1314,7 @@ if __name__ == '__main__':
                         help="Optional fixed radius (pixels) for GT gaze mask blobs.")
     parser.add_argument('--gt_gaze_mask_radius_ratio', type=float, default=0.1,
                         help="Relative radius used when no fixed radius is provided for GT gaze mask blobs.")
-    parser.add_argument('--use-body-bbox', action='store_true', default=False,
+    parser.add_argument('--use_body_bbox', action='store_true', default=False,
                         help="Use normalized body bounding boxes from the GT CSV instead of head boxes when creating person masks.")
     # parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
     # " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \

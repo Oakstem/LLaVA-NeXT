@@ -836,7 +836,7 @@ class Qwen2DecoderLayer(nn.Module):
         bsz, q_len = hidden_size[0], hidden_size[1]
         # debug print
         # print(f"hidden states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape if attention_mask is not None else None}, position_ids shape: {position_ids.shape if position_ids is not None else None}")
-        # kwargs['boost_positions'] = None
+        kwargs['boost_positions'] = None
         if kwargs.get("boost_positions", None) is not None:
             gaze_target_boost_positions = kwargs.get('boost_positions', None).get('gaze_target', None)
             gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
