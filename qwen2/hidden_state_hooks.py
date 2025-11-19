@@ -72,7 +72,7 @@ def _prepare_patch_entries(
 
 def build_qwen2_hidden_state_patch_config(
     repr_injection: Optional[Dict[str, Dict[str, torch.Tensor]]],
-    repr_layer_idx: Optional[Union[int, Dict[str, int]]],
+    # repr_layer_idx: Optional[Union[int, Dict[str, int]]],
     num_hidden_layers: int,
     batch_size: int,
     device: torch.device,
@@ -81,31 +81,18 @@ def build_qwen2_hidden_state_patch_config(
     """
     Convert repr_injection payload into per-layer patch configuration consumable by the hook helpers.
     """
-    if not repr_injection or repr_layer_idx is None:
+    if not repr_injection:
         return {}
 
     patch_config: HiddenStatePatchConfig = {}
 
-    if isinstance(repr_layer_idx, dict):
-        for key, idx in repr_layer_idx.items():
-            if idx is None:
-                continue
-            normalized_idx = _normalize_layer_index(idx, num_hidden_layers)
-            entry = repr_injection.get(key)
-            if not entry:
-                continue
-            patches = _prepare_patch_entries(entry, batch_size, device, dtype)
-            if patches:
-                patch_config.setdefault(normalized_idx, []).extend(patches)
-    else:
-        normalized_idx = _normalize_layer_index(repr_layer_idx, num_hidden_layers)
-        combined_patches: List[HiddenStatePatchEntry] = []
-        for entry in repr_injection.values():
-            if not entry:
-                continue
-            combined_patches.extend(_prepare_patch_entries(entry, batch_size, device, dtype))
-        if combined_patches:
-            patch_config[normalized_idx] = combined_patches
+
+    for key, inject_data in repr_injection.items():
+        idx = inject_data['inject_layer_idx']
+        normalized_idx = _normalize_layer_index(idx, num_hidden_layers)
+        patches = _prepare_patch_entries(inject_data, batch_size, device, dtype)
+        if patches:
+            patch_config.setdefault(normalized_idx, []).extend(patches)
 
     return patch_config
 

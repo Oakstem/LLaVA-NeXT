@@ -2509,6 +2509,7 @@ def initialize_generation_state(
         "target_tokens": 0,
         "image_embeddings": None,
         "first_step_hidden_state": None,
+        "first_step_all_hidden_states": None,
         "set_layer_image_embeddings": None,  # Store embeddings from first step for reuse
         "all_correlation_metrics": [],
         "person_mask_correlation_metrics": [],
@@ -2542,6 +2543,7 @@ def process_hidden_states_and_embeddings(
         return None
 
     attn_cfg = attn_config or {}
+    store_all_hidden_states = bool(attn_cfg.get("return_full_hidden_states", False))
     hidden_states = outputs.hidden_states
     num_layers = len(hidden_states)
 
@@ -2563,17 +2565,21 @@ def process_hidden_states_and_embeddings(
     if base_layer_idx is None:
         base_layer_idx = -1
 
-    source_layer_idx_raw = attn_cfg.get("repr_source_layer_idx", base_layer_idx)
-    target_layer_idx_raw = attn_cfg.get("repr_target_layer_idx", base_layer_idx)
+    capture_layer_idx_raw = attn_cfg.get("repr_capture_layer_idx")
+    if capture_layer_idx_raw is None:
+        capture_layer_idx_raw = base_layer_idx
+    target_layer_idx_raw = attn_cfg.get("repr_inject_layer_idx")
+    if target_layer_idx_raw is None:
+        target_layer_idx_raw = base_layer_idx
 
     similarity_layer_idx_raw = base_layer_idx
     if similarity_layer_idx_raw is None:
-        similarity_layer_idx_raw = target_layer_idx_raw if target_layer_idx_raw is not None else source_layer_idx_raw
+        similarity_layer_idx_raw = target_layer_idx_raw if target_layer_idx_raw is not None else capture_layer_idx_raw
     if similarity_layer_idx_raw is None:
         similarity_layer_idx_raw = -1
 
-    source_layer_idx = _normalize_layer_idx(source_layer_idx_raw, "repr_source_layer_idx")
-    target_layer_idx = _normalize_layer_idx(target_layer_idx_raw, "repr_target_layer_idx")
+    source_layer_idx = _normalize_layer_idx(capture_layer_idx_raw, "repr_capture_layer_idx")
+    target_layer_idx = _normalize_layer_idx(target_layer_idx_raw, "repr_inject_layer_idx")
     similarity_layer_idx = _normalize_layer_idx(similarity_layer_idx_raw, "repr_layer_idx")
 
     selected_hidden_state = hidden_states[similarity_layer_idx].squeeze(0)
@@ -2584,10 +2590,16 @@ def process_hidden_states_and_embeddings(
         print(f"Extracting representation tokens from hidden layer {target_layer_idx} for injection")
         # Store the first step hidden state for later output
         use_multi_layer_repr = (
-            attn_cfg.get("repr_source_layer_idx") is not None
-            or attn_cfg.get("repr_target_layer_idx") is not None
+            attn_cfg.get("repr_capture_layer_idx") is not None
+            or attn_cfg.get("repr_inject_layer_idx") is not None
             or source_layer_idx != target_layer_idx
         )
+
+        if store_all_hidden_states:
+            # Store every layer output for downstream caching / sweeps
+            state["first_step_all_hidden_states"] = [
+                layer.squeeze(0).detach().cpu() for layer in hidden_states
+            ]
 
         if use_multi_layer_repr:
             repr_payload: Dict[str, torch.Tensor] = {
@@ -2811,4 +2823,5 @@ def create_generation_results(
         "target_mask_correlation": state["all_correlation_metrics"],
         "step_metrics": state["all_step_metrics"],
         "first_step_hidden_state": state["first_step_hidden_state"],
+        "first_step_all_hidden_states": state.get("first_step_all_hidden_states"),
     }

@@ -1396,10 +1396,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         hidden_states = inputs_embeds
         num_hidden_layers = len(self.layers)
         repr_injection = kwargs.pop("repr_injection", None)
-        repr_layer_idx = kwargs.get("repr_layer_idx", None)
+        # repr_layer_idx = kwargs.get("repr_layer_idx", None)
         hs_patch_config = build_qwen2_hidden_state_patch_config(
             repr_injection=repr_injection,
-            repr_layer_idx=repr_layer_idx,
+            # repr_layer_idx=repr_layer_idx,
             num_hidden_layers=num_hidden_layers,
             batch_size=batch_size,
             device=hidden_states.device,

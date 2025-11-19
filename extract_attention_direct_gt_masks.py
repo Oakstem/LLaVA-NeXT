@@ -67,6 +67,7 @@ from generation_utils import (
     create_generation_results,
     set_gt_annotation_lookup_use_body_bbox,
 )
+from repr_layer_token_injection_experiment import run_repr_layer_token_injection_experiment
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
     generate_next_token_with_evaluation, create_generation_summary,
@@ -219,14 +220,14 @@ def run_generation_with_attention(
     state = initialize_generation_state(gen_config, tokenizer, input_ids)
 
     repr_layer_map = None
-    repr_source_layer_idx = None
-    repr_target_layer_idx = None
+    repr_capture_layer_idx = None
+    repr_inject_layer_idx = None
     if attn_config:
-        repr_source_layer_idx = attn_config.get("repr_source_layer_idx")
-        repr_target_layer_idx = attn_config.get("repr_target_layer_idx")
+        repr_capture_layer_idx = attn_config.get("repr_capture_layer_idx")
+        repr_inject_layer_idx = attn_config.get("repr_inject_layer_idx")
         repr_layer_map = attn_config.get("repr_layer_idx")
         multi_layer_requested = (
-            repr_source_layer_idx is not None or repr_target_layer_idx is not None
+            repr_capture_layer_idx is not None or repr_inject_layer_idx is not None
         )
         if multi_layer_requested:
             fallback_layer = repr_layer_map
@@ -235,8 +236,8 @@ def run_generation_with_attention(
             if fallback_layer is None:
                 fallback_layer = -1
             repr_layer_map = {
-                "source": repr_source_layer_idx if repr_source_layer_idx is not None else fallback_layer,
-                "target": repr_target_layer_idx if repr_target_layer_idx is not None else fallback_layer,
+                "capture": repr_capture_layer_idx if repr_capture_layer_idx is not None else fallback_layer,
+                "inject": repr_inject_layer_idx if repr_inject_layer_idx is not None else fallback_layer,
             }
 
     # Main generation loop
@@ -250,7 +251,8 @@ def run_generation_with_attention(
                 "output_attentions": True,
                 "output_hidden_states": True,
                 "atten_ids": None,
-                "boost_positions": boost_positions if include_image_inputs else None,
+                "boost_positions": boost_positions,     #if include_image_inputs else None,
+                "include_image_inputs": include_image_inputs,
                 "bias_strength": bias_strength,
                 "query_indices": attn_config.get("query_indices", None),
                 "repr_layer_idx": repr_layer_map,
@@ -276,15 +278,11 @@ def run_generation_with_attention(
                 for key, tensor in target_mask_embedding.items():
                     if tensor is None:
                         continue
-                    print(
-                        f"Using {key} target mask embedding from previous run for guidance with mean: {tensor.mean().item():.4f}, "
-                        f"min: {tensor.min().item():.4f}, max: {tensor.max().item():.4f}"
-                    )
-            elif target_mask_embedding is not None:
-                print(
-                    f"Using target mask embedding from previous run for guidance with mean: {target_mask_embedding.mean().item():.4f}, "
-                    f"min: {target_mask_embedding.min().item():.4f}, max: {target_mask_embedding.max().item():.4f}"
-                )
+            # elif target_mask_embedding is not None:
+            #     print(
+            #         f"Using target mask embedding from previous run for guidance with mean: {target_mask_embedding.mean().item():.4f}, "
+            #         f"min: {target_mask_embedding.min().item():.4f}, max: {target_mask_embedding.max().item():.4f}"
+            #     )
 
 
             # Generate next token with gaze guidance
@@ -300,7 +298,7 @@ def run_generation_with_attention(
             )
             state["all_step_metrics"].append(evaluation_metrics)
             
-            print(f"Step {i+1}: Hidden state -1: mean {outputs.hidden_states[-1].mean().item():.4f}, min {outputs.hidden_states[-1].min().item():.4f}, max {outputs.hidden_states[-1].max().item():.4f}")
+            # print(f"Step {i+1}: Hidden state -1: mean {outputs.hidden_states[-1].mean().item():.4f}, min {outputs.hidden_states[-1].min().item():.4f}, max {outputs.hidden_states[-1].max().item():.4f}")
             # ## Todo: remove after testing
             # decoded = []
             # all_probs = torch.softmax(outputs.logits[0, :, :], dim=-1)
@@ -932,15 +930,17 @@ def run_repr_layer_sweep_experiment(
 
     required_cache_layers = sorted({idx for combo in combos for idx in combo})
     layer_hidden_state_cache: Dict[int, torch.Tensor] = {}
-    for layer_idx in required_cache_layers:
-        print(f" - Caching hidden state for layer {layer_idx}")
+    if required_cache_layers:
+        cache_layers_label = ", ".join(str(idx) for idx in required_cache_layers)
+        print(f" - Caching hidden states for layers [{cache_layers_label}] in a single initial run")
         cache_config = copy.deepcopy(base_experiment_config)
-        cache_config["output_dir"] = f"{base_output_dir}/repr_cache_layer_{layer_idx}"
+        cache_config["output_dir"] = f"{base_output_dir}/repr_cache_all_layers"
         cache_config.setdefault("generation_config", {})["bias_strength"] = effective_bias
         attn_cfg = copy.deepcopy(cache_config.get("attention_config", {}))
-        attn_cfg.pop("repr_source_layer_idx", None)
-        attn_cfg.pop("repr_target_layer_idx", None)
-        attn_cfg["repr_layer_idx"] = layer_idx
+        attn_cfg.pop("repr_capture_layer_idx", None)
+        attn_cfg.pop("repr_inject_layer_idx", None)
+        attn_cfg["repr_layer_idx"] = required_cache_layers[0]
+        attn_cfg["return_full_hidden_states"] = True
         cache_config["attention_config"] = attn_cfg
         init_run_results = run_generation_with_attention(
             model=model,
@@ -964,18 +964,23 @@ def run_repr_layer_sweep_experiment(
             save_mask_overlays=cache_config.get("save_mask_overlays", False),
             mask_overlay_alpha=cache_config.get("mask_overlay_alpha", 0.4),
         )
-        cached_hidden_state = init_run_results.get("first_step_hidden_state")
-        if isinstance(cached_hidden_state, dict):
-            cached_hidden_state = cached_hidden_state.get("target") or cached_hidden_state.get("source")
-        if cached_hidden_state is None:
-            raise RuntimeError(f"Failed to cache hidden state for layer {layer_idx}")
-        layer_hidden_state_cache[layer_idx] = cached_hidden_state.detach().cpu()
+        all_hidden_states = init_run_results.get("first_step_all_hidden_states")
+        if not all_hidden_states:
+            raise RuntimeError("Failed to retrieve full hidden state cache from initial run.")
+        total_layers = len(all_hidden_states)
+        for layer_idx in required_cache_layers:
+            normalized_idx = layer_idx if layer_idx >= 0 else total_layers + layer_idx
+            if normalized_idx < 0 or normalized_idx >= total_layers:
+                raise ValueError(
+                    f"Requested hidden-state layer {layer_idx} is out of range for {total_layers} total layers."
+                )
+            layer_hidden_state_cache[layer_idx] = all_hidden_states[normalized_idx]
 
     for source_idx, target_idx in combos:
         print(f"\n{'='*60}")
         if enable_pairwise_sweep:
             print(
-                f"Running repr-layer sweep experiment with source layer {source_idx} -> target layer {target_idx}"
+                f"Running repr-layer sweep experiment with capture layer {source_idx} -> inject layer {target_idx}"
             )
         else:
             print(f"Running repr-layer sweep experiment with repr_layer_idx: {target_idx}")
@@ -987,20 +992,20 @@ def run_repr_layer_sweep_experiment(
         attn_cfg = copy.deepcopy(experiment_config.get("attention_config", {}))
         attn_cfg["repr_layer_idx"] = target_idx
         if enable_pairwise_sweep:
-            attn_cfg["repr_source_layer_idx"] = source_idx
-            attn_cfg["repr_target_layer_idx"] = target_idx
+            attn_cfg["repr_capture_layer_idx"] = source_idx
+            attn_cfg["repr_inject_layer_idx"] = target_idx
         else:
-            attn_cfg.pop("repr_source_layer_idx", None)
-            attn_cfg.pop("repr_target_layer_idx", None)
+            attn_cfg.pop("repr_capture_layer_idx", None)
+            attn_cfg.pop("repr_inject_layer_idx", None)
         experiment_config["attention_config"] = attn_cfg
 
-        if enable_pairwise_sweep:
-            prev_hidden_state: Union[torch.Tensor, Dict[str, torch.Tensor]] = {
-                "source": layer_hidden_state_cache[source_idx],
-                "target": layer_hidden_state_cache[target_idx],
-            }
-        else:
-            prev_hidden_state = layer_hidden_state_cache[target_idx]
+        # if enable_pairwise_sweep:
+        #     prev_hidden_state: Union[torch.Tensor, Dict[str, torch.Tensor]] = {
+        #         "source": layer_hidden_state_cache[source_idx],
+        #         "target": layer_hidden_state_cache[target_idx],
+        #     }
+        # else:
+        prev_hidden_state = layer_hidden_state_cache[source_idx]
 
         results = run_generation_with_attention(
             model=model,
@@ -1029,8 +1034,8 @@ def run_repr_layer_sweep_experiment(
             include_image_inputs=False,
         )
         results.pop("first_step_hidden_state", None)
-        results["repr_source_layer_idx"] = source_idx if enable_pairwise_sweep else target_idx
-        results["repr_target_layer_idx"] = target_idx
+        results["repr_capture_layer_idx"] = source_idx if enable_pairwise_sweep else target_idx
+        results["repr_inject_layer_idx"] = target_idx
         all_results[combo_label] = results
         print(f"Finished experiment for {combo_label}. Results saved to: {results['output_directories']['main']}")
 
@@ -1054,8 +1059,10 @@ def run_repr_layer_sweep_experiment(
         generated_text = result.get("generated_text", "") or ""
         num_tokens = result.get("num_tokens", 0)
         overall_quality_score = quality_analysis.get("overall_quality_score", 0.0) if quality_analysis else 0.0
-        source_idx = result.get("repr_source_layer_idx")
-        target_idx = result.get("repr_target_layer_idx", source_idx)
+        source_idx = result.get("repr_capture_layer_idx")
+        if source_idx is None:
+            source_idx = result.get("repr_inject_layer_idx")
+        target_idx = result.get("repr_inject_layer_idx", source_idx)
 
         if correlation_score == 0.0:
             continue
@@ -1063,8 +1070,8 @@ def run_repr_layer_sweep_experiment(
             continue
 
         performance_summary.append({
-            "repr_source_layer_idx": source_idx,
-            "repr_target_layer_idx": target_idx,
+            "repr_capture_layer_idx": source_idx,
+            "repr_inject_layer_idx": target_idx,
             "overall_quality_score": overall_quality_score,
             "avg_confidence": avg_confidence,
             "avg_entropy": avg_entropy,
@@ -1081,7 +1088,7 @@ def run_repr_layer_sweep_experiment(
         print(f"\n{heading}:")
         if enable_pairwise_sweep:
             print(
-                f"{'Rank':<4} {'Src':<5} {'Tgt':<5} {'Quality':<8} {'Confidence':<11} "
+                f"{'Rank':<4} {'Cap':<5} {'Inj':<5} {'Quality':<8} {'Confidence':<11} "
                 f"{'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}"
             )
         else:
@@ -1091,8 +1098,10 @@ def run_repr_layer_sweep_experiment(
             )
         print("-" * 105)
         for i, result in enumerate(performance_summary[:5], 1):
-            display_source = result.get("repr_source_layer_idx")
-            display_target = result.get("repr_target_layer_idx")
+            display_source = result.get("repr_capture_layer_idx")
+            if display_source is None:
+                display_source = result.get("repr_inject_layer_idx")
+            display_target = result.get("repr_inject_layer_idx")
             if enable_pairwise_sweep:
                 print(
                     f"{i:<4} {display_source:<5} {display_target:<5} {result['overall_quality_score']:<8.2f} "
@@ -1111,7 +1120,7 @@ def run_repr_layer_sweep_experiment(
         print(f"\nWORST 3 REPRESENTATION LAYERS:")
         if enable_pairwise_sweep:
             print(
-                f"{'Rank':<4} {'Src':<5} {'Tgt':<5} {'Quality':<8} {'Confidence':<11} "
+                f"{'Rank':<4} {'Cap':<5} {'Inj':<5} {'Quality':<8} {'Confidence':<11} "
                 f"{'Entropy':<8} {'Correlation':<11} {'Tokens':<7} {'Generated Text':<30}"
             )
         else:
@@ -1122,8 +1131,10 @@ def run_repr_layer_sweep_experiment(
         print("-" * 105)
         worst_start = max(len(performance_summary) - 3, 0)
         for i, result in enumerate(performance_summary[worst_start:], worst_start + 1):
-            display_source = result.get("repr_source_layer_idx")
-            display_target = result.get("repr_target_layer_idx")
+            display_source = result.get("repr_capture_layer_idx")
+            if display_source is None:
+                display_source = result.get("repr_inject_layer_idx")
+            display_target = result.get("repr_inject_layer_idx")
             if enable_pairwise_sweep:
                 print(
                     f"{i:<4} {display_source:<5} {display_target:<5} {result['overall_quality_score']:<8.2f} "
@@ -1140,13 +1151,17 @@ def run_repr_layer_sweep_experiment(
                 )
 
         best_result = performance_summary[0]
+        best_capture_idx = best_result.get("repr_capture_layer_idx")
+        if best_capture_idx is None:
+            best_capture_idx = best_result.get("repr_inject_layer_idx")
+        best_inject_idx = best_result.get("repr_inject_layer_idx")
         if enable_pairwise_sweep:
             print(
                 f"\n🏆 RECOMMENDED REPR LAYERS: "
-                f"source={best_result['repr_source_layer_idx']} -> target={best_result['repr_target_layer_idx']}"
+                f"capture={best_capture_idx} -> inject={best_inject_idx}"
             )
         else:
-            print(f"\n🏆 RECOMMENDED REPR LAYER: {best_result['repr_target_layer_idx']}")
+            print(f"\n🏆 RECOMMENDED REPR LAYER: {best_inject_idx}")
         print(f"   • Overall Quality Score: {best_result['overall_quality_score']:.2f}/10")
         print(f"   • Average Confidence: {best_result['avg_confidence']:.3f}")
         print(f"   • Average Entropy: {best_result['avg_entropy']:.3f}")
@@ -1154,6 +1169,8 @@ def run_repr_layer_sweep_experiment(
         print(f"   • Generated Text: '{best_result['generated_text']}'")
     else:
         best_result = None
+        best_capture_idx = None
+        best_inject_idx = None
         print("No representation layers met the filtering criteria (non-zero correlation and containing 'looking').")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1165,8 +1182,8 @@ def run_repr_layer_sweep_experiment(
         "bias_strength_used": effective_bias,
         "repr_layer_results": all_results,
         "performance_summary": performance_summary,
-        "best_repr_source_layer_idx": best_result["repr_source_layer_idx"] if best_result else None,
-        "best_repr_target_layer_idx": best_result["repr_target_layer_idx"] if best_result else None,
+        "best_repr_capture_layer_idx": best_capture_idx,
+        "best_repr_inject_layer_idx": best_inject_idx,
     }
     saved_results_path = save_image_results(
         sweep_payload,
@@ -1176,8 +1193,6 @@ def run_repr_layer_sweep_experiment(
     )
     print(f"\n📁 Representation layer sweep results saved to: {saved_results_path}")
     print(f"{'='*80}")
-
-    return all_results
 
 def print_resume_usage_examples():
     """Print usage examples for the resume functionality."""
@@ -1302,10 +1317,11 @@ if __name__ == '__main__':
 # a person looking at a dog → a person in a puffer vest and beanie, looking at a small brown dog
 # The sentence: a _ looking at _ → """, help="Input prompt.")
     parser.add_argument('--prompt', type=str, default="""Complete the sentence in the following format, for example:
-                        woman → a woman in a beige coat and ankle boots, holding a phone. 
-                        man → a man in a black leather jacket and glasses. 
-                        woman → a woman in a dark green sweater and black jeans, carrying a tan shoulder bag
-                        The sentence: _ → """, help="Input prompt.")
+                        a guy → a guy in a gray hoodie and ripped jeans, sitting on a worn wooden bench. 
+                        a woman → a woman in a beige coat and ankle boots, holding a phone. 
+                        a man → a man in a black leather jacket and glasses. 
+                        a woman → a woman in a dark green sweater and black jeans, carrying a tan shoulder bag
+                        The sentence: a _ → """, help="Input prompt.")
     parser.add_argument('--use-gt-gaze-csv', action=argparse.BooleanOptionalAction, default=True,
                         dest='use_gt_gaze_csv', help="Use ground-truth gaze CSV to override gaze masks (default: enabled).")
     parser.add_argument('--gt_gaze_csv_path', type=str, default=str(DEFAULT_GT_GAZE_CSV),
@@ -1349,11 +1365,17 @@ if __name__ == '__main__':
     parser.add_argument('--repr_sweep_bias', type=float, default=2.5,
                         help="Bias strength to use during repr layer sweep (defaults to generation bias).")
     parser.add_argument('--repr_combo_sweep', action='store_true',
-                        help="When provided, performs a pairwise sweep over source/target repr layers instead of a single shared index.")
-    parser.add_argument('--repr_source_layers', type=int, nargs='*', default=None,
-                        help="Optional override for source/person representation layers used during combo sweeps.")
-    parser.add_argument('--repr_target_layers', type=int, nargs='*', default=None,
-                        help="Optional override for target/gaze representation layers used during combo sweeps.")
+                        help="When provided, performs a pairwise sweep over capture/inject repr layers instead of a single shared index.")
+    parser.add_argument('--repr_capture_layers', '--repr_source_layers', type=int, nargs='*', default=None,
+                        dest='repr_capture_layers',
+                        help="Optional override for capture/person representation layers used during combo sweeps.")
+    parser.add_argument('--repr_inject_layers', '--repr_target_layers', type=int, nargs='*', default=None,
+                        dest='repr_inject_layers',
+                        help="Optional override for inject/gaze representation layers used during combo sweeps.")
+    parser.add_argument('--token_injection_repr_sweep', action=argparse.BooleanOptionalAction, default=False,
+                        help="Run the representation sweep with alternating runs that inject selected tokens as image tokens.")
+    parser.add_argument('--token_injection_runs_per_combo', type=int, default=2,
+                        help="Number of runs per layer combination when token injection sweep is enabled (>=1).")
 
     # --- Gaze Guidance Arguments ---
     parser.add_argument('--use_gaze_guidance', action='store_true', help="Enable gaze-guided token selection.")
@@ -1411,9 +1433,9 @@ if __name__ == '__main__':
     if args.repr_sweep_layers is None:
         args.repr_sweep_layers = default_repr_layers
 
-    repr_source_layers = args.repr_source_layers if args.repr_source_layers is not None else args.repr_sweep_layers
-    repr_target_layers = (
-        args.repr_target_layers if args.repr_target_layers is not None else
+    repr_capture_layers = args.repr_capture_layers if args.repr_capture_layers is not None else args.repr_sweep_layers
+    repr_inject_layers = (
+        args.repr_inject_layers if args.repr_inject_layers is not None else
         (args.repr_sweep_layers if args.repr_combo_sweep else None)
     )
 
@@ -1551,13 +1573,32 @@ if __name__ == '__main__':
             mask_overlay_alpha=args.mask_overlay_alpha,
         )
         base_experiment_config["save_debug_files"] = args.save_debug_files
-        run_repr_layer_sweep_experiment(
-            base_experiment_config=base_experiment_config,
-            model=model,
-            tokenizer=tokenizer,
-            image_processor=image_processor,
-            repr_layer_indices=args.repr_sweep_layers,
-            bias_strength=args.repr_sweep_bias,
-            use_gaze_guidance=args.use_gaze_guidance,
-            guidance_config=guidance_config,
-        )
+        if args.token_injection_repr_sweep:
+            runs_per_combo = max(1, int(args.token_injection_runs_per_combo))
+            print(f"Token injection sweep enabled (runs per combo = {runs_per_combo}).")
+            run_repr_layer_token_injection_experiment(
+                base_experiment_config=base_experiment_config,
+                model=model,
+                tokenizer=tokenizer,
+                image_processor=image_processor,
+                repr_layer_indices=args.repr_sweep_layers,
+                bias_strength=args.repr_sweep_bias,
+                use_gaze_guidance=args.use_gaze_guidance,
+                guidance_config=guidance_config,
+                repr_target_layer_indices=repr_inject_layers if args.repr_combo_sweep else None,
+                enable_pairwise_sweep=args.repr_combo_sweep,
+                runs_per_combo=runs_per_combo,
+            )
+        else:
+            run_repr_layer_sweep_experiment(
+                base_experiment_config=base_experiment_config,
+                model=model,
+                tokenizer=tokenizer,
+                image_processor=image_processor,
+                repr_layer_indices=args.repr_sweep_layers,
+                bias_strength=args.repr_sweep_bias,
+                use_gaze_guidance=args.use_gaze_guidance,
+                guidance_config=guidance_config,
+                repr_target_layer_indices=repr_inject_layers if args.repr_combo_sweep else None,
+                enable_pairwise_sweep=args.repr_combo_sweep,
+            )
