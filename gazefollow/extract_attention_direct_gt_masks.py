@@ -14,8 +14,6 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from transformers import PreTrainedModel, PreTrainedTokenizer
-from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
-
 # Add project root to sys.path
 try:
     project_root = Path(__file__).resolve().parent.parent
@@ -23,8 +21,8 @@ except NameError:
     project_root = Path.cwd().parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
-
-from extract_cls_token_image_similarity import draw_topk_similarity_overlay
+from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
+from gazefollow.extract_cls_token_image_similarity import draw_topk_similarity_overlay
 from generation_utils import (
     enable_inference_optimizations,
     load_model_and_setup,
@@ -77,28 +75,6 @@ from generation_metrics import (
     analyze_generation_quality, calculate_attention_correlation_from_similarity,
     print_detailed_step_analysis, compare_generation_configs, analyze_top_k_impact
 )
-
-"""
-todo: it seems that the more we increase the bias strength, the more the model confidence increases in the right direction, for example:
-Bias 1.67::
-Step 6: 'ceiling' | Confidence: 0.035 | Entropy: 3.536
-  Top alternatives:
-    1. 'ceiling' (p=0.295)
-    2. 'camera' (p=0.260)
-    3. 'man' (p=0.245)
-
-Bias 3.89::
-Step 6: 'man' | Confidence: 0.232 | Entropy: 2.832
-  Top alternatives:
-    1. 'man' (p=0.558)
-    2. 'camera' (p=0.289)
-    3. 'photographer' (p=0.065)
-
-This only works for hidden state-based embedding (and not the raw image embeddings) ->
-Maybe, we can try using the image embeddings after the projections
-
-todo: during the end of sweep, we need to find the best bias strength with the highest score
-"""
 
 
 # Set device

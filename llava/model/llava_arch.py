@@ -14,6 +14,7 @@
 
 
 from abc import ABC, abstractmethod
+from typing import List, Optional
 
 import math
 import re
@@ -249,7 +250,18 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
+    def prepare_inputs_labels_for_multimodal(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        past_key_values,
+        labels,
+        images,
+        modalities=["image"],
+        image_sizes=None,
+        image_token_filter_indices: Optional[List[int]] = None,
+    ):
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -257,6 +269,35 @@ class LlavaMetaForCausalLM(ABC):
 
         if isinstance(modalities, str):
             modalities = [modalities]
+
+        def _normalize_filter_indices(value) -> Optional[List[int]]:
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                flat = value.detach().cpu().view(-1).tolist()
+            elif isinstance(value, (list, tuple, set)):
+                flat = list(value)
+            else:
+                flat = [value]
+            normalized: List[int] = []
+            for idx in flat:
+                try:
+                    normalized.append(int(idx))
+                except Exception:
+                    continue
+            normalized = sorted(set([i for i in normalized if i >= 0]))
+            return normalized or None
+
+        def _apply_image_token_filter(feature_tensor: torch.Tensor, allowed_indices: Optional[List[int]]) -> torch.Tensor:
+            if not allowed_indices:
+                return feature_tensor
+            filter_tensor = torch.as_tensor(allowed_indices, device=feature_tensor.device, dtype=torch.long)
+            valid = filter_tensor[(filter_tensor >= 0) & (filter_tensor < feature_tensor.shape[0])]
+            if valid.numel() == 0:
+                return feature_tensor
+            return feature_tensor.index_select(0, valid)
+
+        normalized_filter_indices = _normalize_filter_indices(image_token_filter_indices)
 
         # import pdb; pdb.set_trace()
         if type(images) is list or images.ndim == 5:
@@ -484,6 +525,7 @@ class LlavaMetaForCausalLM(ABC):
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
                         label_type = IGNORE_INDEX
+                    cur_image_features = _apply_image_token_filter(cur_image_features, normalized_filter_indices)
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), label_type, device=cur_labels.device, dtype=cur_labels.dtype))

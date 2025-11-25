@@ -69,6 +69,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         self.model = LlavaQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.latest_person_mask_repr: Optional[torch.Tensor] = None
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -119,6 +120,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         kwargs: Dict[str, Any],
     ) -> bool:
         """Apply mask embedding injections into the token representations if requested."""
+        self.latest_person_mask_repr = None
         if inputs_embeds is None or not isinstance(boost_positions, dict):
             return False
 
@@ -204,6 +206,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 boost_positions["gaze_source"] = gaze_source_targets
 
             gaze_source_targets += _normalize_positions(source_insert_targets)
+            self.latest_person_mask_repr = person_mask_repr.detach()
             updated = True
 
         if mask_hidden_state_target is not None and has_target_tokens:
@@ -250,12 +253,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         pixel_coords_for_attention: Optional[List[Tuple[int, int]]] = None, # New parameter
         **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
+        self.latest_person_mask_repr = None
         ids_to_attend_pixels = []
         original_input_ids = input_ids # Save before potential modification
         # original_attention_mask = attention_mask # Keep a reference if needed
         final_ids_to_attend = kwargs.get("boost_positions" , None)
         mask_logic_applied = False
+        image_token_filter_indices = kwargs.pop("image_token_filter_indices", None)
 
         if inputs_embeds is None:
             if images is not None and image_sizes is not None:
@@ -269,7 +273,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         labels=labels,
                         images=images,
                         modalities=modalities,
-                        image_sizes=image_sizes
+                        image_sizes=image_sizes,
+                        image_token_filter_indices=image_token_filter_indices,
                     )
 
                 if kwargs.get("target_mask_embedding", None) is not None:
@@ -286,12 +291,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     self.prepare_inputs_labels_for_multimodal(
                         input_ids=input_ids,
                         position_ids=position_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    labels=labels,
-                    images=images,
-                    modalities=modalities,
-                    image_sizes=image_sizes
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        labels=labels,
+                        images=images,
+                        modalities=modalities,
+                        image_sizes=image_sizes,
+                        image_token_filter_indices=image_token_filter_indices,
                 )   
 
             # if kwargs.get("target_tokens", 0) == 2:
@@ -339,8 +345,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # Only build custom mask if final_ids_to_attend is populated and token indexing information is available.
         tokens_indexing = getattr(self, "tokens_indexing", None)
         image_index_list = None
-        if isinstance(tokens_indexing, dict):
+        if isinstance(tokens_indexing, dict) and tokens_indexing.get("insert_embd", None) is not None:
             image_index_list = tokens_indexing.get("image")
+            source = tokens_indexing["insert_embd"].get("source", None)
+            has_gaze_source_indices = source is not None and len(source) > 0
+            target = tokens_indexing["insert_embd"].get("target", None)
+            has_gaze_target_indices = target is not None and len(target) > 0
         has_image_indices = (
             isinstance(image_index_list, list)
             and len(image_index_list) > 0
@@ -353,8 +363,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             final_ids_to_attend = final_ids_to_attend.get("gaze_target", None)
         else:
             source_ids_to_attend = None
-            
-        if can_build_custom_mask and final_ids_to_attend:
+
+        # Gaze Target attention mask             
+        if can_build_custom_mask and final_ids_to_attend is not None and has_gaze_target_indices:
             attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
                 input_embeds=inputs_embeds,
                 inputs_embeds_shape=input_embeds_shape,
@@ -362,8 +373,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 tokens_indexing=tokens_indexing,
                 device=input_device,
                 dtype=input_dtype,
-            )
-        if can_build_custom_mask and source_ids_to_attend is not None:
+            )   
+
+        if can_build_custom_mask and source_ids_to_attend is not None and has_gaze_source_indices:
             # If source_ids_to_attend is provided, we also build a mask for it.
             # This is useful for cases where we want to boost attention to specific tokens.
             source_attention_mask = LlavaQwenForCausalLM._build_custom_attention_mask_static(
@@ -375,8 +387,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dtype=input_dtype,
                 mask_all_image=True,  # Assuming we want to mask all image tokens in the source attention
             )
+            # in case of no target attention mask, we fallback to source_attention_mask
+            if attention_mask is None:
+                attention_mask = source_attention_mask.clone()
+                # source_attention_mask = None
         else:
             source_attention_mask = None
+        
+        # attention_mask = None   # todo: remove once done testing
+        # source_attention_mask = None    # todo: remove once done testing
 
         if inputs_embeds is None and attention_mask is not None and attention_mask.dim() > 2:
             tokens_to_take = 1
@@ -425,7 +444,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
                 # boost_positions=kwargs.get("boost_positions", None),
                 # bias_strength=kwargs.get("bias_strength", None),
-                tokens_indexing=self.tokens_indexing,
+                tokens_indexing=tokens_indexing,
                 # query_indices=kwargs.get("query_indices", None),
                 **kwargs
             )
@@ -492,7 +511,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         The mask allows causal attention for all tokens.
         For the last token, it ONLY allows attention to `ids_to_attend`.
         """
-        batch_size, seq_len, embed_size = inputs_embeds_shape
+        batch_size, seq_len, key_len = inputs_embeds_shape
 
         # Initialize with causal mask properties
         mask = torch.full((seq_len, seq_len), float("0"), device=device, dtype=dtype)
@@ -535,7 +554,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # Qwen2 expects (batch_size, num_heads, query_length, kv_length) or (batch_size, 1, query_length, kv_length)
         # The original code produced [1,1,SL,SL]. We assume batch_size is handled by broadcasting if this is [1,1,SL,SL]
         # or we make it [B,1,SL,SL]
-        return mask.unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+        mask = mask.unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+        if key_len == 1:
+            mask = mask[:, :, -1:, :]  # (B, 1, SL, 1)
+        return mask
 
 
 AutoConfig.register("llava_qwen", LlavaQwenConfig)

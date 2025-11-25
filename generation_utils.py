@@ -531,7 +531,7 @@ def load_model_and_setup(
     attn_implementation: str = "sdpa",
     load_4bit: bool = False,
     load_8bit: bool = False,
-    attn_layer_ind: int = -1,
+    attn_layer_ind: int = 23,
     model_base: Optional[str] = None,
     adapter_path: Optional[str] = None
 ) -> Tuple[PreTrainedTokenizer, PreTrainedModel, SigLipImageProcessor, int]:
@@ -892,7 +892,7 @@ def _create_person_mask_from_bbox(
     image_size: Tuple[int, int],
     bbox: Tuple[float, float, float, float],
     *,
-    scale: float = 1.,
+    scale: float = 0.5,
 ) -> np.ndarray:
     """Create a binary mask covering the provided head bounding box.
 
@@ -1576,7 +1576,7 @@ def _prepare_configs(generation_config: Optional[Dict], attention_config: Option
         "create_collage": True,
         "collage_grid_rows": 3,
         "collage_grid_cols": 4,
-        "visualize_attn_overlays": False,
+        "visualize_attn_overlays": True,
         "save_tensors": False
     }
 
@@ -1659,6 +1659,7 @@ def _prepare_inputs(
     gt_gaze_mask_radius: Optional[int] = None,
     gt_gaze_mask_radius_ratio: float = 0.02,
     insert_image_token: bool = True,
+    same_mask_for_person: bool = False,
 ) -> Tuple[Any, Any, torch.Tensor, List, List[int], Any, torch.Tensor]:
     """Load and prepare image, mask, and input tensors.
 
@@ -1733,6 +1734,10 @@ def _prepare_inputs(
     if not person_mask_from_gt and Path(person_mask_path).exists():
         person_mask = load_mask_from_file(person_mask_path)
 
+    if same_mask_for_person:
+        print("Using the same mask for person and target")
+        person_mask = np.copy(mask) if mask is not None else None
+
     if person_mask is not None:
         person_mask_raw = np.copy(person_mask)
 
@@ -1780,6 +1785,8 @@ def _prepare_inputs(
             apply_for_anyres_patches=False
         )
     print(f"Initial attention indices: {len(atten_indices)} tokens")
+    print(f"Target mask available: {target_mask is not None}")
+    print(f"Person mask available: {person_mask is not None}")
     masks = {
         'target_mask': target_mask,
         'person_mask': person_mask,
@@ -1906,6 +1913,8 @@ def _extract_and_process_attention(
         return None, None
 
     attentions = outputs.attentions
+    if len(attentions) == 0:
+        return None, None
     selected_attentions = attentions[0][0].squeeze(0)  # Remove batch dimension
     avg_attentions = selected_attentions.mean(dim=0)  # Average across heads
 
@@ -2257,9 +2266,10 @@ def create_experiment_config(
     gt_gaze_mask_radius_ratio: float = 0.02,
     save_mask_overlays: bool = False,
     mask_overlay_alpha: float = 0.4,
+    include_image_inputs: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Build base experiment config dict for bias sweep."""
-    return {
+    config: Dict[str, Any] = {
         "image_path": str(image_path),
         "mask_path": str(mask_path),
         "prompt": prompt,
@@ -2273,6 +2283,9 @@ def create_experiment_config(
         "save_mask_overlays": save_mask_overlays,
         "mask_overlay_alpha": mask_overlay_alpha,
     }
+    if include_image_inputs is not None:
+        config["include_image_inputs"] = include_image_inputs
+    return config
 
 def save_image_results(
     results: Dict[str, Any],
@@ -2513,6 +2526,7 @@ def initialize_generation_state(
         "set_layer_image_embeddings": None,  # Store embeddings from first step for reuse
         "all_correlation_metrics": [],
         "person_mask_correlation_metrics": [],
+        "person_mask_similarity_overlays": [],
         "apply_only_target_mask": False
     }
 
@@ -2674,6 +2688,98 @@ def create_similarity_visualization(
         return None
 
 
+def create_cls_similarity_visualizations_per_layer(
+    set_layer_image_embeddings: Optional[torch.Tensor],
+    all_hidden_states: Optional[List[torch.Tensor]],
+    model: "PreTrainedModel",
+    image: Image.Image,
+    grid_size: int,
+    similarity_output_dir: Path,
+    step: int,
+    iteration_label: str = "iter2",
+    cls_token_position: int = 0,
+    save_files: bool = True,
+) -> Dict[int, np.ndarray]:
+    """
+    Create similarity maps between the image embeddings and the CLS token representation
+    from every hidden layer. This is primarily used for the second decoding iteration in
+    extract_attention_direct_gt_masks.py where we compare the cached image embeddings
+    against all hidden-layer CLS activations (28 for Qwen2).
+
+    Args:
+        set_layer_image_embeddings: Image embeddings captured during the first decoding step.
+        all_hidden_states: List of hidden states (one tensor per layer) captured previously.
+        model: Language model used for embedding projection.
+        image: Original PIL image for visualization overlays.
+        grid_size: Patch grid dimension (e.g., 27 for a 27x27 map).
+        similarity_output_dir: Directory to store similarity visualizations.
+        step: Current decoding step index.
+        iteration_label: Text label added to filenames to distinguish iterations.
+        cls_token_position: Index to treat as CLS token within the sequence.
+        save_files: Whether to persist the generated overlays to disk.
+
+    Returns:
+        Dictionary mapping layer index to the computed similarity map.
+    """
+    if set_layer_image_embeddings is None or not all_hidden_states:
+        return {}
+
+    try:
+        similarity_output_dir = Path(similarity_output_dir)
+        similarity_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Convert cached image embeddings into token space once for reuse.
+        converted_token_ids = torch.argmax(
+            model.get_output_embeddings()(set_layer_image_embeddings),
+            dim=-1,
+        )
+        converted_image_embeddings = model.get_model().embed_tokens(converted_token_ids)
+
+        cls_similarity_maps: Dict[int, np.ndarray] = {}
+        safe_iter_label = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in iteration_label) or "iter"
+
+        for layer_idx, hidden_state in enumerate(all_hidden_states):
+            if hidden_state is None:
+                continue
+
+            layer_hidden = hidden_state
+            if layer_hidden.dim() == 3:
+                # Handle tensors that still carry a batch dimension.
+                if layer_hidden.shape[0] == 1:
+                    layer_hidden = layer_hidden.squeeze(0)
+                else:
+                    layer_hidden = layer_hidden[0]
+
+            if layer_hidden.dim() != 2:
+                continue
+
+            cls_idx = cls_token_position if cls_token_position >= 0 else layer_hidden.size(0) + cls_token_position
+            if cls_idx < 0 or cls_idx >= layer_hidden.size(0):
+                continue
+
+            cls_embedding = layer_hidden[cls_idx].to(
+                device=converted_image_embeddings.device,
+                dtype=converted_image_embeddings.dtype,
+            )
+            file_name = f"similarity_{safe_iter_label}_step{step:03d}_layer{layer_idx:02d}_cls.png"
+            sim_path = similarity_output_dir / file_name
+
+            similarity_map = visualize_embedding_similarity(
+                text_token_embedding=cls_embedding,
+                image_token_embeddings=converted_image_embeddings,
+                original_image=image,
+                grid_size=grid_size,
+                output_path=sim_path,
+                save_file=save_files,
+            )
+            cls_similarity_maps[layer_idx] = similarity_map
+
+        return cls_similarity_maps
+    except Exception as e:
+        print(f"Warning: Failed to create CLS similarity visualizations: {e}")
+        return {}
+
+
 def calculate_correlation_metrics(
     state: Dict[str, Any],
     input_masks: Dict[str, Any],
@@ -2821,6 +2927,7 @@ def create_generation_results(
         "attention_correlation": generation_summary.get("average_attention_correlation", {}) if generation_summary else {},
         "person_mask_correlation": state["person_mask_correlation_metrics"],
         "target_mask_correlation": state["all_correlation_metrics"],
+        "person_mask_similarity_overlays": state.get("person_mask_similarity_overlays", []),
         "step_metrics": state["all_step_metrics"],
         "first_step_hidden_state": state["first_step_hidden_state"],
         "first_step_all_hidden_states": state.get("first_step_all_hidden_states"),
