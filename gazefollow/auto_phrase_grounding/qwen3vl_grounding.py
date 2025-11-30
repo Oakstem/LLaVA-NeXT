@@ -245,8 +245,8 @@ def run_qwen3vl_grounding(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen3-VL grounding detection")
-    parser.add_argument("--image-path", type=str, default="/mnt/d/Projects/data/gazefollow/train/00000065/00065874.jpg", help="Path to input image")
-    parser.add_argument("--query", type=str, default="Locate the wooden planks, output its bbox coordinates using JSON format.", help="Detection query")
+    parser.add_argument("--image-path", type=str, default="/galitylab/students/alonmardi/gazefollow/train/00000093/00093143.jpg", help="Path to input image")
+    parser.add_argument("--query", type=str, default="Locate the 'woman who’s walking towards the camera, wearing a vibrant red dress and heels, looking over her shoulder with a smile', output its bbox coordinates using JSON format.", help="Detection query")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen3-VL-4B-Instruct", help="Model ID")
     parser.add_argument("--max-new-tokens", type=int, default=300, help="Max tokens to generate")
     parser.add_argument("--output-json", type=str, default=None, help="Optional path to save detections as JSON")

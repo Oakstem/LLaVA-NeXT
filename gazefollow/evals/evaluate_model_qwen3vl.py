@@ -1557,6 +1557,9 @@ def main():
     if args.log_to_wandb:
         try:
             scalar_metrics, non_scalar_metrics = split_metrics(final_metrics)
+            # print scalar_metrics, non_scalar_metrics
+            print("Scalar metrics:", scalar_metrics)
+            print("Non-scalar metrics:", non_scalar_metrics)
             wandb_run_instance = ensure_wandb_run()
             if wandb_run_instance is None:
                 if wandb_disabled_reason is None:
