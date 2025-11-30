@@ -30,7 +30,7 @@ from llava.utils import disable_torch_init
 from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres, _pixel_to_token_indices_helper_anyres_inference
 
 # Import our enhanced generation metrics
-from generation_metrics import (
+from gazefollow.generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
     generate_next_token_with_evaluation, create_generation_summary,
     analyze_generation_quality, calculate_attention_correlation_from_similarity
@@ -38,6 +38,9 @@ from generation_metrics import (
 
 BASE_IMAGE_GRID_SIZE = 27  # Corresponds to the 27x27 base image tokens (729 total)
 BASE_IMAGE_TOKEN_START_INDEX = 14  # Matches _pixel_to_token_indices_helper_anyres default
+DEFAULT_GT_GAZE_CSV = Path(__file__).resolve().parent / "data" / "train_annotations_release.csv"
+_GT_ANNOTATION_LOOKUP_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_GT_ANNOTATION_USE_BODY_BBOX: bool = False
 
 def enable_inference_optimizations() -> None:
     """Enable tf32 and other CUDA optimizations for faster inference"""
@@ -680,12 +683,6 @@ def load_mask_from_file(mask_path: Union[str, Path]) -> np.ndarray:
         mask = mask_data
 
     return mask
-
-
-DEFAULT_GT_GAZE_CSV = Path(__file__).resolve().parent / "gazefollow" / "data" / "train_annotations_release.csv"
-_GT_ANNOTATION_LOOKUP_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
-_GT_ANNOTATION_USE_BODY_BBOX: bool = False
-
 
 def _normalize_gt_gaze_keys(raw_key: Any) -> List[str]:
     """Create a set of lookup keys for CSV rows to maximize match robustness."""
