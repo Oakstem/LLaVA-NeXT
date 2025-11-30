@@ -63,6 +63,7 @@ from generation_utils import (
     calculate_correlation_metrics,
     update_generation_state,
     create_generation_results,
+    set_gt_annotation_lookup_use_body_bbox,
 )
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
@@ -182,6 +183,7 @@ def run_generation_with_attention(
                 "boost_positions": boost_positions,
                 "bias_strength": bias_strength,
                 "query_indices": attn_config.get("query_indices", None),
+                "repr_layer_idx": attn_config.get("repr_layer_idx", None),
                 "target_mask_embedding": prev_run_last_hidden_state,
                 "base_image_token_inds": [image_token_start_index_in_llm, image_token_start_index_in_llm + num_patches],
                 "input_masks": input_masks,
@@ -849,7 +851,12 @@ if __name__ == '__main__':
     parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks\gaze__00000032_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
-    parser.add_argument('--prompt', type=str, default="The _ is looking at _ . Where is the _ person looking?", help="Input prompt.")
+    # parser.add_argument('--prompt', type=str, default="The _ is looking at _ . Where is the _ person looking?", help="Input prompt.")
+    parser.add_argument('--prompt', type=str, default="Complete the sentence in the following format, examples: " \
+                                                      "a guy on the left → a guy who’s sitting on a bench wearing a gray hoodie. " \
+                                                      "a woman in the center → a woman who’s standing and holding her phone. " \
+                                                      "a man in the back → a man who’s talking to someone and wearing a black jacket. " \
+                                                      "The sentence: a _ → ", help="Input prompt.")
     # parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
     # " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \
     # "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
@@ -867,6 +874,8 @@ if __name__ == '__main__':
     parser.add_argument('--skip_first', type=int, default=0, help="Skip the first X images in the dataset (applied after filtering and sorting).")
     parser.add_argument('--sgl_conversation_path', type=str, default='sgl_conversation_data.json', help="Path to SGL conversation data JSON file for filtering already processed images.")
     parser.add_argument('--save_debug_files', action='store_true', default=False, help="Save debug files during generation.")
+    parser.add_argument('--use-body-bbox', action='store_true', default=False,
+                        help="Use normalized body bounding boxes from the GT CSV instead of head boxes when creating person masks.")
 
     # --- Bias Sweep Arguments ---
     parser.add_argument('--bias_min', type=float, default=1., help="Minimum bias strength for the sweep.")
@@ -883,6 +892,7 @@ if __name__ == '__main__':
     parser.add_argument('--show_resume_examples', action='store_true', help="Show usage examples for resume functionality and exit.")
 
     args = parser.parse_args()
+    set_gt_annotation_lookup_use_body_bbox(args.use_body_bbox)
 
     model_path = fix_wsl_paths(args.model_path)
     adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None

@@ -225,7 +225,8 @@ def _pixel_to_token_indices_helper_anyres_inference(
     resizes the image while preserving aspect ratio, pads it to the target canvas, splits
     that canvas into ``final_patch_division_size`` (e.g. 384) crops, encodes each crop with a
     ViT of ``patch_size`` (e.g. 14), then flattens the resulting token grid row-wise while
-    inserting a newline token after every row. The very first tokens correspond to the base
+    inserting a newline token after every row. With ``spatial_unpad`` the padded tokens are
+    removed before the newline column is added. The very first tokens correspond to the base
     image that is resized directly to ``final_patch_division_size``.
     """
     original_w, original_h = original_image_size
@@ -245,18 +246,15 @@ def _pixel_to_token_indices_helper_anyres_inference(
         scaled_h = best_h
         scaled_w = min(int(math.ceil(original_w * scale_h_factor)), best_w)
 
-    pad_left = max((best_w - scaled_w) // 2, 0)
-    pad_top = max((best_h - scaled_h) // 2, 0)
-
-    # Token-grid bookkeeping
+    # Token-grid bookkeeping (matches spatial_unpad merge)
     tokens_per_patch_side = max(final_patch_division_size // patch_size, 1)
     base_patch_tokens = tokens_per_patch_side ** 2
-    num_width_patches = max(int(math.ceil(best_w / final_patch_division_size)), 1)
-    num_height_patches = max(int(math.ceil(best_h / final_patch_division_size)), 1)
-    width_tokens = num_width_patches * tokens_per_patch_side
-    height_tokens = num_height_patches * tokens_per_patch_side
-    anyres_row_stride = width_tokens + 1  # +1 for the newline token appended per row
     anyres_base_offset = image_token_start_index_in_embeds + base_patch_tokens
+
+    # Tokens that survive unpadding (derived from the resized, pre-pad image)
+    unpadded_width_tokens = max(int(math.ceil(scaled_w / patch_size)), 1)
+    unpadded_height_tokens = max(int(math.ceil(scaled_h / patch_size)), 1)
+    anyres_row_stride = unpadded_width_tokens + 1  # +1 for newline token appended per row
 
     token_indices = set()
     resized_mask = np.zeros(
@@ -276,26 +274,12 @@ def _pixel_to_token_indices_helper_anyres_inference(
         token_indices.add(int(final_base_idx))
         resized_mask[base_patch_row, base_patch_col] = 1.0
 
-        # Anyres token: map pixel -> scaled (pre-pad) -> padded canvas -> ViT token
+        # Anyres token: map pixel -> scaled (pre-pad), then place on the unpadded grid
         x_scaled = (x_pixel_orig / max(original_w, 1)) * max(scaled_w - 1, 1)
         y_scaled = (y_pixel_orig / max(original_h, 1)) * max(scaled_h - 1, 1)
-        x_padded = np.clip(x_scaled + pad_left, 0, best_w - 1)
-        y_padded = np.clip(y_scaled + pad_top, 0, best_h - 1)
 
-        # Determine patch-aligned token coordinates within the concatenated grid
-        patch_col = int(x_padded // final_patch_division_size)
-        patch_row = int(y_padded // final_patch_division_size)
-        patch_col = min(patch_col, num_width_patches - 1)
-        patch_row = min(patch_row, num_height_patches - 1)
-        token_col_within_patch = int((x_padded % final_patch_division_size) // patch_size)
-        token_row_within_patch = int((y_padded % final_patch_division_size) // patch_size)
-
-        token_col = np.clip(
-            patch_col * tokens_per_patch_side + token_col_within_patch, 0, width_tokens - 1
-        )
-        token_row = np.clip(
-            patch_row * tokens_per_patch_side + token_row_within_patch, 0, height_tokens - 1
-        )
+        token_col = int(np.clip(x_scaled // patch_size, 0, unpadded_width_tokens - 1))
+        token_row = int(np.clip(y_scaled // patch_size, 0, unpadded_height_tokens - 1))
 
         anyres_linear_idx = int(anyres_base_offset + token_row * anyres_row_stride + token_col)
         token_indices.add(anyres_linear_idx)

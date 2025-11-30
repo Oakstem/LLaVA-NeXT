@@ -28,9 +28,6 @@ from llava.constants import (
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.utils import disable_torch_init
 from gazefollow.gazefollow_utils import _pixel_to_token_indices_helper_anyres, _pixel_to_token_indices_helper_anyres_inference
-import traceback
-
-from llava.model.llava_arch import unpad_image
 
 # Import our enhanced generation metrics
 from generation_metrics import (
@@ -38,6 +35,9 @@ from generation_metrics import (
     generate_next_token_with_evaluation, create_generation_summary,
     analyze_generation_quality, calculate_attention_correlation_from_similarity
 )
+
+BASE_IMAGE_GRID_SIZE = 27  # Corresponds to the 27x27 base image tokens (729 total)
+BASE_IMAGE_TOKEN_START_INDEX = 14  # Matches _pixel_to_token_indices_helper_anyres default
 
 def enable_inference_optimizations() -> None:
     """Enable tf32 and other CUDA optimizations for faster inference"""
@@ -276,13 +276,8 @@ def decode_embeddings_to_text(
         }
         
         for j, (sim_score, token_idx) in enumerate(zip(top_k_similarities, top_k_indices)):
-            try:
-                token_text = tokenizer.decode([token_idx.item()], skip_special_tokens=True)
-                # Clean up the token text
-                token_text = token_text.strip()
-                if not token_text:
-                    token_text = f"<token_{token_idx.item()}>"
-            except Exception:
+            token_text = tokenizer.decode([token_idx.item()], skip_special_tokens=True).strip()
+            if not token_text:
                 token_text = f"<token_{token_idx.item()}>"
             
             embedding_result["top_tokens"].append({
@@ -587,10 +582,7 @@ def load_model_and_setup(
                 **llava_model_args
             )
 
-        try:
-            from peft import PeftModel
-        except ImportError as exc:
-            raise ImportError("peft must be installed to load LoRA adapters") from exc
+        from peft import PeftModel
 
         print("Loading LoRA adapter weights...")
         # Suppress warnings during adapter loading
@@ -892,7 +884,7 @@ def _create_person_mask_from_bbox(
     image_size: Tuple[int, int],
     bbox: Tuple[float, float, float, float],
     *,
-    scale: float = 0.5,
+    scale: float =1.,
 ) -> np.ndarray:
     """Create a binary mask covering the provided head bounding box.
 
@@ -1040,117 +1032,79 @@ def save_mask_overlay_image(
 
 def calculate_coordinate_mapping(original_img_shape, patch_boxes, patched_final_dim, patched_resized_before_pad_dim, vision_tower):
     """
-    Calculate coordinate mapping from tokens to pixels.
+    Generate a mapping from base image tokens (first 27x27 patches) to their center coordinates.
+
+    This simplified version ignores AnyRes patching details and only returns coordinates for the
+    729 base tokens. Each token is mapped to the center of its corresponding patch in the original
+    image resolution.
+    """
+    if hasattr(original_img_shape, "width") and hasattr(original_img_shape, "height"):
+        img_width, img_height = original_img_shape.width, original_img_shape.height
+    else:
+        img_width, img_height = original_img_shape
+
+    img_width = max(int(img_width), 1)
+    img_height = max(int(img_height), 1)
+
+    grid_size = BASE_IMAGE_GRID_SIZE
+    num_tokens = grid_size * grid_size
+
+    # Align with the helper that produces attention indices.
+    vision_cfg = getattr(vision_tower, "config", None)
+    base_token_start = getattr(vision_cfg, "image_token_start_index", BASE_IMAGE_TOKEN_START_INDEX)
+
+    coordinate_map = np.full((base_token_start + num_tokens, 2), -1, dtype=int)
+    pixel_to_token_indices: Dict[Tuple[int, int], int] = {}
+
+    patch_width = img_width / grid_size
+    patch_height = img_height / grid_size
+
+    for token_offset in range(num_tokens):
+        row = token_offset // grid_size
+        col = token_offset % grid_size
+
+        center_x = int(np.clip(round((col + 0.5) * patch_width), 0, img_width - 1))
+        center_y = int(np.clip(round((row + 0.5) * patch_height), 0, img_height - 1))
+
+        token_idx = base_token_start + token_offset
+        coordinate_map[token_idx] = (center_x, center_y)
+        pixel_to_token_indices[(center_x, center_y)] = token_idx
+
+    return coordinate_map, pixel_to_token_indices
+
+
+def token_indices_to_image_coordinates(
+    token_indices: List[int],
+    coordinate_mapping: Optional[np.ndarray]
+) -> List[Tuple[int, Tuple[int, int]]]:
+    """
+    Convert flattened token indices back to image-space coordinates.
 
     Args:
-        original_img_shape: Original PIL image shape or object with .width and .height
-        patch_boxes: List of patch boxes
-        patched_final_dim: Final dimension after patching (width, height)
-        patched_resized_before_pad_dim: Image size before padding (width, height)
-        vision_tower: Vision tower for getting patch size
+        token_indices: Token indices produced by the tokenizer / vision tower.
+        coordinate_mapping: Flattened map from token index -> (x, y) pixel coordinate.
 
-    AnyRes Processing:
-    1. The image is encoded with ViT to 14-sized patches resulting in a 27x27 grid for every patch
-    2. All patches are concatenated first on every axis, x and y resulting in (N*27)x(M*27) grid for an NxM patch grid
-    3. For every line, an additional newline patch is added to the end of the line resulting with (width*27)x((height*27)+1) grid
-    4. Flatten the grid to a single dimension, resulting in (width*height*27*27 + width*27) tokens
-    5. The base image patches are added to the start of the sequence, resulting in 729+tokens in total
+    Returns:
+        List of (token_index, (x, y)) tuples for valid coordinates.
+        Tokens that map to padded regions (-1 coordinates) are skipped.
     """
-    patch_size = vision_tower.config.patch_size if hasattr(vision_tower.config, 'patch_size') else 14
-    nb_height_patches = patched_final_dim[1] // 384
-    nb_width_patches = patched_final_dim[0] // 384
-    nb_height_tokens = nb_height_patches * (384 // patch_size)
-    nb_width_tokens = nb_width_patches * (384 // patch_size) + 1 # +1 for the newline patch
-    
-    patched_img_scale_x = original_img_shape[0] / patched_resized_before_pad_dim[0]
-    patched_img_scale_y = original_img_shape[1] / patched_resized_before_pad_dim[1]
+    if not token_indices or coordinate_mapping is None:
+        return []
 
-    dummy_img = np.zeros((nb_height_tokens, nb_width_tokens, 3), dtype=np.uint8)
-    unpadded = unpad_image(np.transpose(dummy_img, (2, 0, 1)), original_img_shape)
-    nb_height_tokens, nb_width_tokens = unpadded.shape[1], unpadded.shape[2]
-    # Calculate the number of patches per side
-    token_patch_boxes = []
-    for box in patch_boxes:
-        token_box = [val // patch_size for val in box]
-        # since every anyres patch is 384x384 which is 27x27 tokens, we need to round to 27 multiples
-        token_box[0] = (token_box[0] // 27) * 27
-        token_box[1] = (token_box[1] // 27) * 27
-        token_box[2] = (token_box[2] // 27) * 27
-        token_box[3] = (token_box[3] // 27) * 27
-        token_patch_boxes.append(token_box)
+    results: List[Tuple[int, Tuple[int, int]]] = []
+    max_index = coordinate_mapping.shape[0]
 
-    # now lets build a matrix with the all the patches in token size, where every cell is the coordinate of the center pixel before tokenization
-    coordinate_mat = np.ones((nb_height_tokens, nb_width_tokens, 2), dtype=int)*(-1)
-    for token_box, patch_box in zip(token_patch_boxes, patch_boxes):
-        token2pixel_ratio = patch_box[-1] / token_box[-1]
-        token_inds_in_box_x = np.arange(token_box[0], token_box[2])
-        token_inds_in_box_y = np.arange(token_box[1], token_box[3])
-        for token_idx_y in token_inds_in_box_y:
-            for token_idx_x in token_inds_in_box_x:
-                # Calculate the center pixel of the token box
-                pixel_x_min = int(token_idx_x * token2pixel_ratio)
-                pixel_y_min = int(token_idx_y * token2pixel_ratio)
-
-                # Map to the coordinate matrix
-                coordinate_mat[token_idx_y, token_idx_x] = (pixel_x_min, pixel_y_min)
-
-    # Flatten to make it the same shape as the token sequence
-    coordinate_mat_flat = coordinate_mat.reshape(-1, 2)
-    # scale back to origina image size before resizing
-    coordinate_mat_flat[:, 0] = np.round(coordinate_mat_flat[:, 0] * patched_img_scale_x).astype(int)
-    coordinate_mat_flat[:, 1] = np.round(coordinate_mat_flat[:, 1] * patched_img_scale_y).astype(int)
-    # Clip the coordinate values since the image might be padded, -1 means no image coordinate (since these tokens added as placeholders for every end of line)
-    coordinate_mat_flat[:, 0] = np.clip(coordinate_mat_flat[:, 0], -1, original_img_shape[0] - 1)
-    coordinate_mat_flat[:, 1] = np.clip(coordinate_mat_flat[:, 1], -1, original_img_shape[1] - 1)
-
-    # Insert additional patch at the start of the sequence as placeholder for the base image
-    base_image_patch = np.ones([(384 // patch_size) * (384 // patch_size), 2], dtype=int)*(-1)
-    coordinate_mat_flat = np.insert(coordinate_mat_flat, 0, base_image_patch, axis=0)
-
-    # lets also do an inverse mapping to get the token index from pixel coordinates
-    pixel_to_token_indices = {}
-    for token_idx, (x, y) in enumerate(coordinate_mat_flat):
-        # skip if indices are -1
-        if x == -1 or y == -1:
+    for token_idx in token_indices:
+        if token_idx < 0 or token_idx >= max_index:
             continue
-        # if (x, y) not in pixel_to_token_indices:
-        #     pixel_to_token_indices[(x, y)] = token_idx
 
-        # Calculate all covered pixel coordinates for this token
-        patch_size_scaled = np.round(patch_size*patched_img_scale_x).astype(int)
-        # todo: instead of patch_radius, use the actual (scaled) patch size in pixels
-        covered_coords = []
-        covered_x_indices = np.arange(x, x + patch_size_scaled)
-        covered_y_indices = np.arange(y, y + patch_size_scaled)
-        # remove indices that are out of bounds
-        covered_x_indices = covered_x_indices[(covered_x_indices >= 0) & (covered_x_indices < original_img_shape[0])]
-        covered_y_indices = covered_y_indices[(covered_y_indices >= 0) & (covered_y_indices < original_img_shape[1])]
-        # create all combinations of covered coordinates without a for loop
-        covered_coords = np.array(np.meshgrid(covered_x_indices, covered_y_indices)).T
-        covered_coords = covered_coords.reshape(-1, 2)
+        coord = coordinate_mapping[token_idx]
+        x, y = int(coord[0]), int(coord[1])
+        if x < 0 or y < 0:
+            continue
+        results.append((int(token_idx), (x, y)))
 
-        # Insert all valid coordinates into the dict
-        for coord in covered_coords:
-            coord = tuple(coord)
-            # Append the token index to the list for this coordinate
-            pixel_to_token_indices[coord] = token_idx
-
-
-    # Calculate coverage statistics
-    total_image_pixels = original_img_shape[0] * original_img_shape[1]
-    covered_mask = np.zeros((original_img_shape[1], original_img_shape[0]), dtype=bool)
-    for coord in pixel_to_token_indices.keys():
-        covered_mask[coord[1], coord[0]] = True
-    covered_pixels = np.sum(covered_mask)
-    coverage_percentage = (covered_pixels / total_image_pixels) * 100
-
-    print(f"Image coverage statistics:")
-    print(f"  Total image pixels: {total_image_pixels:,}")
-    print(f"  Covered pixels: {covered_pixels:,}")
-    print(f"  Coverage percentage: {coverage_percentage:.2f}%")
-    
-
-    return coordinate_mat_flat, pixel_to_token_indices
+    return results
 
 def get_attention_indices_from_mask(
     mask: np.ndarray, 
@@ -1533,18 +1487,13 @@ def append_results_to_json(results: Dict[str, Any], output_path: Union[str, Path
     # Read existing data if file exists
     existing_data = []
     if output_path.exists():
-        try:
-            with open(output_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if content:
-                    existing_data = json.loads(content)
-                    if not isinstance(existing_data, list):
-                        # If existing file is not a list, wrap it in a list
-                        existing_data = [existing_data]
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Warning: Could not read existing file {output_path}: {e}")
-            print("Creating new file...")
-            existing_data = []
+        with open(output_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if content:
+                existing_data = json.loads(content)
+                if not isinstance(existing_data, list):
+                    # If existing file is not a list, wrap it in a list
+                    existing_data = [existing_data]
     
     # Append new results
     existing_data.append(serializable_results)
@@ -1576,7 +1525,7 @@ def _prepare_configs(generation_config: Optional[Dict], attention_config: Option
         "create_collage": True,
         "collage_grid_rows": 3,
         "collage_grid_cols": 4,
-        "visualize_attn_overlays": True,
+        "visualize_attn_overlays": False,
         "save_tensors": False
     }
 
@@ -1604,13 +1553,14 @@ def _setup_output_directories(output_dir: Union[str, Path]) -> Tuple[Path, Path,
 def _find_gt_annotation_entry(
     mask_path: Union[str, Path],
     image_path: Union[str, Path],
-    csv_path: Optional[Path]
+    csv_path: Optional[Path],
+    use_body_bbox: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Return the GT annotation entry and the key that matched it."""
     if not csv_path:
         return None, None
 
-    lookup = load_gt_annotation_lookup(csv_path)
+    lookup = load_gt_annotation_lookup(csv_path, use_body_bbox=use_body_bbox)
     if not lookup:
         return None, None
 
@@ -1660,6 +1610,7 @@ def _prepare_inputs(
     gt_gaze_mask_radius_ratio: float = 0.02,
     insert_image_token: bool = True,
     same_mask_for_person: bool = False,
+    use_body_bbox: bool = False,
 ) -> Tuple[Any, Any, torch.Tensor, List, List[int], Any, torch.Tensor]:
     """Load and prepare image, mask, and input tensors.
 
@@ -1688,6 +1639,7 @@ def _prepare_inputs(
             mask_path=mask_path,
             image_path=image_path,
             csv_path=csv_path,
+            use_body_bbox=use_body_bbox,
         )
 
     if gt_annotation_entry and gt_annotation_entry.get("coords"):
@@ -1743,7 +1695,6 @@ def _prepare_inputs(
 
 
     print(f"Image size: {image.size}")
-    print(f"Mask shape: {mask.shape}")
 
 
     # Process image: get tensor of shape [1, C, H, W]
@@ -1759,6 +1710,17 @@ def _prepare_inputs(
     # Move to device and cast to model's dtype
     image_tensor = image_tensor.to(model.device, dtype=model.dtype)
 
+    vision_tower = model.get_vision_tower() if hasattr(model, 'get_vision_tower') else None
+    token_coordinate_mapping: Optional[np.ndarray] = None
+    if vision_tower is not None and patch_boxes is not None:
+        token_coordinate_mapping, _ = calculate_coordinate_mapping(
+            original_img_shape=image.size,
+            patch_boxes=patch_boxes,
+            patched_final_dim=patched_final_dim,
+            patched_resized_before_pad_dim=patched_resized_before_pad_dim,
+            vision_tower=vision_tower
+        )
+
     # Get attention indices from mask
     atten_indices, target_mask = get_attention_indices_from_mask(
         mask=mask,
@@ -1768,7 +1730,7 @@ def _prepare_inputs(
         patched_final_dim=patched_final_dim,
         patch_boxes=patch_boxes,
         patched_resized_before_pad_dim=patched_resized_before_pad_dim,
-        vision_tower=model.get_vision_tower() if hasattr(model, 'get_vision_tower') else None,
+        vision_tower=vision_tower,
         apply_for_anyres_patches=False
     )
     if person_mask is not None:
@@ -1781,12 +1743,20 @@ def _prepare_inputs(
             patched_final_dim=patched_final_dim,
             patch_boxes=patch_boxes,
             patched_resized_before_pad_dim=patched_resized_before_pad_dim,
-            vision_tower=model.get_vision_tower() if hasattr(model, 'get_vision_tower') else None,
+            vision_tower=vision_tower,
             apply_for_anyres_patches=False
         )
     print(f"Initial attention indices: {len(atten_indices)} tokens")
     print(f"Target mask available: {target_mask is not None}")
+    print(f"Target mask indices: {atten_indices}")
+    if token_coordinate_mapping is not None:
+        target_mask_coordinates = token_indices_to_image_coordinates(atten_indices, token_coordinate_mapping)
+        print(f"Target mask coordinates: {target_mask_coordinates}")
+    else:
+        print("Target mask coordinates: unavailable (token mapping not computed)")
     print(f"Person mask available: {person_mask is not None}")
+    print(f"Person mask indices: {person_mask_indices}")
+    
     masks = {
         'target_mask': target_mask,
         'person_mask': person_mask,
@@ -2592,22 +2562,13 @@ def process_hidden_states_and_embeddings(
     if similarity_layer_idx_raw is None:
         similarity_layer_idx_raw = -1
 
-    source_layer_idx = _normalize_layer_idx(capture_layer_idx_raw, "repr_capture_layer_idx")
-    target_layer_idx = _normalize_layer_idx(target_layer_idx_raw, "repr_inject_layer_idx")
+    capture_layer_idx = _normalize_layer_idx(capture_layer_idx_raw, "repr_capture_layer_idx")
     similarity_layer_idx = _normalize_layer_idx(similarity_layer_idx_raw, "repr_layer_idx")
 
     selected_hidden_state = hidden_states[similarity_layer_idx].squeeze(0)
-    source_hidden_state = hidden_states[source_layer_idx].squeeze(0)
-    target_hidden_state = hidden_states[target_layer_idx].squeeze(0)
+    capture_hidden_state = hidden_states[capture_layer_idx].squeeze(0)
     
     if state["image_embeddings"] is None:  # First step only
-        print(f"Extracting representation tokens from hidden layer {target_layer_idx} for injection")
-        # Store the first step hidden state for later output
-        use_multi_layer_repr = (
-            attn_cfg.get("repr_capture_layer_idx") is not None
-            or attn_cfg.get("repr_inject_layer_idx") is not None
-            or source_layer_idx != target_layer_idx
-        )
 
         if store_all_hidden_states:
             # Store every layer output for downstream caching / sweeps
@@ -2615,14 +2576,7 @@ def process_hidden_states_and_embeddings(
                 layer.squeeze(0).detach().cpu() for layer in hidden_states
             ]
 
-        if use_multi_layer_repr:
-            repr_payload: Dict[str, torch.Tensor] = {
-                "source": source_hidden_state,
-                "target": target_hidden_state,
-            }
-            state["first_step_hidden_state"] = repr_payload
-        else:
-            state["first_step_hidden_state"] = selected_hidden_state
+        state["first_step_hidden_state"] = capture_hidden_state
         state["image_embeddings"] = selected_hidden_state[
             image_token_start_index_in_llm : image_token_start_index_in_llm + num_patches
         ]
@@ -2663,29 +2617,25 @@ def create_similarity_visualization(
     """
     if set_layer_image_embeddings is None:
         return None
-        
-    try:
-        safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text) or f"tokenid_{next_token_id.item()}"
-        sim_path = similarity_output_dir / f"similarity_{step:03d}_{safe_token_text}.png"
-        
-        # Convert embeddings to token space for similarity computation
-        tmp_image_embeddings_converted = model.get_model().embed_tokens(
-            torch.argmax(model.get_output_embeddings()(set_layer_image_embeddings), dim=-1)
-        )
-        tmp_text_embedding_converted = model.get_model().embed_tokens(next_token_id).squeeze(0)
-        
-        similarity_map = visualize_embedding_similarity(
-            text_token_embedding=tmp_text_embedding_converted,
-            image_token_embeddings=tmp_image_embeddings_converted,
-            original_image=image,
-            grid_size=grid_size,
-            output_path=sim_path,
-        )
-        
-        return similarity_map
-    except Exception as e:
-        print(f"Warning: Failed to create similarity visualization: {e}")
-        return None
+
+    safe_token_text = "".join(c if c.isalnum() else "_" for c in token_text) or f"tokenid_{next_token_id.item()}"
+    sim_path = similarity_output_dir / f"similarity_{step:03d}_{safe_token_text}.png"
+
+    # Convert embeddings to token space for similarity computation
+    tmp_image_embeddings_converted = model.get_model().embed_tokens(
+        torch.argmax(model.get_output_embeddings()(set_layer_image_embeddings), dim=-1)
+    )
+    tmp_text_embedding_converted = model.get_model().embed_tokens(next_token_id).squeeze(0)
+
+    similarity_map = visualize_embedding_similarity(
+        text_token_embedding=tmp_text_embedding_converted,
+        image_token_embeddings=tmp_image_embeddings_converted,
+        original_image=image,
+        grid_size=grid_size,
+        output_path=sim_path,
+    )
+
+    return similarity_map
 
 
 def create_cls_similarity_visualizations_per_layer(
@@ -2724,60 +2674,56 @@ def create_cls_similarity_visualizations_per_layer(
     if set_layer_image_embeddings is None or not all_hidden_states:
         return {}
 
-    try:
-        similarity_output_dir = Path(similarity_output_dir)
-        similarity_output_dir.mkdir(parents=True, exist_ok=True)
+    similarity_output_dir = Path(similarity_output_dir)
+    similarity_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Convert cached image embeddings into token space once for reuse.
-        converted_token_ids = torch.argmax(
-            model.get_output_embeddings()(set_layer_image_embeddings),
-            dim=-1,
+    # Convert cached image embeddings into token space once for reuse.
+    converted_token_ids = torch.argmax(
+        model.get_output_embeddings()(set_layer_image_embeddings),
+        dim=-1,
+    )
+    converted_image_embeddings = model.get_model().embed_tokens(converted_token_ids)
+
+    cls_similarity_maps: Dict[int, np.ndarray] = {}
+    safe_iter_label = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in iteration_label) or "iter"
+
+    for layer_idx, hidden_state in enumerate(all_hidden_states):
+        if hidden_state is None:
+            continue
+
+        layer_hidden = hidden_state
+        if layer_hidden.dim() == 3:
+            # Handle tensors that still carry a batch dimension.
+            if layer_hidden.shape[0] == 1:
+                layer_hidden = layer_hidden.squeeze(0)
+            else:
+                layer_hidden = layer_hidden[0]
+
+        if layer_hidden.dim() != 2:
+            continue
+
+        cls_idx = cls_token_position if cls_token_position >= 0 else layer_hidden.size(0) + cls_token_position
+        if cls_idx < 0 or cls_idx >= layer_hidden.size(0):
+            continue
+
+        cls_embedding = layer_hidden[cls_idx].to(
+            device=converted_image_embeddings.device,
+            dtype=converted_image_embeddings.dtype,
         )
-        converted_image_embeddings = model.get_model().embed_tokens(converted_token_ids)
+        file_name = f"similarity_{safe_iter_label}_step{step:03d}_layer{layer_idx:02d}_cls.png"
+        sim_path = similarity_output_dir / file_name
 
-        cls_similarity_maps: Dict[int, np.ndarray] = {}
-        safe_iter_label = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in iteration_label) or "iter"
+        similarity_map = visualize_embedding_similarity(
+            text_token_embedding=cls_embedding,
+            image_token_embeddings=converted_image_embeddings,
+            original_image=image,
+            grid_size=grid_size,
+            output_path=sim_path,
+            save_file=save_files,
+        )
+        cls_similarity_maps[layer_idx] = similarity_map
 
-        for layer_idx, hidden_state in enumerate(all_hidden_states):
-            if hidden_state is None:
-                continue
-
-            layer_hidden = hidden_state
-            if layer_hidden.dim() == 3:
-                # Handle tensors that still carry a batch dimension.
-                if layer_hidden.shape[0] == 1:
-                    layer_hidden = layer_hidden.squeeze(0)
-                else:
-                    layer_hidden = layer_hidden[0]
-
-            if layer_hidden.dim() != 2:
-                continue
-
-            cls_idx = cls_token_position if cls_token_position >= 0 else layer_hidden.size(0) + cls_token_position
-            if cls_idx < 0 or cls_idx >= layer_hidden.size(0):
-                continue
-
-            cls_embedding = layer_hidden[cls_idx].to(
-                device=converted_image_embeddings.device,
-                dtype=converted_image_embeddings.dtype,
-            )
-            file_name = f"similarity_{safe_iter_label}_step{step:03d}_layer{layer_idx:02d}_cls.png"
-            sim_path = similarity_output_dir / file_name
-
-            similarity_map = visualize_embedding_similarity(
-                text_token_embedding=cls_embedding,
-                image_token_embeddings=converted_image_embeddings,
-                original_image=image,
-                grid_size=grid_size,
-                output_path=sim_path,
-                save_file=save_files,
-            )
-            cls_similarity_maps[layer_idx] = similarity_map
-
-        return cls_similarity_maps
-    except Exception as e:
-        print(f"Warning: Failed to create CLS similarity visualizations: {e}")
-        return {}
+    return cls_similarity_maps
 
 
 def calculate_correlation_metrics(
@@ -2925,7 +2871,6 @@ def create_generation_results(
         "evaluation_summary": generation_summary,
         "quality_analysis": quality_analysis,
         "attention_correlation": generation_summary.get("average_attention_correlation", {}) if generation_summary else {},
-        "person_mask_correlation": state["person_mask_correlation_metrics"],
         "target_mask_correlation": state["all_correlation_metrics"],
         "person_mask_similarity_overlays": state.get("person_mask_similarity_overlays", []),
         "step_metrics": state["all_step_metrics"],

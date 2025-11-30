@@ -21,7 +21,7 @@
 import inspect
 import math
 import warnings
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -813,6 +813,182 @@ class Qwen2DecoderLayer(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. "
                 "Please make sure use `attention_mask` instead.`"
             )
+
+        bias_strength = kwargs.get("bias_strength", 0.0)
+        if isinstance(bias_strength, torch.Tensor):
+            bias_strength = float(bias_strength.detach().item())
+        elif bias_strength is None:
+            bias_strength = 0.0
+        else:
+            bias_strength = float(bias_strength)
+
+        tokens_indexing = kwargs.get("tokens_indexing", None)
+        has_tokens_indexing_targets = (
+            isinstance(tokens_indexing, dict) and tokens_indexing.get("insert_embd") is not None
+        )
+        boost_positions = (
+            sorted(set(self._flatten_boost_positions(kwargs.get("boost_positions"))))
+            if has_tokens_indexing_targets
+            else []
+        )
+        self.bias_strength = bias_strength
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        if bias_strength and boost_positions:
+            attention_mask = self._inject_attention_bias(
+                attention_mask,
+                hidden_states,
+                past_key_value,
+                boost_positions,
+                bias_strength,
+                tokens_indexing=tokens_indexing,
+            )
+
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            boost_positions=kwargs.get("boost_positions", None),
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
+
+    def _flatten_boost_positions(self, boost_positions) -> List[int]:
+        if boost_positions is None:
+            return []
+        if isinstance(boost_positions, dict):
+            return boost_positions.get("gaze_source", [])
+        return boost_positions
+
+    def _extract_text_row_indices(
+        self,
+        tokens_indexing: Optional[Dict[str, Any]],
+        batch_size: int,
+        q_len: int,
+    ) -> Optional[List[List[int]]]:
+        if not isinstance(tokens_indexing, dict):
+            return None
+
+        text_sources = tokens_indexing.get("text")
+        if text_sources is None:
+            return None
+
+        if torch.is_tensor(text_sources):
+            text_sources = [text_sources]
+
+        if not isinstance(text_sources, (list, tuple)):
+            return None
+
+        row_lists: List[List[int]] = [[] for _ in range(batch_size)]
+        limit = min(batch_size, len(text_sources))
+
+        for batch_idx in range(limit):
+            entry = text_sources[batch_idx]
+            if entry is None:
+                continue
+
+            if torch.is_tensor(entry):
+                entry_values = entry.detach().cpu().tolist()
+            elif isinstance(entry, np.ndarray):
+                entry_values = entry.astype(int).tolist()
+            elif isinstance(entry, (list, tuple)):
+                entry_values = list(entry)
+            else:
+                entry_values = [entry]
+
+            if isinstance(entry_values, (int, float)):
+                entry_values = [entry_values]
+
+            filtered_rows: List[int] = []
+            for idx in entry_values:
+                try:
+                    idx_int = int(idx)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx_int < q_len:
+                    filtered_rows.append(idx_int)
+
+            row_lists[batch_idx] = filtered_rows
+
+        if any(row_lists):
+            return row_lists
+
+        return None
+
+    def _inject_attention_bias(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor]],
+        boost_positions: List[int],
+        bias_strength: float,
+        tokens_indexing: Optional[Dict[str, Any]] = None,
+    ) -> Optional[torch.Tensor]:
+        mask = attention_mask.clone() if attention_mask is not None else None
+        if mask is not None and mask.dim() != 4:
+            return attention_mask
+
+        if mask is not None:
+            kv_seq_len = mask.size(-1)
+        else:
+            q_len = hidden_states.size(1)
+            attn_layer_idx = getattr(self.self_attn, "layer_idx", None)
+            kv_seq_len = q_len + _cached_sequence_length(past_key_value, q_len, attn_layer_idx)
+
+        valid_positions = sorted({pos for pos in boost_positions if 0 <= pos < kv_seq_len})
+        if not valid_positions:
+            return attention_mask
+
+        if mask is None:
+            mask = hidden_states.new_zeros(hidden_states.size(0), 1, hidden_states.size(1), kv_seq_len)
+
+        text_row_lists = self._extract_text_row_indices(tokens_indexing, mask.size(0), mask.size(-2))
+        if mask.shape[2] > 1:
+            text_row_lists = [int(val.item()) for val in tokens_indexing['insert_embd']['source']] + [mask.size(-2) - 1]
+            if text_row_lists is None:
+                mask[..., valid_positions] += bias_strength
+            else:
+                for text_row in text_row_lists:
+                    mask[:, :, text_row, np.array(valid_positions)] += bias_strength
+        else:
+            mask[..., valid_positions] += bias_strength
+
+        return mask
+
+    def forward2(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
+                "Please make sure use `attention_mask` instead.`"
+            )
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -942,7 +1118,7 @@ class Qwen2DecoderLayer(nn.Module):
         return outputs
     
     @staticmethod
-    def _create_bias_positions_attend_to(boost_positions, query_positions, seq_len, abs_indexing=False):
+    def _create_bias_positions_attend_to(boost_positions, query_positions, seq_len, abs_indexing=False, add_last_token=False):
         """Make all positions attend more to boost_positions"""
         bias_positions = []
         range_fn = None
@@ -974,6 +1150,10 @@ class Qwen2DecoderLayer(nn.Module):
         for q_pos in range_fn:
             for boost_pos in boost_positions:
                 bias_positions.append((q_pos, boost_pos))  # All queries -> boost keys
+        if add_last_token:
+            last_token_pos = seq_len - 1
+            for boost_pos in boost_positions:
+                bias_positions.append((last_token_pos, boost_pos))
         # debug print
         # print(f"bias_positions: {bias_positions}")
         return bias_positions

@@ -471,14 +471,14 @@ def create_generation_summary(
         "num_tokens": len(all_step_metrics),
         "average_confidence": avg_confidence,
         "diversity_metrics": diversity_metrics,
-        "confidence_trajectory": {
-            "trend": confidence_trend,
-            "scores": confidence_scores,
-            "entropy_scores": entropy_scores
-        },
+        # "confidence_trajectory": {
+        #     "trend": confidence_trend,
+        #     "scores": confidence_scores,
+        #     "entropy_scores": entropy_scores
+        # },
         "decision_points": decision_points,
         "quality_indicators": quality_indicators,
-        "step_by_step_metrics": all_step_metrics
+        # "step_by_step_metrics": all_step_metrics
     }
 
     if avg_correlation:

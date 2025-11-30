@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from gazefollow.extract_attention_direct_gt_masks import run_generation_with_attention
+from extract_attention_direct_gt_masks import run_generation_with_attention
 from generation_utils import (
     enable_inference_optimizations,
     fix_wsl_paths,
@@ -227,7 +227,7 @@ def main() -> None:
         "image_processor": image_processor,
         "generation_config": generation_config,
         "attention_config": attention_config,
-        "bias_strength": generation_config.get("bias_strength", 2.5),
+        "bias_strength": generation_config.get("bias_strength", 0),
         "use_gaze_guidance": args.use_gaze_guidance,
         "guidance_config": guidance_config,
         "save_debug_files": args.save_debug_files,
@@ -237,6 +237,7 @@ def main() -> None:
         "include_image_inputs": not args.exclude_image_inputs,
         "filter_image_tokens_to_person_mask": False,
         "same_mask_for_person": True,
+        "attention_mask_viz_dir": str(run_dir / "attention_masks"),
     }
 
     prev_hidden_state = None

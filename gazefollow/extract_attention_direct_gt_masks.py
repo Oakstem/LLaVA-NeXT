@@ -49,6 +49,7 @@ from generation_utils import (
     log_generation_step,
     DEFAULT_GT_GAZE_CSV,
     save_mask_overlay_image,
+    _mask_array_to_binary,
     # New gaze guidance functions
     select_token_by_gaze_correlation,
     generate_next_token_with_gaze_guidance,
@@ -67,6 +68,11 @@ from generation_utils import (
     update_generation_state,
     create_generation_results,
     set_gt_annotation_lookup_use_body_bbox,
+)
+from llava.model.language_model.attention_mask_visualizer import (
+    AttentionMaskFrame,
+    capture_attention_mask_frame,
+    save_attention_mask_sequence,
 )
 from repr_layer_token_injection_experiment import run_repr_layer_image_token_injection_experiment
 from generation_metrics import (
@@ -176,6 +182,8 @@ def run_generation_with_attention(
     include_image_inputs: bool = True,
     filter_image_tokens_to_person_mask: bool = False,
     same_mask_for_person: bool = False,
+    attention_mask_viz_dir: Optional[Union[str, Path]] = None,
+    use_body_bbox: bool = False,
 ) -> Dict[str, Any]:
     """
     Run generation with attention extraction and optional gaze guidance.
@@ -204,6 +212,7 @@ def run_generation_with_attention(
         mask_overlay_alpha: Alpha blend to use for overlay visualization
         include_image_inputs: Whether to send image tensors to the model on the first decoding step
         filter_image_tokens_to_person_mask: Restrict image tokens to the person_mask selection when True
+        attention_mask_viz_dir: Directory to store compressed custom attention mask visualizations (optional)
 
     Returns:
         Dictionary containing generation results and analysis
@@ -223,6 +232,15 @@ def run_generation_with_attention(
     (output_dir, vis_output_dir_raw, vis_output_dir_processed, 
      tensor_output_dir, collage_output_dir, similarity_output_dir) = output_directories
     mask_overlay_dir = Path(output_dir) / "mask_overlays"
+    mask_viz_dir: Optional[Path] = None
+    if attention_mask_viz_dir is False:
+        mask_viz_dir = None
+    elif attention_mask_viz_dir:
+        mask_viz_dir = Path(fix_wsl_paths(str(attention_mask_viz_dir))).expanduser().resolve()
+    else:
+        mask_viz_dir = Path(output_dir) / "attention_mask_visualizations"
+    if mask_viz_dir is not None:
+        mask_viz_dir.mkdir(parents=True, exist_ok=True)
 
     # Prepare inputs
     (image, input_masks, image_tensor, image_sizes, atten_indices,
@@ -239,10 +257,28 @@ def run_generation_with_attention(
         gt_gaze_mask_radius_ratio=gt_gaze_mask_radius_ratio,
         insert_image_token=include_image_inputs,
         same_mask_for_person=same_mask_for_person,
+        use_body_bbox=use_body_bbox,
     )
 
     target_mask_raw = input_masks.get('target_mask_raw')
     person_mask_raw = input_masks.get('person_mask_raw')
+
+    person_mask_bbox: Optional[List[float]] = None
+    if person_mask_raw is not None:
+        binary_person_mask = _mask_array_to_binary(person_mask_raw, image.size)
+        if binary_person_mask is not None:
+            coords = np.argwhere(binary_person_mask > 0)
+            if coords.size > 0:
+                y_min = int(coords[:, 0].min())
+                x_min = int(coords[:, 1].min())
+                y_max = int(coords[:, 0].max())
+                x_max = int(coords[:, 1].max())
+                person_mask_bbox = [
+                    float(x_min),
+                    float(y_min),
+                    float(x_max + 1),
+                    float(y_max + 1),
+                ]
 
     overlay_path: Optional[Path] = None
     if save_mask_overlays:
@@ -273,6 +309,15 @@ def run_generation_with_attention(
     # Initialize generation state
     print("Starting generation with attention extraction and advanced evaluation...")
     state = initialize_generation_state(gen_config, tokenizer, input_ids)
+    attention_mask_frames: List[AttentionMaskFrame] = []
+
+    def _pop_mask_snapshot(model_obj: Any) -> Optional[Dict[str, Any]]:
+        getter = getattr(model_obj, "pop_latest_attention_mask_snapshot", None)
+        if getter is None and hasattr(model_obj, "module"):
+            getter = getattr(model_obj.module, "pop_latest_attention_mask_snapshot", None)
+        if callable(getter):
+            return getter()
+        return None
 
     repr_layer_map = None
     repr_capture_layer_idx = None
@@ -318,6 +363,8 @@ def run_generation_with_attention(
                 "target_tokens": state["target_tokens"],
                 "image_token_filter_indices": image_token_filter_indices if include_image_inputs else None,
             }
+            if mask_viz_dir is not None:
+                model_inputs["attention_mask_viz"] = {"capture_only": True}
             if i == 0 and include_image_inputs:
                 model_inputs.update({"images": image_tensor, "image_sizes": image_sizes, "modalities": ["image"]})
 
@@ -353,6 +400,26 @@ def run_generation_with_attention(
                 guidance_config=guidance_config
             )
             state["all_step_metrics"].append(evaluation_metrics)
+
+            if mask_viz_dir is not None:
+                snapshot = _pop_mask_snapshot(model)
+                if snapshot and snapshot.get("mask") is not None:
+                    try:
+                        top_candidates = (
+                            (evaluation_metrics.get("top_k_analysis") or {}).get("candidates")
+                            if isinstance(evaluation_metrics, dict)
+                            else None
+                        )
+                        frame = capture_attention_mask_frame(
+                            attention_mask=snapshot["mask"],
+                            tokens_indexing=snapshot.get("tokens_indexing"),
+                            step_idx=i,
+                            token_text=token_text or f"id_{next_token_id.item()}",
+                            top_candidates=top_candidates,
+                        )
+                        attention_mask_frames.append(frame)
+                    except Exception as exc:
+                        print(f"[ATTN_VIZ] Failed to capture visualization frame for step {i}: {exc}")
             
             # print(f"Step {i+1}: Hidden state -1: mean {outputs.hidden_states[-1].mean().item():.4f}, min {outputs.hidden_states[-1].min().item():.4f}, max {outputs.hidden_states[-1].max().item():.4f}")
             # ## Todo: remove after testing
@@ -437,6 +504,15 @@ def run_generation_with_attention(
 
     if overlay_path:
         results["mask_overlay_path"] = str(overlay_path)
+    if person_mask_bbox is not None:
+        results["person_mask_bbox"] = person_mask_bbox
+    if mask_viz_dir is not None and attention_mask_frames:
+        combined_path = save_attention_mask_sequence(
+            attention_mask_frames,
+            Path(mask_viz_dir) / "attention_mask_sequence.html",
+        )
+        if combined_path:
+            results["attention_mask_visualization"] = str(combined_path)
 
     # Print summary
     print_summary(
