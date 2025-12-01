@@ -17,6 +17,31 @@ from io import BytesIO
 import requests
 import pandas as pd
 
+# Some torch builds don't expose the public pytree registration helpers that
+# recent transformers versions expect. Shim the missing symbols (remove when
+# the environment upgrades torch).
+try:
+    import torch.utils._pytree as _torch_pytree  # type: ignore
+
+    def _maybe_register_alias(public_name: str, private_name: str) -> None:
+        if hasattr(_torch_pytree, public_name):
+            return
+        fallback = getattr(_torch_pytree, private_name, None)
+        if fallback is None:
+            return
+
+        def _compat_wrapper(*args, **kwargs):
+            kwargs.pop("serialized_type_name", None)
+            return fallback(*args, **kwargs)
+
+        setattr(_torch_pytree, public_name, _compat_wrapper)
+
+    _maybe_register_alias("register_pytree_node", "_register_pytree_node")
+    _maybe_register_alias("register_pytree_node_class", "_register_pytree_node_class")
+except Exception:
+    # Skip if torch isn't available yet; the transformers import below will fail anyway.
+    pass
+
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
 from llava.model.builder import load_pretrained_model
