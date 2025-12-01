@@ -53,6 +53,12 @@ def parse_cli_args() -> argparse.Namespace:
         help="Optional upper bound on the number of rows to process.",
     )
     parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="Row index to begin processing from (0-based).",
+    )
+    parser.add_argument(
         "--data-root",
         default=str(DEFAULT_DATA_ROOT),
         help="Root directory of the gazefollow dataset (default: %(default)s).",
@@ -76,7 +82,7 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip rows that already have both source_description fields populated.",
+        help="Skip rows that already have source grounding metrics populated.",
     )
     parser.add_argument(
         "--use-body-bbox",
@@ -204,13 +210,16 @@ def _create_image_task(
     image_path = Path(fix_wsl_paths(str(data_root / rel_image_path))).expanduser()
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found at {image_path}")
-    mask_path = pipeline._resolve_mask_path(  # noqa: SLF001
-        image_path=image_path,
-        explicit_mask=None,
-        mask_dir=mask_dir,
-        mask_template=mask_template,
-        fallback_template=fallback_template,
-    )
+    # The pipeline now relies on GT gaze CSV entries for masks, so simply format the
+    # expected mask path without verifying it exists (it may not be generated).
+    mask_candidates: List[Path] = []
+    mask_dir = mask_dir.expanduser()
+    primary = mask_dir / mask_template.format(stem=image_path.stem)
+    mask_candidates.append(primary)
+    if fallback_template:
+        mask_candidates.append(mask_dir / fallback_template.format(stem=image_path.stem))
+    # Prefer a candidate that contains the gaze prefix to maximize GT CSV lookup hits.
+    mask_path = next((candidate for candidate in mask_candidates if "gaze__" in candidate.name), mask_candidates[0])
     image_id = image_path.stem
     return pipeline.ImageTask(image_path=image_path, mask_path=mask_path, image_id=image_id)
 
@@ -230,6 +239,26 @@ def _extract_best_error(payload: Dict[str, Any]) -> Tuple[Optional[float], Optio
             best_iou = metrics.get("bbox_iou_vs_person")
             best_detection = detection
     return best_error, best_iou, best_detection
+
+
+def _safe_write_csv(df: pd.DataFrame, output_csv: Path, logger: logging.Logger, reason: str) -> bool:
+    try:
+        df.to_csv(output_csv, index=False)
+    except OSError as error:
+        logger.warning("Failed to write CSV (%s) at %s due to %s. Will retry later.", reason, output_csv, error)
+        return False
+    except Exception as error:  # noqa: BLE001
+        logger.warning("Unexpected error while writing CSV (%s) at %s: %s", reason, output_csv, error)
+        return False
+    return True
+
+
+def _has_valid_metric(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return not pd.isna(value)
 
 
 def main() -> None:
@@ -266,7 +295,32 @@ def main() -> None:
 
     df = pd.read_csv(queue_csv)
     total_rows = len(df)
-    limit = min(cli_args.limit, total_rows) if cli_args.limit else total_rows
+    start_index = max(cli_args.start_index, 0)
+    if total_rows == 0:
+        logger.info("Queue CSV is empty. Nothing to process.")
+        return
+    if start_index >= total_rows:
+        logger.warning("Start index %d is beyond available rows (%d). Nothing to process.", start_index, total_rows)
+        return
+    if cli_args.limit is not None:
+        requested_limit = max(cli_args.limit, 0)
+        stop_index = min(total_rows, start_index + requested_limit)
+    else:
+        stop_index = total_rows
+    rows_to_process = stop_index - start_index
+    if rows_to_process <= 0:
+        logger.warning(
+            "No rows remaining to process after applying start index (%d) and limit (%s).",
+            start_index,
+            cli_args.limit,
+        )
+        return
+    logger.info(
+        "Processing %d row(s) from indices %d (inclusive) to %d (exclusive).",
+        rows_to_process,
+        start_index,
+        stop_index,
+    )
     success_count = 0
     skipped_count = 0
 
@@ -274,19 +328,22 @@ def main() -> None:
     results: List[Dict[str, Any]] = []
 
     for idx, row in df.iterrows():
-        if idx >= limit:
+        if idx < start_index:
+            continue
+        if idx >= stop_index:
             break
-        source_desc = row.get("source_description")
-        steered_desc = row.get("steered_source_description")
-        if cli_args.skip_existing and isinstance(source_desc, str) and source_desc.strip() and isinstance(steered_desc, str) and steered_desc.strip():
+        progress_prefix = f"[{idx - start_index + 1}/{rows_to_process}]"
+        has_iou = _has_valid_metric(row.get("source_grounding_bbox_iou"))
+        has_error = _has_valid_metric(row.get("source_grounding_normalized_l2_error"))
+        if cli_args.skip_existing and has_iou and has_error:
             skipped_count += 1
-            logger.info("[%d/%d] Row %d already populated. Skipping.", idx + 1, limit, idx)
+            logger.info("%s Row %d already has grounding metrics. Skipping.", progress_prefix, idx)
             continue
 
         rel_image_path = _select_image_path(row)
         if not rel_image_path:
             skipped_count += 1
-            logger.warning("[%d/%d] Missing image path for row %d.", idx + 1, limit, idx)
+            logger.warning("%s Missing image path for row %d.", progress_prefix, idx)
             continue
         task = _create_image_task(
             rel_image_path=rel_image_path,
@@ -296,7 +353,7 @@ def main() -> None:
             fallback_template=pipeline_args.mask_fallback_template,
         )
 
-        logger.info("[%d/%d] Processing %s", idx + 1, limit, task.image_id)
+        logger.info("%s Processing %s", progress_prefix, task.image_id)
         payload = pipeline.process_image_task(
             task,
             args=pipeline_args,
@@ -321,12 +378,7 @@ def main() -> None:
         best_error, best_iou, best_detection = _extract_best_error(payload)
         if best_error is None:
             skipped_count += 1
-            logger.info(
-                "[%d/%d] %s returned no detections. Skipping update.",
-                idx + 1,
-                limit,
-                task.image_id,
-            )
+            logger.info("%s %s returned no detections. Skipping update.", progress_prefix, task.image_id)
             continue
         df.at[idx, "source_grounding_normalized_l2_error"] = best_error
         df.at[idx, "source_grounding_bbox_iou"] = best_iou
@@ -342,23 +394,21 @@ def main() -> None:
 
             success_count += 1
             logger.info(
-                "[%d/%d] ACCEPTED %s (normalized L2=%.4f, IoU=%s). Stored query: %s",
-                idx + 1,
-                limit,
+                "%s ACCEPTED %s (normalized L2=%.4f, IoU=%s). Stored query: %s",
+                progress_prefix,
                 task.image_id,
                 best_error,
                 f"{best_iou:.4f}" if best_iou is not None else "None",
                 query_text,
             )
             if success_count % 5 == 0:
-                df.to_csv(output_csv, index=False)
+                _safe_write_csv(df, output_csv, logger, "checkpoint")
                 logger.info("Checkpoint save after %d successes to %s", success_count, output_csv)
         else:
             skipped_count += 1
             logger.info(
-                "[%d/%d] REJECTED %s (normalized L2=%.4f >= %.4f, IoU=%s).",
-                idx + 1,
-                limit,
+                "%s REJECTED %s (normalized L2=%.4f >= %.4f, IoU=%s).",
+                progress_prefix,
                 task.image_id,
                 best_error,
                 cli_args.threshold,
@@ -373,8 +423,10 @@ def main() -> None:
                     gt_bbox,
                 )
 
-    df.to_csv(output_csv, index=False)
-    logger.info("Saved updated CSV to %s", output_csv)
+    if _safe_write_csv(df, output_csv, logger, "final"):
+        logger.info("Saved updated CSV to %s", output_csv)
+    else:
+        logger.warning("Failed to save final CSV to %s. Results will be retried on the next run.", output_csv)
     summary_path = output_dir / "queue_processing_summary.json"
     pipeline.save_json(
         {

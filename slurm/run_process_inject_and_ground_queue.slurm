@@ -13,10 +13,11 @@
 PROJECT_ROOT="/galitylab/students/alonmardi/projects/LLaVA-NeXT"
 
 # Queue processor configuration
-QUEUE_CSV="${QUEUE_CSV:-$PROJECT_ROOT/gazefollow/data/inject_and_ground_queue.csv}"
+QUEUE_CSV="${QUEUE_CSV:-$PROJECT_ROOT/gazefollow/data/combined_description_results.csv}"
 OUTPUT_CSV="${OUTPUT_CSV:-}"
 THRESHOLD="${THRESHOLD:-0.16}"
 LIMIT="${LIMIT:-}"
+START_INDEX="${START_INDEX:-0}"
 DATA_ROOT="${DATA_ROOT:-/galitylab/students/alonmardi/gazefollow}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 MASK_DIR="${MASK_DIR:-/galitylab/students/alonmardi/gazefollow/train_gaze_segmentations/small_masks/small_masks}"
@@ -41,6 +42,7 @@ echo "  Queue CSV: $QUEUE_CSV"
 echo "  Output CSV: ${OUTPUT_CSV:-<in-place>}"
 echo "  Threshold: $THRESHOLD"
 echo "  Limit: ${LIMIT:-<no limit>}"
+echo "  Start Index: $START_INDEX"
 echo "  Data Root: $DATA_ROOT"
 echo "  Output Dir: ${OUTPUT_DIR:-<auto timestamp>}"
 echo "  Mask Dir: ${MASK_DIR:-<pipeline default>}"
@@ -107,6 +109,7 @@ ARGS=(
     "--queue-csv" "$QUEUE_CSV"
     "--threshold" "$THRESHOLD"
     "--data-root" "$DATA_ROOT"
+    "--start-index" "$START_INDEX"
 )
 
 if [ -n "$OUTPUT_CSV" ]; then
