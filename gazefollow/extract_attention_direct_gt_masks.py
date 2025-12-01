@@ -74,7 +74,7 @@ from llava.model.language_model.attention_mask_visualizer import (
     capture_attention_mask_frame,
     save_attention_mask_sequence,
 )
-from repr_layer_token_injection_experiment import run_repr_layer_image_token_injection_experiment
+from gazefollow.repr_layer_token_injection_experiment import run_repr_layer_image_token_injection_experiment
 from generation_metrics import (
     ConfidenceMetrics, RepetitivityMetrics, TopKCandidateEvaluator,
     generate_next_token_with_evaluation, create_generation_summary,
