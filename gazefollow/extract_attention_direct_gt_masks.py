@@ -81,8 +81,31 @@ from generation_metrics import (
     analyze_generation_quality, calculate_attention_correlation_from_similarity,
     print_detailed_step_analysis, compare_generation_configs, analyze_top_k_impact
 )
+DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
+a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans sitting on a worn wooden bench.  
+a chic woman in a beige coat → a woman in a beige coat and ankle boots holding a phone.  
+a techy man in a leather jacket → a man in a black leather jacket and glasses.  
+a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans carrying a tan shoulder bag.
 
+The sentence: a _ → """
+DEFAULT_TARGET_PROMPT = """Complete the sentence in the following format, for example:
+a scruffy guy in a tee → a guy with messy hair wearing a faded graphic t-shirt and loose jeans.
+a stylish woman in red → a woman with sleek hair wearing a bright red blazer and matching heels.
+a bulky backpack → a large black backpack with thick straps and a padded mesh back.
+a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
+a nerdy man with glasses → a man with round glasses, a plaid button-up, and tucked-in chinos.
+a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
 
+The sentence: a _ → """
+DEFAULT_TARGET_PROMPT = """Complete the sentence in the following format, for example:
+a bulky backpack → a large black backpack with thick straps and a padded mesh back.
+a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
+a warm croissant → a golden, flaky croissant with crisp layers and a soft buttery center.
+a vintage camera → a compact silver-and-black camera with a textured grip and a chunky lens.
+a loaded hotdog → a toasted bun filled with a browned sausage, topped with bright mustard and diced onions.
+a cozy wool blanket → a thick cream-colored blanket with a soft woven pattern.
+
+The sentence: a _ →"""
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -182,6 +205,7 @@ def run_generation_with_attention(
     include_image_inputs: bool = True,
     filter_image_tokens_to_person_mask: bool = False,
     same_mask_for_person: bool = False,
+    use_target_insert_for_source: bool = False,
     attention_mask_viz_dir: Optional[Union[str, Path]] = None,
     use_body_bbox: bool = False,
 ) -> Dict[str, Any]:
@@ -212,6 +236,7 @@ def run_generation_with_attention(
         mask_overlay_alpha: Alpha blend to use for overlay visualization
         include_image_inputs: Whether to send image tensors to the model on the first decoding step
         filter_image_tokens_to_person_mask: Restrict image tokens to the person_mask selection when True
+        use_target_insert_for_source: When True, reuse gaze target insert indices/representations for the source slots
         attention_mask_viz_dir: Directory to store compressed custom attention mask visualizations (optional)
 
     Returns:
@@ -243,6 +268,9 @@ def run_generation_with_attention(
         mask_viz_dir.mkdir(parents=True, exist_ok=True)
 
     # Prepare inputs
+    if use_target_insert_for_source and not same_mask_for_person:
+        same_mask_for_person = True
+
     (image, input_masks, image_tensor, image_sizes, atten_indices,
      person_mask_indices, input_ids) = _prepare_inputs(
         image_path,
@@ -262,6 +290,16 @@ def run_generation_with_attention(
 
     target_mask_raw = input_masks.get('target_mask_raw')
     person_mask_raw = input_masks.get('person_mask_raw')
+
+    if use_target_insert_for_source:
+        print("Target insert override enabled: using gaze target mask for both source and target injections.")
+        if target_mask_raw is not None:
+            person_mask_raw = np.copy(target_mask_raw)
+            input_masks['person_mask_raw'] = person_mask_raw
+        if input_masks.get('target_mask') is not None:
+            input_masks['person_mask'] = input_masks.get('target_mask')
+        if atten_indices:
+            person_mask_indices = list(atten_indices)
 
     person_mask_bbox: Optional[List[float]] = None
     if person_mask_raw is not None:
@@ -300,7 +338,8 @@ def run_generation_with_attention(
     input_masks.pop('person_mask_raw', None)
 
     # Setup model configuration
-    boost_positions = {'gaze_source': person_mask_indices, 'gaze_target': atten_indices}
+    boost_source_indices = atten_indices if use_target_insert_for_source else person_mask_indices
+    boost_positions = {'gaze_source': boost_source_indices, 'gaze_target': atten_indices}
     image_token_filter_indices: Optional[List[int]] = None
     if filter_image_tokens_to_person_mask and person_mask_indices:
         image_token_filter_indices = list(person_mask_indices)
@@ -361,8 +400,11 @@ def run_generation_with_attention(
                 "input_masks": input_masks,
                 "apply_only_target_mask": state["apply_only_target_mask"],
                 "target_tokens": state["target_tokens"],
+                "target_tokens": state["target_tokens"],
                 "image_token_filter_indices": image_token_filter_indices if include_image_inputs else None,
             }
+            if use_target_insert_for_source:
+                model_inputs["use_target_insert_indices_for_source"] = True
             if mask_viz_dir is not None:
                 model_inputs["attention_mask_viz"] = {"capture_only": True}
             if i == 0 and include_image_inputs:
@@ -720,6 +762,7 @@ def process_batch_from_json(
     save_mask_overlays: bool = False,
     mask_overlay_alpha: float = 0.4,
     include_image_inputs: Optional[bool] = None,
+    use_target_insert_for_source: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process multiple images, performing bias sweeps for each image.
@@ -894,6 +937,7 @@ def process_batch_from_json(
             save_mask_overlays=save_mask_overlays,
             mask_overlay_alpha=mask_overlay_alpha,
         )
+        base_config["use_target_insert_for_source"] = use_target_insert_for_source
         if include_image_inputs is not None:
             base_config["include_image_inputs"] = include_image_inputs
         bias_sweep_results = run_bias_sweep_experiment(
@@ -989,6 +1033,7 @@ def run_bias_sweep_experiment(
             save_mask_overlays=experiment_config.get("save_mask_overlays", False),
             mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
             include_image_inputs=experiment_config.get("include_image_inputs", True),
+            use_target_insert_for_source=experiment_config.get("use_target_insert_for_source", False),
         )
 
     for bias_i in bias_range:
@@ -1023,6 +1068,7 @@ def run_bias_sweep_experiment(
             save_mask_overlays=experiment_config.get("save_mask_overlays", False),
             mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
             include_image_inputs=experiment_config.get("include_image_inputs", True),
+            use_target_insert_for_source=experiment_config.get("use_target_insert_for_source", False),
         )
         results.pop('first_step_hidden_state', None)
         all_results[bias_i] = results
@@ -1116,6 +1162,7 @@ def run_repr_layer_sweep_experiment(
             save_mask_overlays=cache_config.get("save_mask_overlays", False),
             mask_overlay_alpha=cache_config.get("mask_overlay_alpha", 0.4),
             include_image_inputs=cache_config.get("include_image_inputs", True),
+            use_target_insert_for_source=cache_config.get("use_target_insert_for_source", False),
         )
         all_hidden_states = init_run_results.get("first_step_all_hidden_states")
         if not all_hidden_states:
@@ -1185,6 +1232,7 @@ def run_repr_layer_sweep_experiment(
             save_mask_overlays=experiment_config.get("save_mask_overlays", False),
             mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
             include_image_inputs=experiment_config.get("include_image_inputs", True),
+            use_target_insert_for_source=experiment_config.get("use_target_insert_for_source", False),
         )
         results.pop("first_step_hidden_state", None)
         results["repr_capture_layer_idx"] = source_idx if enable_pairwise_sweep else target_idx
@@ -1454,8 +1502,8 @@ if __name__ == '__main__':
     )
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000093\00093143.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks\gaze__00093143_results.npy", help="Path to the attention mask.")
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000691.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks\gaze__00000691_results.npy", help="Path to the attention mask.")
     # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
     # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
     # parser.add_argument('--prompt', type=str, default="The _ is looking at _ . Where is the _ person looking?", help="Input prompt.")
@@ -1473,22 +1521,19 @@ if __name__ == '__main__':
 #                         a woman → a woman in a beige coat and ankle boots holding a phone. 
 #                         a man → a man in a black leather jacket and glasses. 
 #                         a woman → a woman in a dark green sweater and black jeans carrying a tan shoulder bag
-    parser.add_argument('--prompt', type=str, default="""Complete the sentence in the following format, for example:
-                        a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans sitting on a worn wooden bench.  
-                        a chic woman in a beige coat → a woman in a beige coat and ankle boots holding a phone.  
-                        a techy man in a leather jacket → a man in a black leather jacket and glasses.  
-                        a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans carrying a tan shoulder bag.
-                        The sentence: a _ → """, help="Input prompt.")
+    parser.add_argument('--prompt', type=str, default=DEFAULT_PROMPT, help="Input prompt.")
     parser.add_argument('--use-gt-gaze-csv', action=argparse.BooleanOptionalAction, default=True,
                         dest='use_gt_gaze_csv', help="Use ground-truth gaze CSV to override gaze masks (default: enabled).")
     parser.add_argument('--gt_gaze_csv_path', type=str, default=str(DEFAULT_GT_GAZE_CSV),
                         help="Path to the ground-truth gaze CSV file.")
     parser.add_argument('--gt_gaze_mask_radius', type=int, default=None,
                         help="Optional fixed radius (pixels) for GT gaze mask blobs.")
-    parser.add_argument('--gt_gaze_mask_radius_ratio', type=float, default=0.02,
+    parser.add_argument('--gt_gaze_mask_radius_ratio', type=float, default=0.05,
                         help="Relative radius used when no fixed radius is provided for GT gaze mask blobs.")
     parser.add_argument('--use_body_bbox', action='store_true', default=False,
                         help="Use normalized body bounding boxes from the GT CSV instead of head boxes when creating person masks.")
+    parser.add_argument('--use_target_insert_for_source', action='store_true', default=False,
+                        help="Use gaze target insert indices and representations for both source and target slots.")
     # parser.add_argument('--prompt', type=str, default="You are provided with embeddings representing people or objects in an image." \
     # " Your task is to describe each embedding and where it is looking clearly and succinctly in the following exact format: 'The _ [description of the person] is looking at  _ [description of the object or person]. Repeat the sentence.' " \
     # "Make sure to include 'looking at' in each sentence and that each description accurately captures key visual attributes (e.g., age, gender, clothing, appearance for objects or people; type, color, state for objects) in no more than one short phrase.", help="Input prompt.")
@@ -1530,10 +1575,10 @@ if __name__ == '__main__':
                         help="Bias strength to use during repr layer sweep (defaults to generation bias).")
     parser.add_argument('--repr_combo_sweep', action='store_true',
                         help="When provided, performs a pairwise sweep over capture/inject repr layers instead of a single shared index.")
-    parser.add_argument('--repr_capture_layers', type=int, nargs='*', default=None,
+    parser.add_argument('--repr_capture_layers', type=int, nargs='*', default=[20],
                         dest='repr_capture_layers',
                         help="Optional override for capture/person representation layers used during combo sweeps.")
-    parser.add_argument('--repr_inject_layers', type=int, nargs='*', default=None,
+    parser.add_argument('--repr_inject_layers', type=int, nargs='*', default=[0],
                         dest='repr_inject_layers',
                         help="Optional override for inject/gaze representation layers used during combo sweeps.")
     parser.add_argument('--token_injection_repr_sweep', action=argparse.BooleanOptionalAction, default=False,
@@ -1632,6 +1677,8 @@ if __name__ == '__main__':
         "enable_after_keyword": "looking"
     }
 
+    if args.use_target_insert_for_source:
+        args.prompt = DEFAULT_TARGET_PROMPT
 
     if args.mode == 'single':
         print("--- Running Single Experiment ---")
@@ -1656,6 +1703,7 @@ if __name__ == '__main__':
              save_mask_overlays=args.save_mask_overlays,
              mask_overlay_alpha=args.mask_overlay_alpha,
              include_image_inputs=not args.exclude_image_inputs,
+             use_target_insert_for_source=args.use_target_insert_for_source,
         )
 
     elif args.mode == 'batch':
@@ -1690,6 +1738,7 @@ if __name__ == '__main__':
             save_mask_overlays=args.save_mask_overlays,
             mask_overlay_alpha=args.mask_overlay_alpha,
             include_image_inputs=not args.exclude_image_inputs,
+            use_target_insert_for_source=args.use_target_insert_for_source,
         )
 
     elif args.mode == 'sweep':
@@ -1708,6 +1757,7 @@ if __name__ == '__main__':
             save_mask_overlays=args.save_mask_overlays,
             mask_overlay_alpha=args.mask_overlay_alpha,
         )
+        base_experiment_config["use_target_insert_for_source"] = args.use_target_insert_for_source
         base_experiment_config["save_debug_files"] = args.save_debug_files
         if args.exclude_image_inputs:
             base_experiment_config["include_image_inputs"] = False
@@ -1740,6 +1790,7 @@ if __name__ == '__main__':
             save_mask_overlays=args.save_mask_overlays,
             mask_overlay_alpha=args.mask_overlay_alpha,
         )
+        base_experiment_config["use_target_insert_for_source"] = args.use_target_insert_for_source
         base_experiment_config["save_debug_files"] = args.save_debug_files
         if args.exclude_image_inputs:
             base_experiment_config["include_image_inputs"] = False

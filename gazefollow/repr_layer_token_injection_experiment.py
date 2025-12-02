@@ -121,6 +121,7 @@ def run_repr_layer_image_token_injection_experiment(
             gt_gaze_mask_radius_ratio=cache_config.get("gt_gaze_mask_radius_ratio", 0.02),
             save_mask_overlays=cache_config.get("save_mask_overlays", False),
             mask_overlay_alpha=cache_config.get("mask_overlay_alpha", 0.4),
+            use_target_insert_for_source=cache_config.get("use_target_insert_for_source", False),
         )
         all_hidden_states = cache_results.get("first_step_all_hidden_states")
         if not all_hidden_states:
@@ -190,6 +191,7 @@ def run_repr_layer_image_token_injection_experiment(
                 gt_gaze_mask_radius_ratio=experiment_config.get("gt_gaze_mask_radius_ratio", 0.02),
                 save_mask_overlays=experiment_config.get("save_mask_overlays", False),
                 mask_overlay_alpha=experiment_config.get("mask_overlay_alpha", 0.4),
+                use_target_insert_for_source=experiment_config.get("use_target_insert_for_source", False),
                 include_image_inputs=True,
                 filter_image_tokens_to_person_mask=apply_filter,
             )
