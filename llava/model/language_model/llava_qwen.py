@@ -115,6 +115,32 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         return tokens_indexing
 
+    @staticmethod
+    def _insert_positions_nonempty(positions: Optional[Any]) -> bool:
+        if positions is None:
+            return False
+        if torch.is_tensor(positions):
+            return positions.numel() > 0
+        if isinstance(positions, np.ndarray):
+            return positions.size > 0
+        if isinstance(positions, (list, tuple)):
+            return len(positions) > 0
+        return True
+
+    def _maybe_share_target_insert_positions(
+        self,
+        tokens_indexing: Optional[Dict[str, Any]],
+    ) -> None:
+        if not isinstance(tokens_indexing, dict):
+            return
+        insert_positions = tokens_indexing.get("insert_embd")
+        if not isinstance(insert_positions, dict):
+            return
+        target_positions = insert_positions.get("target")
+        if not self._insert_positions_nonempty(target_positions):
+            return
+        insert_positions["source"] = target_positions
+
     def _apply_mask_embedding_logic(
         self,
         inputs_embeds: Optional[torch.Tensor],
@@ -133,6 +159,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         tokens_indexing = getattr(self, "tokens_indexing", None)
         if not isinstance(tokens_indexing, dict):
             return False
+
+        use_target_insert_override = bool(kwargs.get("use_target_insert_indices_for_source", False))
+        if use_target_insert_override:
+            self._maybe_share_target_insert_positions(tokens_indexing)
 
         insert_positions = tokens_indexing.get("insert_embd")
         if not isinstance(insert_positions, dict):
@@ -161,6 +191,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         target_attn_mask_indices = boost_positions.get("gaze_target")
         person_attn_mask_indices = boost_positions.get("gaze_source")
+        if use_target_insert_override and target_attn_mask_indices is not None:
+            person_attn_mask_indices = target_attn_mask_indices
+            if mask_hidden_state_target is not None:
+                mask_hidden_state_source = mask_hidden_state_target
 
         repr_layer_idx = kwargs.get("repr_layer_idx", None)
         use_layer_injection = repr_layer_idx is not None and insert_positions is not None
@@ -279,6 +313,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         image_sizes=image_sizes,
                         image_token_filter_indices=image_token_filter_indices,
                     )
+                if kwargs.get("use_target_insert_indices_for_source"):
+                    self._maybe_share_target_insert_positions(self.tokens_indexing)
 
                 if kwargs.get("target_mask_embedding", None) is not None:
                     mask_logic_applied = self._apply_mask_embedding_logic(
@@ -337,6 +373,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 self.tokens_indexing = self._build_tokens_indexing_from_ids(
                     original_input_ids, input_embeds_shape[1]
                 )
+                if kwargs.get("use_target_insert_indices_for_source"):
+                    self._maybe_share_target_insert_positions(self.tokens_indexing)
             except Exception as exc:
                 print(f"Warning: failed to build tokens_indexing from prompt tokens: {exc}")
         if not mask_logic_applied and kwargs.get("target_mask_embedding", None) is not None:

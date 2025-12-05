@@ -20,10 +20,11 @@ from gazefollow.auto_phrase_grounding import extract_and_ground_pipeline as pipe
 
 
 LOGGER_NAME = "inject_and_ground_queue"
-DEFAULT_QUEUE_PATH = Path("gazefollow/data/inject_and_ground_queue.csv")
+DEFAULT_QUEUE_PATH = Path("gazefollow/data/combined_source_extract_patchscope_valid.csv")
 DEFAULT_DATA_ROOT = Path(r"D:\Projects\data\gazefollow")
 DEFAULT_OUTPUT_ROOT = Path("results/steered_generation")
 DEFAULT_THRESHOLD = 0.16
+TARGET_DESCRIPTION = True
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -90,6 +91,12 @@ def parse_cli_args() -> argparse.Namespace:
         default=True,
         help="Use body bounding boxes when available during person description extraction.",
     )
+    parser.add_argument(
+        "--use-target-insert-for-source",
+        action=argparse.BooleanOptionalAction,
+        default=TARGET_DESCRIPTION,
+        help="Use target description insertion for source grounding.",
+    )
     return parser.parse_args()
 
 
@@ -125,11 +132,14 @@ def _build_pipeline_args(
     visualization_dir: Path,
     mask_dir: Path,
     use_body_bbox: bool,
+    use_target_insert_for_source: bool,
 ) -> argparse.Namespace:
     saved_argv = sys.argv
     sys.argv = ["extract_and_ground_pipeline"]
     pipeline_args = pipeline.parse_args()
     sys.argv = saved_argv
+
+    default_prompt = pipeline.DEFAULT_TARGET_PROMPT if use_target_insert_for_source else pipeline.DEFAULT_SOURCE_PROMPT
 
     pipeline_args.mode = "single"
     pipeline_args.mask_dir = str(mask_dir)
@@ -142,10 +152,11 @@ def _build_pipeline_args(
     pipeline_args.attn_show_highest_blob = False
     pipeline_args.attn_create_collage = False
     pipeline_args.attn_save_tensors = False
-    pipeline_args.attn_capture_layer_idx = None
-    pipeline_args.attn_inject_layer_idx = None
-    pipeline_args.prompt = pipeline.DEFAULT_PROMPT
+    pipeline_args.attn_capture_layer_idx = 20
+    pipeline_args.attn_inject_layer_idx = 0
+    pipeline_args.prompt = default_prompt
     pipeline_args.use_body_bbox = use_body_bbox
+    pipeline_args.use_target_insert_for_source = use_target_insert_for_source
     return pipeline_args
 
 
@@ -285,6 +296,7 @@ def main() -> None:
         visualization_dir=visualization_dir,
         mask_dir=mask_dir,
         use_body_bbox=cli_args.use_body_bbox,
+        use_target_insert_for_source=cli_args.use_target_insert_for_source,
     )
 
     logger.info("Loading models and processors...")
@@ -339,6 +351,23 @@ def main() -> None:
             skipped_count += 1
             logger.info("%s Row %d already has grounding metrics. Skipping.", progress_prefix, idx)
             continue
+
+        if cli_args.use_target_insert_for_source:
+            in_or_out_value = row.get("in_or_out")
+            is_zero = False
+            if in_or_out_value is not None and not (isinstance(in_or_out_value, float) and pd.isna(in_or_out_value)):
+                try:
+                    is_zero = float(in_or_out_value) == 0
+                except (TypeError, ValueError):
+                    is_zero = False
+            if is_zero:
+                skipped_count += 1
+                logger.info(
+                    "%s Row %d has in_or_out=0 while using target insertion for source. Skipping.",
+                    progress_prefix,
+                    idx,
+                )
+                continue
 
         rel_image_path = _select_image_path(row)
         if not rel_image_path:

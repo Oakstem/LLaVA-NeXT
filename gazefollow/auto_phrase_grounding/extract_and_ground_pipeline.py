@@ -51,6 +51,17 @@ a techy man in a leather jacket → a man in a black leather jacket and glasses.
 a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans.
 
 The sentence: a _ →"""
+DEFAULT_TARGET_PROMPT = """Complete the sentence in the following format, for example:
+a scruffy guy in a tee → a guy with messy hair wearing a faded graphic t-shirt and loose jeans.
+a warm croissant → a golden, flaky croissant with crisp layers and a soft buttery center.
+a stylish woman in red → a woman with sleek hair wearing a bright red blazer and matching heels.
+a young child in overalls → a small child with curly hair wearing light denim overalls and a striped tee.
+a bulky backpack → a large black backpack with thick straps and a padded mesh back.
+a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
+a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
+
+The sentence: a _ →"""
+
 DEFAULT_QUERY_TEMPLATE = (
     "Locate the person described as: {description}. "
     "Return JSON with a `bbox` field using pixel coordinates."
@@ -495,6 +506,7 @@ def capture_initial_repr_state(
         save_mask_overlays=args.save_mask_overlays,
         mask_overlay_alpha=args.mask_overlay_alpha,
         include_image_inputs=not args.exclude_image_inputs,
+        use_target_insert_for_source=args.use_target_insert_for_source,
         use_body_bbox=args.use_body_bbox,
         attention_mask_viz_dir=attention_mask_viz_dir,
     )
@@ -559,6 +571,7 @@ def process_image_task(
         include_image_inputs=not args.exclude_image_inputs,
         attention_mask_viz_dir=attention_mask_viz_dir,
         use_body_bbox=args.use_body_bbox,
+        use_target_insert_for_source=args.use_target_insert_for_source,
     )
     description_text = (description_results.get("generated_text") or "").strip()
     if not description_text:
@@ -644,7 +657,7 @@ def parse_args() -> argparse.Namespace:
         description="Extract person descriptions with LLaVA-NeXT attention and ground them with Qwen3-VL."
     )
     parser.add_argument("--mode", choices=["single", "list"], default="single")
-    parser.add_argument("--image-path", default=r"D:\Projects\data\gazefollow\train\00000000\00000032.jpg", help="Path to a single image to process.")
+    parser.add_argument("--image-path", default=r"D:\Projects\data\gazefollow\train\00000000\00000018.jpg", help="Path to a single image to process.")
     parser.add_argument("--mask-path", help="Optional explicit mask path for the single image.")
     parser.add_argument("--image-id", help="Override identifier for the single image.")
     parser.add_argument("--image-list", help="Path to a JSON/JSONL/txt list of images for list mode.")
@@ -717,7 +730,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llava-do-sample", action="store_true")
     parser.add_argument(
         "--prompt",
-        default=DEFAULT_PROMPT,
+        default=DEFAULT_TARGET_PROMPT,
         help="Prompt used when extracting the person description.",
     )
 
@@ -749,9 +762,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-gt-gaze-csv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gt-gaze-csv-path", default=str(DEFAULT_GT_GAZE_CSV))
     parser.add_argument("--gt-gaze-mask-radius", type=int, default=None)
-    parser.add_argument("--gt-gaze-mask-radius-ratio", type=float, default=0.02)
+    parser.add_argument("--gt-gaze-mask-radius-ratio", type=float, default=0.05)
     parser.add_argument("--save-mask-overlays", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mask-overlay-alpha", type=float, default=0.6)
+    parser.add_argument(
+        "--use-target-insert-for-source",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mirror target insert indices/representations into the source slots during prompting.",
+    )
 
     parser.add_argument("--guidance-top-k", type=int, default=10)
     parser.add_argument("--guidance-similarity-weight", type=float, default=0.7)
