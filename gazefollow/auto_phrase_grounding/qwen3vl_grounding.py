@@ -103,7 +103,13 @@ def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
         try:
             parsed, _ = decoder.raw_decode(cleaned[idx:])
         except json.JSONDecodeError:
-            continue
+                # Fallback: search for bbox pattern with 4 numbers
+            bbox_match = re.search(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)', cleaned)
+            if bbox_match:
+                bbox = [int(bbox_match.group(i)) for i in range(1, 5)]
+                return [{"bbox": bbox}]
+            else:
+                continue
 
         if isinstance(parsed, dict):
             return [parsed]

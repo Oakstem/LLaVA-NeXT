@@ -44,7 +44,7 @@ DEFAULT_MASK_DIR = Path(r"D:\Projects\data\gazefollow\train_gaze_segmentations\s
 #     a techy man in a leather jacket → a man in a black leather jacket and glasses.
 #     a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans carrying a tan shoulder bag.
 #     The sentence: a _ → """
-DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
+DEFAULT_SOURCE_PROMPT = """Complete the sentence in the following format, for example:
 a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans.
 a chic woman in a beige coat → a woman in a beige coat and ankle boots.
 a techy man in a leather jacket → a man in a black leather jacket and glasses.
@@ -657,7 +657,7 @@ def parse_args() -> argparse.Namespace:
         description="Extract person descriptions with LLaVA-NeXT attention and ground them with Qwen3-VL."
     )
     parser.add_argument("--mode", choices=["single", "list"], default="single")
-    parser.add_argument("--image-path", default=r"D:\Projects\data\gazefollow\train\00000000\00000018.jpg", help="Path to a single image to process.")
+    parser.add_argument("--image-path", default=r"D:\Projects\data\gazefollow\train\00000000\00000046.jpg", help="Path to a single image to process.")
     parser.add_argument("--mask-path", help="Optional explicit mask path for the single image.")
     parser.add_argument("--image-id", help="Override identifier for the single image.")
     parser.add_argument("--image-list", help="Path to a JSON/JSONL/txt list of images for list mode.")
@@ -730,7 +730,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llava-do-sample", action="store_true")
     parser.add_argument(
         "--prompt",
-        default=DEFAULT_TARGET_PROMPT,
+        default=DEFAULT_SOURCE_PROMPT,
         help="Prompt used when extracting the person description.",
     )
 
@@ -805,6 +805,11 @@ def main() -> None:
         limit=args.list_limit,
         image_id=args.image_id,
     )
+
+    if args.use_target_insert_for_source:
+        args.prompt = DEFAULT_TARGET_PROMPT
+    else:
+        args.prompt = DEFAULT_SOURCE_PROMPT
 
     if user_specified_output:
         output_dir = _normalize_path(args.output_dir)
