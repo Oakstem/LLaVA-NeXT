@@ -5,6 +5,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 import copy
+import re
 from typing import Dict, List, Optional, Any, Tuple, Union
 
 import torch
@@ -709,28 +710,90 @@ def load_mask_from_file(mask_path: Union[str, Path]) -> np.ndarray:
 
     return mask
 
-def _normalize_gt_gaze_keys(raw_key: Any) -> List[str]:
-    """Create a set of lookup keys for CSV rows to maximize match robustness."""
-    if raw_key is None or pd.isna(raw_key):
-        return []
+_GT_IMAGE_KEY_PATTERN = re.compile(r"(\d+)_([0-9]+)")
 
-    key = str(raw_key).strip().replace("\\", "/")
-    if not key:
-        return []
-    if key.lower() == "nan":
-        return []
 
-    candidates = {key}
-    path_obj = Path(key)
-    candidates.add(path_obj.name)
-    candidates.add(path_obj.stem)
-    parts = [part for part in path_obj.parts if part]
-    if len(parts) >= 3:
-        candidates.add("/".join(parts[-3:]))
-    if len(parts) >= 2:
-        candidates.add("/".join(parts[-2:]))
+def _normalize_gt_gaze_key(raw_key: Any) -> Optional[str]:
+    """Normalize any GT reference (path, mask name, etc.) to the gaze key."""
+    if raw_key is None or (isinstance(raw_key, float) and pd.isna(raw_key)):
+        return None
 
-    return [c for c in candidates if c]
+    key = str(raw_key).strip()
+    if not key or key.lower() == "nan":
+        return None
+
+    normalized = key.replace("\\", "/")
+
+    def _from_path(path_str: str) -> Optional[str]:
+        parts = [part for part in path_str.strip("/").split("/") if part]
+        if len(parts) < 2:
+            return None
+        folder_part = parts[-2]
+        file_part = Path(parts[-1]).stem
+        if not folder_part or not file_part:
+            return None
+        combined = f"{folder_part}_{file_part}"
+        match = _GT_IMAGE_KEY_PATTERN.search(combined)
+        if match:
+            return f"{match.group(1)}_{match.group(2)}"
+        if folder_part.isdigit() and file_part.isdigit():
+            return combined
+        return None
+
+    # 1) Try to derive directly from explicit paths (contains /).
+    if "/" in normalized:
+        path_key = _from_path(normalized)
+        if path_key:
+            return path_key
+
+    # 2) Handle filenames like gaze__00000000_00000021_masks.npy
+    base_name = Path(normalized).name
+    name_without_ext = Path(base_name).stem
+
+    for prefix in ("gaze__", "person__", "mask__", "train__", "val__", "test__"):
+        if name_without_ext.startswith(prefix):
+            name_without_ext = name_without_ext[len(prefix):]
+            break
+
+    suffixes = (
+        "_masks",
+        "_mask",
+        "_results",
+        "_result",
+        "_target_embeddings",
+        "_target_embedding",
+        "_target",
+        "_person",
+        "_people",
+        "_bbox",
+        "_segmentation",
+        "_seg",
+        "_attn",
+        "_indices",
+        "_all_segmentation_results",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if name_without_ext.endswith(suffix):
+                name_without_ext = name_without_ext[: -len(suffix)]
+                changed = True
+                break
+
+    name_without_ext = name_without_ext.strip("_")
+    match = _GT_IMAGE_KEY_PATTERN.search(name_without_ext)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+
+    parts = [part for part in name_without_ext.split("_") if part]
+    if len(parts) >= 2 and all(part.isdigit() for part in parts[-2:]):
+        return "_".join(parts[-2:])
+
+    if name_without_ext and any(ch.isdigit() for ch in name_without_ext):
+        return name_without_ext
+
+    return None
 
 
 def _update_gt_annotation_lookup_entry(
@@ -738,36 +801,43 @@ def _update_gt_annotation_lookup_entry(
     raw_key: Any,
     coords: Tuple[float, float],
     gaze_error: float,
-    bbox: Optional[Tuple[float, float, float, float]],
-    bbox_is_normalized: bool = False
+    body_bbox: Optional[Tuple[float, float, float, float]],
+    head_bbox: Optional[Tuple[float, float, float, float]],
 ) -> None:
-    """Register gaze/person annotations for all normalized keys, preferring lower errors."""
-    for key in _normalize_gt_gaze_keys(raw_key):
-        existing = lookup.get(key)
-        if existing is None:
-            lookup[key] = {
-                "coords": coords,
-                "error": gaze_error,
-                "bbox": bbox,
-                "bbox_is_normalized": bbox_is_normalized,
-            }
-            continue
+    """Register gaze/person annotations for a normalized key, preferring lower errors."""
+    normalized_key = _normalize_gt_gaze_key(raw_key)
+    if not normalized_key:
+        return
 
-        existing_error = existing.get("error", float("nan"))
-        if pd.isna(existing_error) and not pd.isna(gaze_error):
-            lookup[key] = {
-                "coords": coords,
-                "error": gaze_error,
-                "bbox": bbox,
-                "bbox_is_normalized": bbox_is_normalized,
-            }
-        elif not pd.isna(existing_error) and not pd.isna(gaze_error) and gaze_error < existing_error:
-            lookup[key] = {
-                "coords": coords,
-                "error": gaze_error,
-                "bbox": bbox,
-                "bbox_is_normalized": bbox_is_normalized,
-            }
+    existing = lookup.get(normalized_key)
+    if existing is None:
+        lookup[normalized_key] = {
+            "gaze_target_coords": coords,
+            "gaze_target_error": gaze_error,
+            "gaze_source_body_bbox": body_bbox,
+            "gaze_source_head_bbox": head_bbox,
+        }
+        return
+
+    existing_error = existing.get("gaze_target_error", float("nan"))
+    should_replace_coords = False
+    if pd.isna(existing_error) and not pd.isna(gaze_error):
+        should_replace_coords = True
+    elif (
+        not pd.isna(existing_error)
+        and not pd.isna(gaze_error)
+        and gaze_error < existing_error
+    ):
+        should_replace_coords = True
+
+    if should_replace_coords:
+        existing["gaze_target_coords"] = coords
+        existing["gaze_target_error"] = gaze_error
+
+    if existing.get("gaze_source_body_bbox") is None and body_bbox is not None:
+        existing["gaze_source_body_bbox"] = body_bbox
+    if existing.get("gaze_source_head_bbox") is None and head_bbox is not None:
+        existing["gaze_source_head_bbox"] = head_bbox
 
 
 def set_gt_annotation_lookup_use_body_bbox(enabled: bool) -> None:
@@ -806,7 +876,9 @@ def load_gt_annotation_lookup(
     df = df.dropna(subset=["gaze_x", "gaze_y"])
 
     use_body_bbox_flag = use_body_bbox if use_body_bbox is not None else _GT_ANNOTATION_USE_BODY_BBOX
-    candidate_columns = [col for col in ("image_path", "image_path.1") if col in df.columns]
+    candidate_columns = [
+        col for col in ("image_key", "image_path", "image_path.1") if col in df.columns
+    ]
     head_bbox_columns = ("head_bbox_x_min", "head_bbox_y_min", "head_bbox_x_max", "head_bbox_y_max")
     body_bbox_columns = ("body_bbox_x", "body_bbox_y", "body_bbox_width", "body_bbox_height")
     has_head_bbox_columns = all(col in df.columns for col in head_bbox_columns)
@@ -819,9 +891,10 @@ def load_gt_annotation_lookup(
     for _, row in df.iterrows():
         coords = (float(row["gaze_x"]), float(row["gaze_y"]))
         gaze_error = float(row["gaze_error"]) if "gaze_error" in df.columns and not pd.isna(row["gaze_error"]) else float("nan")
-        bbox: Optional[Tuple[float, float, float, float]] = None
-        bbox_is_normalized = False
-        if use_body_bbox_flag and has_body_bbox_columns:
+        body_bbox: Optional[Tuple[float, float, float, float]] = None
+        head_bbox: Optional[Tuple[float, float, float, float]] = None
+
+        if has_body_bbox_columns:
             body_values = (
                 row["body_bbox_x"],
                 row["body_bbox_y"],
@@ -835,14 +908,14 @@ def load_gt_annotation_lookup(
                 height_val = float(body_values[3])
                 x_max = x_min + width_val
                 y_max = y_min + height_val
-                bbox = (
+                body_bbox = (
                     max(0.0, min(1.0, x_min)),
                     max(0.0, min(1.0, y_min)),
                     max(0.0, min(1.0, x_max)),
                     max(0.0, min(1.0, y_max)),
                 )
-                bbox_is_normalized = True
-        elif has_head_bbox_columns:
+
+        if has_head_bbox_columns:
             bbox_values = (
                 row["head_bbox_x_min"],
                 row["head_bbox_y_min"],
@@ -850,12 +923,16 @@ def load_gt_annotation_lookup(
                 row["head_bbox_y_max"],
             )
             if not any(pd.isna(v) for v in bbox_values):
-                bbox = tuple(float(v) for v in bbox_values)  # type: ignore[arg-type]
-                bbox_is_normalized = False
+                head_bbox = tuple(float(v) for v in bbox_values)  # type: ignore[arg-type]
 
         for column in candidate_columns:
             _update_gt_annotation_lookup_entry(
-                temp_lookup, row[column], coords, gaze_error, bbox, bbox_is_normalized=bbox_is_normalized
+                temp_lookup,
+                row[column],
+                coords,
+                gaze_error,
+                body_bbox,
+                head_bbox,
             )
 
     _GT_ANNOTATION_LOOKUP_CACHE[normalized_path] = temp_lookup
@@ -906,7 +983,7 @@ def _create_person_mask_from_bbox(
     image_size: Tuple[int, int],
     bbox: Tuple[float, float, float, float],
     *,
-    scale: float =1.,
+    scale: float = 1.0,
 ) -> np.ndarray:
     """Create a binary mask covering the provided head bounding box.
 
@@ -1586,34 +1663,23 @@ def _find_gt_annotation_entry(
     if not lookup:
         return None, None
 
-    ordered_candidates: List[str] = []
+    candidate_keys: List[str] = []
+    for raw_value in (mask_path, image_path):
+        normalized_key = _normalize_gt_gaze_key(raw_value)
+        if normalized_key and normalized_key not in candidate_keys:
+            candidate_keys.append(normalized_key)
 
-    def _append_candidates(raw_value: Any) -> None:
-        for candidate in _normalize_gt_gaze_keys(raw_value):
-            if candidate and candidate not in ordered_candidates:
-                ordered_candidates.append(candidate)
-
-    image_path_str = str(image_path)
-    _append_candidates(image_path_str)
-
-    mask_path_obj = Path(str(mask_path))
-    mask_stem = mask_path_obj.stem
-    _append_candidates(mask_stem)
-
-    stem_without_prefix = mask_stem.replace("gaze__", "")
-    _append_candidates(stem_without_prefix)
-
-    if "_" in stem_without_prefix:
-        _append_candidates(stem_without_prefix.split("_")[0])
-
-    digit_key = "".join(ch for ch in stem_without_prefix if ch.isdigit())
-    _append_candidates(digit_key)
-
-    for candidate_key in ordered_candidates:
+    for candidate_key in candidate_keys:
         entry = lookup.get(candidate_key)
         if entry is None:
             continue
-        return entry, candidate_key
+        normalized_entry = {
+            "gaze_target_coords": entry.get("gaze_target_coords"),
+            "gaze_target_error": entry.get("gaze_target_error"),
+            "gaze_source_body_bbox": entry.get("gaze_source_body_bbox"),
+            "gaze_source_head_bbox": entry.get("gaze_source_head_bbox"),
+        }
+        return normalized_entry, candidate_key
 
     return None, None
 
@@ -1633,6 +1699,7 @@ def _prepare_inputs(
     insert_image_token: bool = True,
     same_mask_for_person: bool = False,
     use_body_bbox: bool = False,
+    person_bbox_scale: float = 1.0,
 ) -> Tuple[Any, Any, torch.Tensor, List, List[int], Any, torch.Tensor]:
     """Load and prepare image, mask, and input tensors.
 
@@ -1664,8 +1731,8 @@ def _prepare_inputs(
             use_body_bbox=use_body_bbox,
         )
 
-    if gt_annotation_entry and gt_annotation_entry.get("coords"):
-        coords = gt_annotation_entry["coords"]
+    if gt_annotation_entry and gt_annotation_entry.get("gaze_target_coords"):
+        coords = gt_annotation_entry["gaze_target_coords"]
         pixel_coord = _denormalize_gaze_point(coords[0], coords[1], image.size)
         mask = _create_gaze_mask_from_point(
             image.size,
@@ -1689,19 +1756,39 @@ def _prepare_inputs(
     person_mask_path = str(mask_path).replace("gaze__", "person__")
     person_mask_from_gt = False
     person_mask_raw: Optional[np.ndarray] = None
-    if gt_annotation_entry and gt_annotation_entry.get("bbox") is not None:
-        bbox = gt_annotation_entry["bbox"]
-        if gt_annotation_entry.get("bbox_is_normalized", False):
-            img_width, img_height = image.size
-            x_min = max(0.0, min(img_width, bbox[0] * img_width))
-            y_min = max(0.0, min(img_height, bbox[1] * img_height))
-            x_max = max(0.0, min(img_width, bbox[2] * img_width))
-            y_max = max(0.0, min(img_height, bbox[3] * img_height))
-            bbox = (x_min, y_min, x_max, y_max)
-        person_mask = _create_person_mask_from_bbox(image.size, bbox)
-        person_mask_from_gt = True
-        lookup_key = matched_lookup_key or "unknown"
-        print(f"Using GT person mask from CSV (key='{lookup_key}') with bbox {bbox}")
+    if gt_annotation_entry:
+        body_bbox = gt_annotation_entry.get("gaze_source_body_bbox")
+        head_bbox = gt_annotation_entry.get("gaze_source_head_bbox")
+        selected_bbox: Optional[Tuple[float, float, float, float]] = None
+        bbox_is_normalized = False
+        bbox_source = "head"
+
+        if use_body_bbox and body_bbox is not None:
+            selected_bbox = body_bbox
+            bbox_is_normalized = True
+            bbox_source = "body"
+        if selected_bbox is None and head_bbox is not None:
+            selected_bbox = head_bbox
+            bbox_is_normalized = False
+            bbox_source = "head"
+        if selected_bbox is None and body_bbox is not None:
+            selected_bbox = body_bbox
+            bbox_is_normalized = True
+            bbox_source = "body"
+
+        if selected_bbox is not None:
+            bbox = selected_bbox
+            if bbox_is_normalized:
+                img_width, img_height = image.size
+                x_min = max(0.0, min(img_width, bbox[0] * img_width))
+                y_min = max(0.0, min(img_height, bbox[1] * img_height))
+                x_max = max(0.0, min(img_width, bbox[2] * img_width))
+                y_max = max(0.0, min(img_height, bbox[3] * img_height))
+                bbox = (x_min, y_min, x_max, y_max)
+            person_mask = _create_person_mask_from_bbox(image.size, bbox, scale=person_bbox_scale)
+            person_mask_from_gt = True
+            lookup_key = matched_lookup_key or "unknown"
+            print(f"Using GT person mask from CSV (key='{lookup_key}', source='{bbox_source}') with bbox {bbox}")
     elif should_apply_gt_overrides:
         print(f"⚠️ Warning: GT person entry not found for {image_path}; falling back to mask file {person_mask_path}")
 
@@ -1773,7 +1860,9 @@ def _prepare_inputs(
     print(f"Target mask indices: {atten_indices}")
     if token_coordinate_mapping is not None:
         target_mask_coordinates = token_indices_to_image_coordinates(atten_indices, token_coordinate_mapping)
+        person_mask_coordinates = token_indices_to_image_coordinates(person_mask_indices, token_coordinate_mapping) if person_mask_indices else []
         print(f"Target mask coordinates: {target_mask_coordinates}")
+        print(f"Person mask coordinates: {person_mask_coordinates}")
     else:
         print("Target mask coordinates: unavailable (token mapping not computed)")
     print(f"Person mask available: {person_mask is not None}")

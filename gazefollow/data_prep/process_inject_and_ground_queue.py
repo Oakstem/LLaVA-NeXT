@@ -251,23 +251,6 @@ def _create_image_task(
     return pipeline.ImageTask(image_path=image_path, mask_path=mask_path, image_id=image_id)
 
 
-def _extract_best_error(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, Any]]]:
-    detections: List[Dict[str, Any]] = payload.get("grounding", {}).get("detections", []) or []
-    best_error: Optional[float] = None
-    best_iou: Optional[float] = None
-    best_detection: Optional[Dict[str, Any]] = None
-    for detection in detections:
-        metrics = detection.get("metrics") or {}
-        error = metrics.get("gaze_normalized_l2_error")
-        if error is None:
-            continue
-        if best_error is None or error < best_error:
-            best_error = error
-            best_iou = metrics.get("bbox_iou_vs_person")
-            best_detection = detection
-    return best_error, best_iou, best_detection
-
-
 def _safe_write_csv(df: pd.DataFrame, output_csv: Path, logger: logging.Logger, reason: str) -> bool:
     try:
         df.to_csv(output_csv, index=False)
@@ -317,6 +300,9 @@ def main() -> None:
         write_callback=lambda frame, path, log: _safe_write_csv(frame, path, log, "init"),
         output_csv=cli_args.output_csv,
     )
+    annotation_snapshot_path = output_dir / "queue_snapshot_annotations.csv"
+    df.to_csv(annotation_snapshot_path, index=False)
+    logger.info("Queue snapshot saved to %s for pipeline annotations.", annotation_snapshot_path)
 
     pipeline_args = _build_pipeline_args(
         base_output_dir=output_dir,
@@ -325,7 +311,7 @@ def main() -> None:
         mask_dir=mask_dir,
         use_body_bbox=cli_args.use_body_bbox,
         use_target_insert_for_source=cli_args.use_target_insert_for_source,
-        gt_gaze_csv_path=cli_args.annotation_file,
+        gt_gaze_csv_path=annotation_snapshot_path,
     )
 
     logger.info("Loading models and processors...")
@@ -411,7 +397,7 @@ def main() -> None:
         )
 
         logger.info("%s Processing %s", progress_prefix, task.image_id)
-        payload = pipeline.process_image_task(
+        payload, best_error, best_iou, best_detection, used_retry, used_scaled_retry = pipeline.process_image_task_with_body_bbox_retry(
             task,
             args=pipeline_args,
             tokenizer=tokenizer,
@@ -426,13 +412,31 @@ def main() -> None:
             visualization_dir=visualization_dir,
             qwen_query_template=pipeline_args.query_template,
             attention_mask_viz_dir=False,
+            retry_threshold=cli_args.threshold,
+            retry_iou_threshold=0.2,
+            retry_use_body_bbox=False,
         )
+        if used_retry:
+            logger.info(
+                "%s Retried %s without body bounding boxes after exceeding threshold %.4f",
+                progress_prefix,
+                task.image_id,
+                cli_args.threshold,
+            )
+        if used_scaled_retry:
+            logger.info(
+                "%s Applied scaled person mask retry (scale=0.5) for %s after repeated threshold failures",
+                progress_prefix,
+                task.image_id,
+            )
         per_image_json = output_dir / f"{task.image_id}.json"
         pipeline.save_json(payload, per_image_json)
-        payload.setdefault("artifacts", {})["result_json"] = str(per_image_json)
+        artifacts = payload.setdefault("artifacts", {})
+        artifacts["result_json"] = str(per_image_json)
+        artifacts["body_bbox_retry_used"] = used_retry
+        artifacts["scaled_person_mask_retry_used"] = used_scaled_retry
         results.append(payload)
 
-        best_error, best_iou, best_detection = _extract_best_error(payload)
         if best_error is None:
             skipped_count += 1
             logger.info("%s %s returned no detections. Skipping update.", progress_prefix, task.image_id)

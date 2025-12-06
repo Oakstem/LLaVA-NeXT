@@ -470,6 +470,7 @@ def capture_initial_repr_state(
     guidance_config: Dict[str, Any],
     image_output_dir: Path,
     attention_mask_viz_dir: Optional[Union[str, Path, bool]],
+    person_bbox_scale: float,
 ) -> Optional[Any]:
     """
     Run a short initial pass to cache the representation tensors that will be injected in the real pass.
@@ -509,6 +510,7 @@ def capture_initial_repr_state(
         use_target_insert_for_source=args.use_target_insert_for_source,
         use_body_bbox=args.use_body_bbox,
         attention_mask_viz_dir=attention_mask_viz_dir,
+        person_bbox_scale=person_bbox_scale,
     )
     prev_hidden_state = cache_results.get("first_step_hidden_state")
     if prev_hidden_state is None:
@@ -532,9 +534,13 @@ def process_image_task(
     visualization_dir: Optional[Path],
     qwen_query_template: str,
     attention_mask_viz_dir: Optional[Union[str, Path, bool]] = None,
+    person_bbox_scale: Optional[float] = None,
 ) -> Dict[str, Any]:
     image_output_dir = llava_output_dir / task.image_id
     image_output_dir.mkdir(parents=True, exist_ok=True)
+    effective_person_bbox_scale = float(
+        person_bbox_scale if person_bbox_scale is not None else getattr(args, "person_bbox_scale", 1.0) or 1.0
+    )
     prev_hidden_state = capture_initial_repr_state(
         task=task,
         args=args,
@@ -546,6 +552,7 @@ def process_image_task(
         guidance_config=guidance_config,
         image_output_dir=image_output_dir,
         attention_mask_viz_dir=attention_mask_viz_dir,
+        person_bbox_scale=effective_person_bbox_scale,
     )
     description_results = run_generation_with_attention(
         image_path=str(task.image_path),
@@ -572,6 +579,7 @@ def process_image_task(
         attention_mask_viz_dir=attention_mask_viz_dir,
         use_body_bbox=args.use_body_bbox,
         use_target_insert_for_source=args.use_target_insert_for_source,
+        person_bbox_scale=effective_person_bbox_scale,
     )
     description_text = (description_results.get("generated_text") or "").strip()
     if not description_text:
@@ -650,6 +658,132 @@ def process_image_task(
         },
     }
     return result_payload
+
+
+def summarize_best_detection(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, Any]]]:
+    """Return the lowest normalized L2 error detection, if present."""
+    detections: List[Dict[str, Any]] = payload.get("grounding", {}).get("detections", []) or []
+    best_error: Optional[float] = None
+    best_iou: Optional[float] = None
+    best_detection: Optional[Dict[str, Any]] = None
+    for detection in detections:
+        metrics = detection.get("metrics") or {}
+        error = metrics.get("gaze_normalized_l2_error")
+        if error is None:
+            continue
+        if best_error is None or error < best_error:
+            best_error = error
+            best_iou = metrics.get("bbox_iou_vs_person")
+            best_detection = detection
+    return best_error, best_iou, best_detection
+
+
+def process_image_task_with_body_bbox_retry(
+    task: ImageTask,
+    *,
+    args: argparse.Namespace,
+    tokenizer,
+    model,
+    image_processor,
+    generation_config: Dict[str, Any],
+    attention_config: Dict[str, Any],
+    guidance_config: Dict[str, Any],
+    llava_output_dir: Path,
+    qwen_processor,
+    qwen_model,
+    visualization_dir: Optional[Path],
+    qwen_query_template: str,
+    attention_mask_viz_dir: Optional[Union[str, Path, bool]] = None,
+    retry_threshold: Optional[float] = None,
+    retry_iou_threshold: Optional[float] = 0.2,
+    retry_use_body_bbox: bool = False,
+    retry_run_subdir: str = "retry_without_body_bbox",
+    retry_person_bbox_scale: Optional[float] = None,
+    final_retry_person_bbox_scale: Optional[float] = 0.5,
+    final_retry_run_subdir: str = "retry_person_bbox_half",
+) -> Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]], bool, bool]:
+    """Run the task and optionally retry with a different ``use_body_bbox`` setting."""
+
+    def _run(
+        current_args: argparse.Namespace,
+        current_llava_dir: Path,
+        current_visualization_dir: Optional[Path],
+        *,
+        person_bbox_scale: float,
+    ) -> Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]]]:
+        payload = process_image_task(
+            task,
+            args=current_args,
+            tokenizer=tokenizer,
+            model=model,
+            image_processor=image_processor,
+            generation_config=generation_config,
+            attention_config=attention_config,
+            guidance_config=guidance_config,
+            llava_output_dir=current_llava_dir,
+            qwen_processor=qwen_processor,
+            qwen_model=qwen_model,
+            visualization_dir=current_visualization_dir,
+            qwen_query_template=qwen_query_template,
+            attention_mask_viz_dir=attention_mask_viz_dir,
+            person_bbox_scale=person_bbox_scale,
+        )
+        payload.setdefault("artifacts", {})["use_body_bbox"] = bool(current_args.use_body_bbox)
+        best_error, best_iou, best_detection = summarize_best_detection(payload)
+        return payload, best_error, best_iou, best_detection
+
+    base_person_bbox_scale = float(getattr(args, "person_bbox_scale", 1.0) or 1.0)
+    payload, best_error, best_iou, best_detection = _run(
+        args,
+        llava_output_dir,
+        visualization_dir,
+        person_bbox_scale=base_person_bbox_scale,
+    )
+    used_retry = False
+    used_scaled_retry = False
+
+    error_trigger = retry_threshold is not None and (best_error is None or best_error >= retry_threshold)
+    iou_trigger = retry_iou_threshold is not None and (best_iou is None or best_iou < retry_iou_threshold)
+    should_retry = args.use_body_bbox != retry_use_body_bbox and (error_trigger or iou_trigger)
+    if should_retry:
+        retry_args = copy.deepcopy(args)
+        retry_args.use_body_bbox = retry_use_body_bbox
+        retry_llava_dir = llava_output_dir / retry_run_subdir if retry_run_subdir else llava_output_dir
+        retry_visualization_dir = (
+            (visualization_dir / retry_run_subdir) if (visualization_dir and retry_run_subdir) else visualization_dir
+        )
+        active_retry_scale = retry_person_bbox_scale if retry_person_bbox_scale is not None else base_person_bbox_scale
+        payload, best_error, best_iou, best_detection = _run(
+            retry_args,
+            retry_llava_dir,
+            retry_visualization_dir,
+            person_bbox_scale=active_retry_scale,
+        )
+        used_retry = True
+        needs_scaled_retry = (
+            used_retry
+            and final_retry_person_bbox_scale is not None
+            and retry_threshold is not None
+            and (best_error is None or best_error >= retry_threshold)
+        )
+        if needs_scaled_retry:
+            final_llava_dir = (
+                llava_output_dir / final_retry_run_subdir if final_retry_run_subdir else llava_output_dir
+            )
+            final_visualization_dir = (
+                (visualization_dir / final_retry_run_subdir)
+                if (visualization_dir and final_retry_run_subdir)
+                else visualization_dir
+            )
+            payload, best_error, best_iou, best_detection = _run(
+                retry_args,
+                final_llava_dir,
+                final_visualization_dir,
+                person_bbox_scale=float(final_retry_person_bbox_scale),
+            )
+            used_scaled_retry = True
+
+    return payload, best_error, best_iou, best_detection, used_retry, used_scaled_retry
 
 
 def parse_args() -> argparse.Namespace:

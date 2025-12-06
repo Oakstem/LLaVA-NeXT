@@ -208,6 +208,7 @@ def run_generation_with_attention(
     use_target_insert_for_source: bool = False,
     attention_mask_viz_dir: Optional[Union[str, Path]] = None,
     use_body_bbox: bool = False,
+    person_bbox_scale: float = 1.0,
 ) -> Dict[str, Any]:
     """
     Run generation with attention extraction and optional gaze guidance.
@@ -286,6 +287,7 @@ def run_generation_with_attention(
         insert_image_token=include_image_inputs,
         same_mask_for_person=same_mask_for_person,
         use_body_bbox=use_body_bbox,
+        person_bbox_scale=person_bbox_scale,
     )
 
     target_mask_raw = input_masks.get('target_mask_raw')
