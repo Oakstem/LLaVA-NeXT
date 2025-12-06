@@ -13,7 +13,7 @@
 PROJECT_ROOT="/galitylab/students/alonmardi/projects/LLaVA-NeXT"
 
 # Queue processor configuration
-QUEUE_CSV="${QUEUE_CSV:-$PROJECT_ROOT/gazefollow/data/combined_description_results.csv}"
+QUEUE_CSV="${QUEUE_CSV:-}"
 OUTPUT_CSV="${OUTPUT_CSV:-}"
 THRESHOLD="${THRESHOLD:-0.16}"
 LIMIT="${LIMIT:-}"
@@ -73,11 +73,6 @@ cd "$PROJECT_ROOT"
 mkdir -p logs
 
 # Validate essential paths
-if [ ! -f "$QUEUE_CSV" ]; then
-    echo "ERROR: Queue CSV not found at $QUEUE_CSV"
-    exit 1
-fi
-
 if [ ! -d "$DATA_ROOT" ]; then
     echo "ERROR: Data root not found at $DATA_ROOT"
     exit 1
@@ -106,11 +101,14 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 # Build CLI arguments
 ARGS=(
-    "--queue-csv" "$QUEUE_CSV"
     "--threshold" "$THRESHOLD"
     "--data-root" "$DATA_ROOT"
     "--start-index" "$START_INDEX"
 )
+
+if [ -n "$QUEUE_CSV" ]; then
+    ARGS+=("--queue-csv" "$QUEUE_CSV")
+fi
 
 if [ -n "$OUTPUT_CSV" ]; then
     ARGS+=("--output-csv" "$OUTPUT_CSV")
