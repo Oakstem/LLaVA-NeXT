@@ -17,14 +17,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 from gazefollow.generation_utils import fix_wsl_paths
 from gazefollow.auto_phrase_grounding import extract_and_ground_pipeline as pipeline
+from gazefollow.data_prep import queue_bootstrap_utils as queue_utils
 
 
 LOGGER_NAME = "inject_and_ground_queue"
 DEFAULT_QUEUE_PATH = Path("gazefollow/data/combined_source_extract_patchscope_valid.csv")
+DEFAULT_QUEUE_PATH = None
 DEFAULT_DATA_ROOT = Path(r"D:\Projects\data\gazefollow")
 DEFAULT_OUTPUT_ROOT = Path("results/steered_generation")
 DEFAULT_THRESHOLD = 0.16
-TARGET_DESCRIPTION = True
+TARGET_DESCRIPTION = False
+PATCHSCOPE_DESCRIPTION_COLUMN = "patchscope_target_description" if TARGET_DESCRIPTION else "patchscope_source_description"
+DEFAULT_ANNOTATION_FILE = 'gazefollow/data/test_annotations_release.csv'
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -33,8 +37,18 @@ def parse_cli_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--queue-csv",
-        default=str(DEFAULT_QUEUE_PATH),
+        default=DEFAULT_QUEUE_PATH,
         help="Path to gazefollow/data/inject_and_ground_queue.csv (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--annotation-file",
+        default=DEFAULT_ANNOTATION_FILE,
+        help="Annotation CSV/TXT file used to bootstrap the queue when it is missing or when --rebuild-queue is set. "
+    )
+    parser.add_argument(
+        "--rebuild-queue",
+        action="store_true",
+        help="Force rebuilding the queue CSV from annotations prior to processing.",
     )
     parser.add_argument(
         "--output-csv",
@@ -133,6 +147,7 @@ def _build_pipeline_args(
     mask_dir: Path,
     use_body_bbox: bool,
     use_target_insert_for_source: bool,
+    gt_gaze_csv_path: Path,
 ) -> argparse.Namespace:
     saved_argv = sys.argv
     sys.argv = ["extract_and_ground_pipeline"]
@@ -157,6 +172,7 @@ def _build_pipeline_args(
     pipeline_args.prompt = default_prompt
     pipeline_args.use_body_bbox = use_body_bbox
     pipeline_args.use_target_insert_for_source = use_target_insert_for_source
+    pipeline_args.gt_gaze_csv_path = str(gt_gaze_csv_path)
     return pipeline_args
 
 
@@ -274,9 +290,7 @@ def _has_valid_metric(value: Any) -> bool:
 
 def main() -> None:
     cli_args = parse_cli_args()
-    queue_csv = Path(fix_wsl_paths(cli_args.queue_csv)).expanduser()
-    if not queue_csv.exists():
-        raise FileNotFoundError(f"Queue CSV not found: {queue_csv}")
+    queue_csv = Path(fix_wsl_paths(cli_args.queue_csv)).expanduser() if cli_args.queue_csv is not None else None
 
     output_dir = _resolve_output_dir(cli_args)
     llava_output_dir = output_dir / "llava_runs"
@@ -285,10 +299,24 @@ def main() -> None:
     visualization_dir.mkdir(parents=True, exist_ok=True)
     log_file = Path(fix_wsl_paths(cli_args.log_file)).expanduser() if cli_args.log_file else output_dir / "inject_and_ground.log"
     logger = setup_logger(log_file)
+    cli_args.output_csv = queue_utils.set_output_path_name(
+        queue_csv,
+        annotation_file=cli_args.annotation_file,
+        logger=logger,
+    )
 
     mask_dir = Path(fix_wsl_paths(cli_args.mask_dir)).expanduser()
     mask_dir.mkdir(parents=True, exist_ok=True)
     data_root = Path(fix_wsl_paths(cli_args.data_root)).expanduser()
+
+    df = queue_utils.load_or_initialize_queue(
+        queue_csv=queue_csv,
+        rebuild_queue=cli_args.rebuild_queue,
+        annotation_file=cli_args.annotation_file,
+        logger=logger,
+        write_callback=lambda frame, path, log: _safe_write_csv(frame, path, log, "init"),
+        output_csv=cli_args.output_csv,
+    )
 
     pipeline_args = _build_pipeline_args(
         base_output_dir=output_dir,
@@ -297,6 +325,7 @@ def main() -> None:
         mask_dir=mask_dir,
         use_body_bbox=cli_args.use_body_bbox,
         use_target_insert_for_source=cli_args.use_target_insert_for_source,
+        gt_gaze_csv_path=cli_args.annotation_file,
     )
 
     logger.info("Loading models and processors...")
@@ -305,7 +334,6 @@ def main() -> None:
     )
     logger.info("Models ready. Starting queue processing from %s", queue_csv)
 
-    df = pd.read_csv(queue_csv)
     total_rows = len(df)
     start_index = max(cli_args.start_index, 0)
     if total_rows == 0:
@@ -411,12 +439,17 @@ def main() -> None:
             continue
         df.at[idx, "source_grounding_normalized_l2_error"] = best_error
         df.at[idx, "source_grounding_bbox_iou"] = best_iou
+        grounding_data = payload.get("grounding") or {}
+        query_value = grounding_data.get("query")
+        if isinstance(query_value, str):
+            query_text = query_value.strip()
+        elif query_value is None:
+            query_text = ""
+        else:
+            query_text = str(query_value).strip()
+        df.at[idx, PATCHSCOPE_DESCRIPTION_COLUMN] = query_text
 
         if best_error <= cli_args.threshold:
-            desc_result = payload['grounding']['query']
-            query_text = desc_result.strip()
-            df.at[idx, "source_description"] = query_text
-            df.at[idx, "steered_source_description"] = query_text
             # Clear any previous error reason if it mentioned 'person'
             if 'person' in str(df.at[idx, 'error_reason']).lower():
                 df.at[idx, 'error_reason'] = ''
