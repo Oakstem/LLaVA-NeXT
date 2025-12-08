@@ -8,16 +8,26 @@ import os
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
-from generation_utils import fix_wsl_paths
+import sys
+# set project dir in path
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from gazefollow.generation_utils import fix_wsl_paths
 
 # Define file paths
 # Workspace base: /mnt/d/Projects/LLaVA-NeXT
 # Data base: /mnt/d/Projects/data/gazefollow/
 
 
-COMBINED_CSV_PATH = r"D:\Projects\data\gazefollow\results\valid_runs\combined_description_results.csv"
+COMBINED_CSV_PATH = r"gazefollow/data/test2_combined_description_results.csv"
 # COMBINED_CSV_PATH = r"/mnt/d/Projects/data/gazefollow/results/valid_runs/combined_ppl_desc_results.csv"
 COMBINED_CSV_PATH = fix_wsl_paths(COMBINED_CSV_PATH)
+OUTSIDE_FRAME_TARGET_DESCRIPTION = "something or someone outside the frame"
+MIN_IOU_THRESHOLD_SOURCE = 0.2
+MAX_L2_THRESHOLD_SOURCE = 0.16
+MIN_IOU_THRESHOLD_TARGET = 0.0
+MAX_L2_THRESHOLD_TARGET = 0.12
 
 # Create output directory with timestamp
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -29,7 +39,7 @@ OUTPUT_FILE_PATH = output_dir / f"{timestamp}_sgl_conversation_data.json"
 IMAGE_BASE_PREFIX = "train/" # Using escaped backslashes for JSON string
 
 # Configuration for periodic saving
-SAVE_INTERVAL = 1000  # Save every N processed items
+SAVE_INTERVAL = 30000  # Save every N processed items
 TEMP_SAVE_PREFIX = "sgl_conversation_data_temp"
 
 def load_json_data(file_path):
@@ -146,6 +156,8 @@ def create_conversational_data():
     skipped_due_to_missing_target = 0
     skipped_due_to_missing_data = 0
     skipped_due_to_target_format = 0
+    skipped_due_to_large_source_error = 0
+    skipped_due_to_large_target_error = 0
 
     # Create progress bar
     total_items = len(combined_df)
@@ -167,16 +179,52 @@ def create_conversational_data():
             
         image_key = str(image_key).zfill(8)  # Ensure image_key is zero-padded to 8 digits
         # image_key is like "train/00000041/00041904.jpg"
+        if row['source_description'] == row['steered_source_description']:
+            # if both descriptions are the same, means this was injected by the newly modified patchscope method and we need to validate the l2 and iou
+            if row['source_grounding_bbox_iou'] < MIN_IOU_THRESHOLD_SOURCE or row['source_grounding_normalized_l2_error'] > MAX_L2_THRESHOLD_SOURCE:
+                skipped_due_to_large_source_error += 1
+                continue
+
         # subject_entry is like {"caption": "hairdresser", ...}
-        subject_entry = row["source_description"]       # prefer the person description extracted from the baseline run with no steering [more elaborate]
+        patchscope_subject_entry = row.get("patchscope_source_description", None)
+        if patchscope_subject_entry is not None and isinstance(patchscope_subject_entry, str):
+            if row['source_grounding_normalized_l2_error'] < MAX_L2_THRESHOLD_SOURCE and row['source_grounding_bbox_iou'] > MIN_IOU_THRESHOLD_SOURCE:
+            # use the patchscope extracted subject description if available
+                subject_entry = patchscope_subject_entry
+            else:
+                skipped_due_to_large_source_error += 1
+                continue
+        else:
+            subject_entry = row["source_description"]       # prefer the person description extracted from the baseline run with no steering [more elaborate]
         # fallback to the steered description if the baseline one is missing or NaN
         if subject_entry is None or pd.isna(subject_entry): 
             subject_entry = row["steered_source_description"]
 
+        if pd.isna(subject_entry) or not isinstance(subject_entry, str):
+            # print(f"Warning: Unexpected format for subject_entry in image_key '{image_key}'. Skipping.")
+            skipped_due_to_missing_data += 1
+            continue
 
-        target_entry = row["steered_target_description"]
+        patchscope_target_entry = row.get("patchscope_target_description", None)
+        if patchscope_target_entry is not None and isinstance(patchscope_target_entry, str):
+            if row['target_grounding_normalized_l2_error'] < MAX_L2_THRESHOLD_TARGET and row['target_grounding_bbox_iou'] > MIN_IOU_THRESHOLD_TARGET:
+                # use the patchscope extracted target description if available
+                target_entry = patchscope_target_entry
+            elif row['in_or_out'] == 1:
+                skipped_due_to_large_target_error += 1
+                continue
+        else:
+            target_entry = row["steered_target_description"]    # prefer the steered target description
+        # fallback to the original target description if the steered one is missing or NaN
+        if pd.isna(target_entry) or not isinstance(target_entry, str):
+            if pd.isna(row["target_description"]) or not isinstance(row["target_description"], str):
+                skipped_due_to_missing_target += 1
+                continue
+            else:
+                target_entry = row["target_description"]
+        
         if row['in_or_out'] == 0:
-            target_entry = row['target_description']
+            target_entry = OUTSIDE_FRAME_TARGET_DESCRIPTION
         if not isinstance(target_entry, str):
             print(f"Warning: Unexpected format for target_entry in image_key '{image_key}'. Skipping.")
             skipped_due_to_target_format += 1
@@ -238,7 +286,7 @@ def create_conversational_data():
         # We need to get the part after "train/", which is "00000041/00041904.jpg"
         # And then replace its slashes.
         
-        if image_key.startswith("train/"):
+        if image_key.startswith("train/") or image_key.startswith("test2/"):
             image_suffix_from_key = image_key[len("train/"):] # "00000041/00041904.jpg"
             # image_path_corrected_slashes = image_suffix_from_key.replace("/", "\\\\")
             full_image_path = f"{IMAGE_BASE_PREFIX}{image_suffix_from_key}"
@@ -298,6 +346,8 @@ def create_conversational_data():
     print(f"Skipped (target key not in target file): {skipped_due_to_missing_target}")
     print(f"Skipped (missing caption/target description): {skipped_due_to_missing_data}")
     print(f"Skipped (target value was simple string or unexpected format): {skipped_due_to_target_format}")
+    print(f"Skipped (large source grounding error): {skipped_due_to_large_source_error}")
+    print(f"Skipped (large target grounding error): {skipped_due_to_large_target_error}")
 
     # Final save
     if save_progress(output_data, processed_image_paths, is_final=True):

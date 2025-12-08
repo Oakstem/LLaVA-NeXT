@@ -12,10 +12,12 @@ from pathlib import Path
 import sys
 from typing import List, Any
 import logging
-if __name__ == '__main__':
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+# set project dir in path
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
     
-from generation_utils import fix_wsl_paths
+from gazefollow.generation_utils import fix_wsl_paths
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -206,7 +208,7 @@ def process_json_file(file_path: Path, backup: bool = True, min_people: int = 0)
 def main():
     parser = argparse.ArgumentParser(description='Fix duplicated words in JSON conversation data')
     parser.add_argument('path', nargs='?', 
-                       default=r'D:\Projects\data\gazefollow\results\valid_runs\sgl_conversations_files\20251007_165818_sgl_conversation_data.json',
+                       default=r'/mnt/d/Projects/LLaVA-NeXT/gazefollow/data/sgl_conversations_files/20251205_174741_sgl_conversation_data.json',
                        help='Path to directory containing JSON files or specific JSON file')
     parser.add_argument('--no-backup', action='store_true', 
                        help='Do not create backup files')

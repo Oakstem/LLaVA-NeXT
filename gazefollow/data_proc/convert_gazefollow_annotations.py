@@ -12,6 +12,10 @@ from typing import Iterable, List, Sequence
 DEFAULT_INPUT = Path("gazefollow/data/test_annotations_release.txt")
 DEFAULT_OUTPUT = DEFAULT_INPUT.with_suffix(".csv")
 
+IN_OR_OUT_COLUMN = "in_or_out"
+ORIGINAL_PATH_COLUMN = "original_path"
+DEFAULT_IN_OR_OUT_VALUE = "1"
+
 BASE_COLUMNS: Sequence[str] = (
     "image_path",
     "id",
@@ -27,17 +31,43 @@ BASE_COLUMNS: Sequence[str] = (
     "head_bbox_y_min",
     "head_bbox_x_max",
     "head_bbox_y_max",
-    "in_or_out",
+    IN_OR_OUT_COLUMN,
+    "dataset_source",
     "meta",
 )
 
+IN_OR_OUT_INDEX = BASE_COLUMNS.index(IN_OR_OUT_COLUMN)
 
-def determine_headers(column_count: int) -> List[str]:
-    if column_count == len(BASE_COLUMNS):
-        return list(BASE_COLUMNS)
-    if column_count == len(BASE_COLUMNS) + 1:
-        return [*BASE_COLUMNS, "original_path"]
-    raise ValueError(f"Unexpected column count {column_count}; expected {len(BASE_COLUMNS)} or {len(BASE_COLUMNS) + 1}.")
+
+def determine_headers(first_row: Sequence[str]) -> tuple[List[str], bool]:
+    base_headers = list(BASE_COLUMNS)
+    column_count = len(first_row)
+    base_len = len(base_headers)
+    if column_count == base_len:
+        if _looks_like_in_or_out_value(first_row[IN_OR_OUT_INDEX]):
+            return base_headers, False
+        return [*base_headers, ORIGINAL_PATH_COLUMN], True
+    if column_count == base_len - 1:
+        return base_headers, True
+    if column_count == base_len + 1:
+        return [*base_headers, ORIGINAL_PATH_COLUMN], False
+    raise ValueError(
+        f"Unexpected column count {column_count}; expected between {base_len - 1} and {base_len + 1}."
+    )
+
+
+def _looks_like_in_or_out_value(value: str) -> bool:
+    try:
+        numeric_value = float(value)
+    except ValueError:
+        return False
+    return numeric_value in (0.0, 1.0)
+
+
+def insert_in_or_out_value(row: Sequence[str], value: str = DEFAULT_IN_OR_OUT_VALUE) -> List[str]:
+    result = list(row)
+    result.insert(IN_OR_OUT_INDEX, value)
+    return result
 
 
 def iter_clean_rows(reader: Iterable[List[str]]) -> Iterable[List[str]]:
@@ -61,7 +91,9 @@ def convert_annotations(input_path: Path, output_path: Path) -> tuple[int, List[
             first_row = next(rows_iter)
         except StopIteration:
             raise ValueError(f"Annotation file {input_path} is empty.")
-        headers = determine_headers(len(first_row))
+        headers, needs_in_or_out = determine_headers(first_row)
+        if needs_in_or_out:
+            first_row = insert_in_or_out_value(first_row)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         row_count = 0
@@ -71,6 +103,8 @@ def convert_annotations(input_path: Path, output_path: Path) -> tuple[int, List[
             writer.writerow(first_row + [""] * (len(headers) - len(first_row)))
             row_count = 1
             for row_idx, row in enumerate(rows_iter, start=2):
+                if needs_in_or_out:
+                    row = insert_in_or_out_value(row)
                 if len(row) > len(headers):
                     raise ValueError(
                         f"Row {row_idx} has {len(row)} columns (expected <= {len(headers)}). "

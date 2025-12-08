@@ -44,6 +44,20 @@ def load_dataset(data_path: str) -> List[Dict[str, Any]]:
     return data
 
 
+def collect_sample_ids(samples: List[Dict[str, Any]], source_name: str) -> List[str]:
+    """Return normalized (Path.stem) IDs in order and validate that they exist."""
+    sample_ids: List[str] = []
+    for idx, sample in enumerate(samples):
+        sample_id = sample.get("id")
+        if sample_id is None:
+            raise ValueError(
+                f"Sample at index {idx} in {source_name} is missing an 'id' field"
+            )
+        normalized_id = Path(str(sample_id)).stem
+        sample_ids.append(normalized_id)
+    return sample_ids
+
+
 def split_dataset(data: List[Dict[str, Any]], 
                  train_ratio: float = 0.8, 
                  val_ratio: float = 0.2,
@@ -177,11 +191,15 @@ def main():
                        help="Ratio of data for validation (default: 0.1)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for reproducibility (default: 42)")
-    
+    parser.add_argument("--existing_val_path", type=str, default=None,
+                       help="Path to a previous val.json file to reuse the same validation split")
+
     args = parser.parse_args()
-    
-    # Validate ratios
-    if abs(args.train_ratio + args.val_ratio - 1.0) > 1e-6:
+
+    reuse_existing_val = args.existing_val_path is not None
+
+    # Validate ratios only when a new split will be created
+    if not reuse_existing_val and abs(args.train_ratio + args.val_ratio - 1.0) > 1e-6:
         raise ValueError(f"Train ratio ({args.train_ratio}) + Val ratio ({args.val_ratio}) must equal 1.0")
     
     # Set dataset name if not provided
@@ -198,42 +216,92 @@ def main():
     print(f"  Train ratio: {args.train_ratio}")
     print(f"  Validation ratio: {args.val_ratio}")
     print(f"  Random seed: {args.seed}")
+    if reuse_existing_val:
+        print(f"  Existing val path: {args.existing_val_path}")
     print()
-    
-    try:
-        # Load dataset
-        data = load_dataset(args.input_path)
-        
+
+    # Load dataset
+    data = load_dataset(args.input_path)
+
+    if reuse_existing_val:
+        print(f"Reusing validation split from {args.existing_val_path}")
+        val_reference_data = load_dataset(args.existing_val_path)
+        val_id_sequence = collect_sample_ids(val_reference_data, args.existing_val_path)
+        val_ids = set(val_id_sequence)
+
+        id_to_sample: Dict[str, Dict[str, Any]] = {}
+        duplicate_ids = set()
+        for idx, sample in enumerate(data):
+            sample_id = sample.get("id")
+            if sample_id is None:
+                raise ValueError(
+                    f"Sample at index {idx} in {args.input_path} is missing an 'id' field"
+                )
+            normalized_id = Path(str(sample_id)).stem
+            if normalized_id in id_to_sample:
+                duplicate_ids.add(normalized_id)
+                continue
+            id_to_sample[normalized_id] = sample
+
+        if duplicate_ids:
+            print(
+                f"Warning: {len(duplicate_ids)} duplicate IDs found in the input dataset."
+                " Using the first occurrence for validation reconstruction."
+            )
+
+        dataset_ids = set(id_to_sample.keys())
+        missing_ids = sorted(val_ids - dataset_ids)
+        if missing_ids:
+            print(
+                f"Warning: {len(missing_ids)} validation IDs were not found in the input dataset."
+            )
+
+        val_data = [
+            id_to_sample[sample_id]
+            for sample_id in val_id_sequence
+            if sample_id in id_to_sample
+        ]
+
+        random.seed(args.seed)
+        train_data = [
+            sample
+            for sample in data
+            if Path(str(sample.get("id"))).stem not in val_ids
+        ]
+        random.shuffle(train_data)
+        print(
+            f"Filtered training data contains {len(train_data)} samples after removing existing validation entries"
+        )
+        print(
+            f"Reconstructed validation data contains {len(val_data)} samples derived from the input dataset"
+        )
+    else:
         # Split dataset
         train_data, val_data = split_dataset(
-            data, 
-            train_ratio=args.train_ratio, 
-            val_ratio=args.val_ratio, 
-            seed=args.seed
+            data,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
         )
-        
-        # Create output structure
-        train_path, val_path = create_output_structure(args.output_dir, args.dataset_name)
-        
-        # Save split data
-        save_split_data(train_data, val_data, train_path, val_path)
-        
-        # Create configuration file
-        create_dataset_config(
-            args.output_dir, 
-            args.dataset_name, 
-            len(train_data), 
-            len(val_data),
-            args.input_path
-        )
-        
-        print(f"\nDataset splitting completed successfully!")
-        print(f"Training data: {train_path} ({len(train_data)} samples)")
-        print(f"Validation data: {val_path} ({len(val_data)} samples)")
-        
-    except Exception as e:
-        print(f"Error during dataset splitting: {str(e)}")
-        return 1
+    
+    # Create output structure
+    train_path, val_path = create_output_structure(args.output_dir, args.dataset_name)
+    
+    # Save split data
+    save_split_data(train_data, val_data, train_path, val_path)
+    
+    # Create configuration file
+    create_dataset_config(
+        args.output_dir,
+        args.dataset_name,
+        len(train_data),
+        len(val_data),
+        args.input_path,
+    )
+    
+    print(f"\nDataset splitting completed successfully!")
+    print(f"Training data: {train_path} ({len(train_data)} samples)")
+    print(f"Validation data: {val_path} ({len(val_data)} samples)")
     
     return 0
 
