@@ -872,12 +872,34 @@ class Qwen2DecoderLayer(nn.Module):
 
         return outputs
 
+    def _normalize_index_list(self, values: Optional[Any]) -> List[int]:
+        if values is None:
+            return []
+        if torch.is_tensor(values):
+            values = values.reshape(-1).detach().cpu().tolist()
+        elif isinstance(values, np.ndarray):
+            values = values.reshape(-1).tolist()
+        elif isinstance(values, (list, tuple)):
+            values = list(values)
+        else:
+            values = [values]
+        normalized: List[int] = []
+        for item in values:
+            try:
+                normalized.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
     def _flatten_boost_positions(self, boost_positions) -> List[int]:
         if boost_positions is None:
             return []
         if isinstance(boost_positions, dict):
-            return boost_positions.get("gaze_source", [])
-        return boost_positions
+            combined: List[int] = []
+            combined.extend(self._normalize_index_list(boost_positions.get("gaze_source")))
+            combined.extend(self._normalize_index_list(boost_positions.get("gaze_target")))
+            return combined
+        return self._normalize_index_list(boost_positions)
 
     def _extract_text_row_indices(
         self,
@@ -963,12 +985,15 @@ class Qwen2DecoderLayer(nn.Module):
 
         text_row_lists = self._extract_text_row_indices(tokens_indexing, mask.size(0), mask.size(-2))
         if mask.shape[2] > 1:
-            text_row_lists = [int(val.item()) for val in tokens_indexing['insert_embd']['source']] + [mask.size(-2) - 1]
-            if text_row_lists is None:
+            insert_meta = tokens_indexing.get('insert_embd') if isinstance(tokens_indexing, dict) else None
+            source_positions = self._normalize_index_list(insert_meta.get('source')) if insert_meta else []
+            text_row_lists = source_positions + [mask.size(-2) - 1]
+            if not text_row_lists:
                 mask[..., valid_positions] += bias_strength
             else:
+                valid_positions_arr = np.array(valid_positions)
                 for text_row in text_row_lists:
-                    mask[:, :, text_row, np.array(valid_positions)] += bias_strength
+                    mask[:, :, text_row, valid_positions_arr] += bias_strength
         else:
             mask[..., valid_positions] += bias_strength
 
@@ -1012,72 +1037,97 @@ class Qwen2DecoderLayer(nn.Module):
         bsz, q_len = hidden_size[0], hidden_size[1]
         # debug print
         # print(f"hidden states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape if attention_mask is not None else None}, position_ids shape: {position_ids.shape if position_ids is not None else None}")
-        kwargs['boost_positions'] = None        # todo: remove this line after testing
-        # if kwargs.get("source_attention_mask", None) is None:
-        #     kwargs['boost_positions'] = None
-        if kwargs.get("boost_positions", None) is not None:
-            gaze_target_boost_positions = kwargs.get('boost_positions', None).get('gaze_target', None)
-            gaze_source_boost_positions = kwargs.get('boost_positions', None).get('gaze_source', None)
-            if kwargs.get('tokens_indexing', None) is not None and kwargs.get('tokens_indexing', None).get('insert_embd', None) is not None:    # and kwargs.get('tokens_indexing', None)['insert_embd'][0] >= 2:
-                abs_indexing = True
-                gaze_source_boost_positions = kwargs.get('tokens_indexing', None)['image'][0].detach().cpu().numpy().tolist()
-                # gaze_target_boost_positions = gaze_target_boost_positions + kwargs['tokens_indexing']['text'][0].cpu().tolist()
-                tokens_indexing = kwargs.get('tokens_indexing', None)
-                gaze_source_query_positions = [tokens_indexing['insert_embd']['source']]
-                if len(tokens_indexing['insert_embd']) > 1:
-                    gaze_target_query_positions = [tokens_indexing['insert_embd']['target']]
-                    # if len(tokens_indexing['insert_embd']['target'].size()) < 1:
-                    #     gaze_target_query_positions = [gaze_target_query_positions]
-                    #     gaze_source_query_positions = [gaze_source_query_positions]
+        boost_positions_cfg = kwargs.get("boost_positions", None)
+        if boost_positions_cfg is not None:
+            def _to_list(values):
+                if values is None:
+                    return None
+                if torch.is_tensor(values):
+                    values = values.reshape(-1).detach().cpu().tolist()
+                elif isinstance(values, np.ndarray):
+                    values = values.reshape(-1).tolist()
+                elif isinstance(values, (list, tuple)):
+                    values = list(values)
+                elif isinstance(values, (int, float)):
+                    values = [int(values)]
                 else:
-                    # no second '_' was found in the prompt, so we assume no gaze target boost positions
-                    gaze_target_boost_positions = None
-                    gaze_source_query_positions = [gaze_source_query_positions]
-            # else:
-            #     abs_indexing = False
-            #     gaze_target_query_positions = kwargs.get('query_indices', None).get('gaze_target', None)
-            #     gaze_source_query_positions = kwargs.get('query_indices', None).get('gaze_source', None)
-                attention_bias_positions_gaze_target = self._create_bias_positions_attend_to(gaze_target_boost_positions, gaze_target_query_positions, q_len, abs_indexing) if gaze_target_boost_positions is not None else None
-                attention_bias_positions_gaze_source = self._create_bias_positions_attend_to(gaze_source_boost_positions, gaze_source_query_positions, q_len, abs_indexing) if gaze_source_boost_positions is not None else None
-                # Create or modify attention mask to include positional bias
-                if attention_bias_positions_gaze_target is not None or attention_bias_positions_gaze_source is not None:
-                    kv_seq_len = q_len
-                    # attention_mask = self._add_positional_bias_optimized(
-                    #     attention_mask,
-                    #     attention_bias_positions,
-                    #     0.3,
-                    #     bsz,
-                    #     q_len,
-                    #     kv_seq_len,
-                    #     position_ids
-                    # )
-                    source_attention_mask = kwargs.get("source_attention_mask", None)
-                    if source_attention_mask is not None:
-                        source_attention_mask = attention_mask
-                    target_bias_mat = self._add_positional_bias(attention_mask, attention_bias_positions_gaze_target, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_target is not None else None
-                    try:
-                        source_bias_mat = self._add_positional_bias(source_attention_mask, attention_bias_positions_gaze_source, bsz, q_len, kv_seq_len, position_ids) if attention_bias_positions_gaze_source is not None else None
-                    except Exception as e:
-                        print(f"Error occurred while adding positional bias to source attention mask: {e}")
-                    if kwargs.get("apply_only_target_mask", False):
-                        combined_bias = target_bias_mat
-                        # get all indices where target bias is 0 (not masked), without the source indices
-                        zero_inds = torch.where(source_attention_mask >= 0)
+                    return None
+                values = [int(v) for v in values if v is not None]
+                return values or None
+
+            tokens_indexing = kwargs.get("tokens_indexing", None)
+            insert_positions = tokens_indexing.get("insert_embd") if isinstance(tokens_indexing, dict) else None
+            source_insert_positions = _to_list(insert_positions.get("source")) if insert_positions else None
+            target_insert_positions = _to_list(insert_positions.get("target")) if insert_positions else None
+
+            gaze_source_query_positions = [source_insert_positions] if source_insert_positions else None
+            gaze_target_query_positions = [target_insert_positions] if target_insert_positions else None
+            abs_indexing = bool(source_insert_positions or target_insert_positions)
+
+            gaze_target_boost_positions = _to_list(boost_positions_cfg.get("gaze_target"))
+            gaze_source_boost_positions = _to_list(boost_positions_cfg.get("gaze_source"))
+
+            if (gaze_target_boost_positions and gaze_target_query_positions) or (
+                gaze_source_boost_positions and gaze_source_query_positions
+            ):
+                kv_seq_len = q_len
+                source_attention_mask = kwargs.get("source_attention_mask", None)
+                target_bias_mat = None
+                source_bias_mat = None
+
+                if gaze_target_boost_positions and gaze_target_query_positions:
+                    attention_bias_positions_gaze_target = self._create_bias_positions_attend_to(
+                        gaze_target_boost_positions,
+                        gaze_target_query_positions,
+                        q_len,
+                        abs_indexing,
+                    )
+                    if attention_bias_positions_gaze_target:
+                        target_bias_mat = self._add_positional_bias(
+                            attention_mask,
+                            attention_bias_positions_gaze_target,
+                            bsz,
+                            q_len,
+                            kv_seq_len,
+                            position_ids,
+                        )
+
+                if (
+                    gaze_source_boost_positions
+                    and gaze_source_query_positions
+                    and not kwargs.get("apply_only_target_mask", False)
+                ):
+                    attention_bias_positions_gaze_source = self._create_bias_positions_attend_to(
+                        gaze_source_boost_positions,
+                        gaze_source_query_positions,
+                        q_len,
+                        abs_indexing,
+                    )
+                    if attention_bias_positions_gaze_source:
+                        mask_for_source = source_attention_mask if source_attention_mask is not None else attention_mask
+                        try:
+                            source_bias_mat = self._add_positional_bias(
+                                mask_for_source,
+                                attention_bias_positions_gaze_source,
+                                bsz,
+                                q_len,
+                                kv_seq_len,
+                                position_ids,
+                            )
+                        except Exception as e:
+                            print(f"Error occurred while adding positional bias to source attention mask: {e}")
+
+                bias_to_apply = None
+                if target_bias_mat is not None:
+                    bias_to_apply = target_bias_mat if bias_to_apply is None else bias_to_apply + target_bias_mat
+                if source_bias_mat is not None:
+                    bias_to_apply = source_bias_mat if bias_to_apply is None else bias_to_apply + source_bias_mat
+
+                if bias_to_apply is not None:
+                    if attention_mask is None:
+                        attention_mask = bias_to_apply
                     else:
-                        combined_bias = source_bias_mat
-                        # get all indices where either target or source bias is 0 (not masked & not boosted)
-                        # zero_inds = torch.where(torch.logical_or(attention_mask >= 0, source_attention_mask >= 0))
-                        zero_inds = torch.where(source_attention_mask >= 0)
-                        # zero_inds = torch.where(source_attention_mask >= 0))
-                    # using bitwise-or with parentheses
-                    nonzero_inds = torch.where(combined_bias >= self.bias_strength)
-                    
-                    combined_mask_attention_mask = torch.ones_like(attention_mask, device=attention_mask.device, dtype=attention_mask.dtype) * attention_mask.min()
-                    # nonzero_inds = torch.where(torch.logical_or(target_bias_mat >= self.bias_strength, source_bias_mat >= self.bias_strength))
-                    combined_mask_attention_mask[zero_inds] = 0.0
-                    combined_mask_attention_mask[nonzero_inds] = self.bias_strength
-                    attention_mask = combined_mask_attention_mask
-                    self._attn_mask_ind += 1
+                        attention_mask = attention_mask + bias_to_apply
                 # if self._attn_mask_ind == 1:
                 #     # save the attention mask to csv file
                 #     np.c_[np.where(attention_mask.cpu().numpy().squeeze() >=0)].tofile(f"attention_mask_{self._attn_mask_ind}.csv", sep=",")

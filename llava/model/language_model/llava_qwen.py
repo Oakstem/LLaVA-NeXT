@@ -98,18 +98,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if special_inds.numel() > 0:
             special_inds = torch.unique(special_inds)
             special_inds = special_inds[(special_inds >= 0) & (special_inds < seq_len)]
-            if special_inds.numel() > 2:
-                tokens_indexing["insert_embd"] = {
-                    "source": [special_inds[0].item(), special_inds[2].item()],
-                    "target": [special_inds[1].item()],
-                }
-            elif special_inds.numel() == 2:
-                tokens_indexing["insert_embd"] = {
-                    "source": [special_inds[0].item()],
-                    "target": [special_inds[1].item()],
-                }
-            elif special_inds.numel() == 1:
-                tokens_indexing["insert_embd"] = {"source": [special_inds[0].item()], "target": []}
+            insert_positions = {"source": [], "target": []}
+            for idx, value in enumerate(special_inds.tolist()):
+                if idx % 2 == 0:
+                    insert_positions["source"].append(int(value))
+                else:
+                    insert_positions["target"].append(int(value))
+            tokens_indexing["insert_embd"] = insert_positions
         else:
             tokens_indexing["insert_embd"] = None
 

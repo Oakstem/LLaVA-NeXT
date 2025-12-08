@@ -602,16 +602,14 @@ class LlavaMetaForCausalLM(ABC):
             special_tokens_inds = special_tokens_inds[(special_tokens_inds >= 0) & (special_tokens_inds < full_input_len)]
         else:
             special_tokens_inds = None
-        if special_tokens_inds is not None:
-            if special_tokens_inds.numel() > 2:
-                tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0], special_tokens_inds[2]],
-                                                'target': [special_tokens_inds[1]]}
-            elif special_tokens_inds.numel() == 2:
-                tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0]],
-                                                  'target': [special_tokens_inds[1]]}
-            else:
-                tokens_indexing['insert_embd'] = {'source': [special_tokens_inds[0]], 
-                                                  'target': []}
+        if special_tokens_inds is not None and special_tokens_inds.numel() > 0:
+            insert_positions = {"source": [], "target": []}
+            for idx, value in enumerate(special_tokens_inds.tolist()):
+                if idx % 2 == 0:
+                    insert_positions["source"].append(int(value))
+                else:
+                    insert_positions["target"].append(int(value))
+            tokens_indexing['insert_embd'] = insert_positions
         else:
             tokens_indexing['insert_embd'] = None
 
