@@ -29,6 +29,7 @@ MAX_L2_THRESHOLD_SOURCE = 0.16
 MIN_IOU_THRESHOLD_TARGET = 0.0
 MAX_L2_THRESHOLD_TARGET = 0.12
 
+test_set = 'test' in COMBINED_CSV_PATH.lower()
 # Create output directory with timestamp
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 output_dir = Path(COMBINED_CSV_PATH).parent / f"sgl_conversations_files"
@@ -36,7 +37,7 @@ output_dir.mkdir(parents=True, exist_ok=True)
 OUTPUT_FILE_PATH = output_dir / f"{timestamp}_sgl_conversation_data.json"
 
 # Base path for the image field in the output JSON
-IMAGE_BASE_PREFIX = "train/" # Using escaped backslashes for JSON string
+IMAGE_BASE_PREFIX = "train/" if not test_set else "test2/"  # Using escaped backslashes for JSON string
 
 # Configuration for periodic saving
 SAVE_INTERVAL = 30000  # Save every N processed items
