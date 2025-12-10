@@ -9,18 +9,19 @@ from shutil import copy2
 from typing import Any, Dict, List, Optional, Tuple
 
 
-COMBINED_CSV_PATH = Path("gazefollow/data/combined_description_results.csv")
+COMBINED_CSV_PATH_TRAIN = Path("gazefollow/data/combined_description_results.csv")
+COMBINED_CSV_PATH_TEST = Path("gazefollow/data/test2_combined_description_results.csv")
 _combined_dataset_cache: Optional[Dict[str, Dict[str, str]]] = None
 
 
-def load_combined_description_cache(csv_path: Path = COMBINED_CSV_PATH) -> Dict[str, Dict[str, str]]:
+def load_combined_description_cache(csv_path: Path = COMBINED_CSV_PATH_TRAIN) -> Dict[str, Dict[str, str]]:
     """
     Load the combined description CSV into a dictionary keyed by relative image path.
     Data is cached for subsequent calls.
     """
     global _combined_dataset_cache
 
-    if _combined_dataset_cache is not None and csv_path == COMBINED_CSV_PATH:
+    if _combined_dataset_cache is not None and csv_path == COMBINED_CSV_PATH_TRAIN:
         return _combined_dataset_cache
 
     mapping: Dict[str, Dict[str, str]] = {}
@@ -37,7 +38,7 @@ def load_combined_description_cache(csv_path: Path = COMBINED_CSV_PATH) -> Dict[
     else:
         print(f"Warning: Combined description CSV not found at {csv_path}")
 
-    if csv_path == COMBINED_CSV_PATH:
+    if csv_path == COMBINED_CSV_PATH_TRAIN:
         _combined_dataset_cache = mapping
 
     return mapping

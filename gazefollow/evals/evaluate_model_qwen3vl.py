@@ -425,7 +425,7 @@ def process_sample_with_qwen_grounding(
         mapping_ref,
     )
     if ground_truth_gaze is None and state.combined_cache is None:
-        state.combined_cache = load_combined_description_cache()
+        state.combined_cache = load_combined_description_cache(Path(args.in_out_labels_csv))
         mapping_ref = state.combined_cache or {}
         ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
             sample,
@@ -1190,6 +1190,9 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if 'test' in args.dataset_json.lower():
+        args.in_out_labels_csv = 'gazefollow/data/test2_combined_description_results.csv'
 
     table_log_interval = max(args.table_log_interval, 0)
     progress_log_path = Path(args.table_log_file) if args.table_log_file else output_dir / "generation_progress.jsonl"

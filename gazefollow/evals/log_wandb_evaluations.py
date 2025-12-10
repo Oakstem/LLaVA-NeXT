@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, MutableMapping, Sequence, Tuple
 
-from gazefollow.evals.wandb_dedup import WandbImportError, prune_wandb_run_duplicates
+# from gazefollow.evals.wandb_dedup import WandbImportError, prune_wandb_run_duplicates
 
 
 DEFAULT_PROJECT = "llava-model-eval"
@@ -106,19 +106,19 @@ def main() -> None:
         format="%(levelname)s - %(message)s",
     )
 
-    if args.prune_wandb_duplicates:
-        try:
-            prune_wandb_run_duplicates(
-                project=args.project,
-                entity=args.entity,
-                dry_run=args.dry_run,
-            )
-        except WandbImportError as exc:
-            logging.error("%s", exc)
-            return
-        except RuntimeError as exc:
-            logging.error("Failed to prune W&B duplicates: %s", exc)
-            return
+    # if args.prune_wandb_duplicates:
+    #     try:
+    #         prune_wandb_run_duplicates(
+    #             project=args.project,
+    #             entity=args.entity,
+    #             dry_run=args.dry_run,
+    #         )
+    #     except WandbImportError as exc:
+    #         logging.error("%s", exc)
+    #         return
+    #     except RuntimeError as exc:
+    #         logging.error("Failed to prune W&B duplicates: %s", exc)
+    #         return
 
     runs = collect_evaluation_runs(
         base_dir=args.base_dir,
