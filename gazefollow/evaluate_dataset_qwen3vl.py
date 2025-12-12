@@ -422,7 +422,12 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
         total_person_descriptions += len(persons)
 
         gt_in_out_value = resolve_in_out_label(sample, in_out_lookup, persons)
-        pred_in_out_value = resolve_in_out_label(sample=sample, lookup={}, descriptions=persons)
+        pred_in_out_value = resolve_in_out_label(
+            sample=sample,
+            lookup={},
+            descriptions=persons,
+            use_model_prediction_offcamera=config.use_gpt_gaze_targets,
+        )
         pred_in_out_value = 0 if pred_in_out_value is None else pred_in_out_value
         if pred_in_out_value is not None:
             in_out_counts[pred_in_out_value] = in_out_counts.get(pred_in_out_value, 0) + 1

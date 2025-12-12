@@ -277,6 +277,7 @@ def resolve_in_out_label(
     sample: Mapping[str, Any],
     lookup: Optional[Mapping[str, Any]],
     descriptions: Optional[Iterable[Any]],
+    use_model_prediction_offcamera: bool = False,
 ) -> Optional[int]:
     """
     Resolve an in/out flag for a dataset sample using embedded annotations,
@@ -302,6 +303,11 @@ def resolve_in_out_label(
                 fallback = inferred
         if fallback is not None:
             value = fallback
+
+    if use_model_prediction_offcamera:
+        model_prediction_text = (sample.get("model_prediction") or "").lower()
+        if "off-camera" in model_prediction_text or "off camera" in model_prediction_text:
+            value = 0
 
     return value
 
