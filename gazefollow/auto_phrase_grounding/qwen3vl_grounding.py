@@ -97,6 +97,7 @@ def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
         cleaned = fenced_match.group(1).strip()
 
     decoder = json.JSONDecoder()
+    parsed_arr = []
     for idx, char in enumerate(cleaned):
         if char not in "[{":
             continue
@@ -106,12 +107,11 @@ def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
             continue
 
         if isinstance(parsed, dict):
-            return [parsed]
+            parsed_arr.append(parsed)
         if isinstance(parsed, list):
-            return parsed
+            parsed_arr.extend(parsed)
 
-    return []
-
+    return parsed_arr
 
 
 def load_qwen3vl_model(

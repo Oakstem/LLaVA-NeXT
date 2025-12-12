@@ -58,6 +58,7 @@ class EvaluationConfig:
     gaze_device: Optional[str]
     max_new_tokens: int
     save_records: bool
+    save_every: int
     log_to_wandb: bool
     wandb_project: str
     wandb_entity: Optional[str]
@@ -85,6 +86,7 @@ class EvaluationConfig:
             gaze_device=args.gaze_device,
             max_new_tokens=args.max_new_tokens,
             save_records=args.save_records,
+            save_every=args.save_every,
             log_to_wandb=args.log_to_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
@@ -387,6 +389,36 @@ def create_wandb_run(config: EvaluationConfig, metrics: Dict[str, Any]) -> Optio
     wandb_run = wandb.init(project=project, entity=entity, name=run_name, config=config_payload, reinit=True)
     print(f"Initialized wandb run: {wandb_run.name}")
     return wandb_run
+
+
+def persist_intermediate_results(
+    config: EvaluationConfig,
+    sample_records: List[Dict[str, Any]],
+    person_records: List[PersonLevelRecord],
+    failed_samples: List[FailureRecord],
+    processed_samples: int,
+) -> Path:
+    """
+    Write a checkpoint of the current evaluation progress.
+
+    Saves the latest sample and person-level records (when enabled) along with failures
+    so long-running runs can be resumed after interruptions.
+    """
+    checkpoint_path = config.output_dir / "intermediate_results_latest.json"
+    payload: Dict[str, Any] = {
+        "processed_samples": processed_samples,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "failed_samples": failed_samples,
+    }
+    if config.save_records:
+        payload["sample_records"] = sample_records
+        payload["person_records"] = person_records
+
+    tmp_path = checkpoint_path.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as checkpoint_file:
+        json.dump(payload, checkpoint_file, indent=2, ensure_ascii=False)
+    tmp_path.replace(checkpoint_path)
+    return checkpoint_path
 
 
 def persist_evaluation_results(config: EvaluationConfig, results: EvaluationResults) -> PersistedPaths:

@@ -111,7 +111,7 @@ def merge_results(input_json, results_jsonl, merged_out):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("input_json", help="model_generation_results.json")
-    ap.add_argument("--workdir", default="batch_out", help="where to write files")
+    ap.add_argument("--workdir", default="batch_out/test2_baseline", help="where to write files")
     args = ap.parse_args()
 
     Path(args.workdir).mkdir(parents=True, exist_ok=True)

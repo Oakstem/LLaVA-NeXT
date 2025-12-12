@@ -36,6 +36,8 @@ from gaze_metrics import (
     compute_gaze_errors,
     ensure_ground_truth_gaze,
     load_combined_description_cache,
+    COMBINED_CSV_PATH_TEST,
+    COMBINED_CSV_PATH_TRAIN
 )
 
 try:  # Allow execution both as a module and via direct script invocation.
@@ -51,6 +53,7 @@ try:  # Allow execution both as a module and via direct script invocation.
         extract_score,
         resolve_in_out_label,
         log_results_to_wandb,
+        persist_intermediate_results,
         persist_evaluation_results,
         print_metrics,
     )
@@ -67,6 +70,7 @@ except ImportError:  # pragma: no cover - fallback for CLI execution.
         extract_score,
         resolve_in_out_label,
         log_results_to_wandb,
+        persist_intermediate_results,
         persist_evaluation_results,
         print_metrics,
     )
@@ -147,6 +151,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(save_records=True)
     parser.add_argument(
+        "--save-every",
+        type=int,
+        default=1,
+        help="Save intermediate results every N samples (0 disables periodic saving).",
+    )
+    parser.add_argument(
         "--log-to-wandb",
         dest="log_to_wandb",
         action="store_true",
@@ -178,7 +188,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--in-out-labels-csv",
-        default="gazefollow/data/combined_description_results.csv",
+        default=COMBINED_CSV_PATH_TRAIN,
         help="Optional CSV file produced by add_in_out_labels.py to supply in/out annotations.",
     )
     return parser.parse_args()
@@ -232,6 +242,9 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     dataset = load_dataset(config.dataset_json, config.limit)
     images_dir = config.images_dir
     device_map = config.resolved_device_map()
+    train_set_mode = "train" in config.dataset_json.name.lower()
+    gt_csv_path = COMBINED_CSV_PATH_TRAIN if train_set_mode else COMBINED_CSV_PATH_TEST
+    config.in_out_labels_csv = COMBINED_CSV_PATH_TRAIN if train_set_mode else COMBINED_CSV_PATH_TEST
 
     print(f"Loading Qwen3-VL model '{config.gaze_model_id}' with device map '{device_map}'...")
     qwen_processor, qwen_model = load_qwen3vl_model(config.gaze_model_id, device_map=device_map)
@@ -241,12 +254,13 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     else:
         print("Using parsed ground truth text for gaze targets")
 
-    combined_cache = load_combined_description_cache()
+    combined_cache = load_combined_description_cache(gt_csv_path)
     in_out_lookup = load_in_out_lookup(config.in_out_labels_csv) if config.in_out_labels_csv else None
     if in_out_lookup is not None:
         print(f"Loaded in/out labels from {config.in_out_labels_csv} ({len(in_out_lookup)} entries)")
     missing_in_out: Set[str] = set()
     in_out_counts = {0: 0, 1: 0}
+    config.output_dir.mkdir(parents=True, exist_ok=True)
 
     sample_records: List[Dict[str, Any]] = []
     person_records: List[PersonLevelRecord] = []
@@ -266,6 +280,21 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     samples_with_detections = 0
     total_person_descriptions = 0
     persons_with_detections = 0
+
+    def maybe_save_intermediate() -> None:
+        if config.save_every <= 0:
+            return
+        processed = len(sample_records) + len(failed_samples)
+        if processed == 0 or processed % config.save_every != 0:
+            return
+        checkpoint_path = persist_intermediate_results(
+            config=config,
+            sample_records=sample_records,
+            person_records=person_records,
+            failed_samples=failed_samples,
+            processed_samples=processed,
+        )
+        print(f"Saved intermediate results after {processed} samples to {checkpoint_path}")
 
     start_time = time.time()
 
@@ -288,6 +317,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
                 "image": image_value,
             }
             failed_samples.append(failure_record)
+            maybe_save_intermediate()
             continue
 
         samples_with_ground_truth += 1
@@ -300,6 +330,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
                 "image": image_value,
             }
             failed_samples.append(failure_record)
+            maybe_save_intermediate()
             continue
 
         image = load_image_rgb(image_path)
@@ -337,6 +368,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
             }
             failed_samples.append(failure_record)
             close_image(image)
+            maybe_save_intermediate()
             continue
 
         if gt_updated and ground_truth_gaze:
@@ -358,18 +390,9 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
         ground_truth_point = (gt_x, gt_y)
 
         if config.use_gpt_gaze_targets:
-            gpt_gaze_target = sample.get("gpt_gaze_target", "")
-            gpt_person_description = sample.get("gpt_person_description", "")
-
-            if not gpt_gaze_target:
-                failure_record: FailureRecord = {
-                    "id": sample_id,
-                    "reason": "GPT gaze target not available",
-                    "image": image_value,
-                }
-                failed_samples.append(failure_record)
-                close_image(image)
-                continue
+            gaze_descriptions = sample.get("extracted_gaze")
+            gpt_gaze_target = gaze_descriptions.get("gaze_target", "")
+            gpt_person_description = gaze_descriptions.get("person_description", "")
 
             persons: List[PersonDescription] = [
                 PersonDescription(
@@ -392,14 +415,17 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
                 }
                 failed_samples.append(failure_record)
                 close_image(image)
+                maybe_save_intermediate()
                 continue
 
         samples_with_person_descriptions += 1
         total_person_descriptions += len(persons)
 
-        in_out_value = resolve_in_out_label(sample, in_out_lookup, persons)
-        if in_out_value is not None:
-            in_out_counts[in_out_value] = in_out_counts.get(in_out_value, 0) + 1
+        gt_in_out_value = resolve_in_out_label(sample, in_out_lookup, persons)
+        pred_in_out_value = resolve_in_out_label(sample=sample, lookup={}, descriptions=persons)
+        pred_in_out_value = 0 if pred_in_out_value is None else pred_in_out_value
+        if pred_in_out_value is not None:
+            in_out_counts[pred_in_out_value] = in_out_counts.get(pred_in_out_value, 0) + 1
         elif config.in_out_labels_csv or sample.get("in_out") is not None:
             missing_in_out.add(str(sample_id))
 
@@ -416,8 +442,6 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
             },
             "gaze_detections": {},
         }
-        if in_out_value is not None:
-            sample_entry["in_out"] = in_out_value
 
         any_detection_for_sample = False
 
@@ -437,12 +461,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
             )
 
             if gaze_target_text:
-                query = build_qwen_query(
-                    person.label,
-                    sanitized_description or person.raw_description,
-                    gaze_target_text,
-                    person.person_id,
-                )
+                query = build_qwen_query(gaze_target_text)
                 try:
                     detections, _ = run_qwen3vl_grounding(
                         image_path=str(image_path),
@@ -472,6 +491,13 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
                     gaze_score = extract_score(best_detection)
                     if best_errors is not None:
                         errors = best_errors
+                else:
+                    pred_in_out_value = 0  # No detection implies "out of frame"
+
+            if pred_in_out_value is not None:
+                sample_entry["predicted_in_out"] = pred_in_out_value
+            if gt_in_out_value is not None:
+                sample_entry["gt_in_out"] = gt_in_out_value
 
             record = {
                 "label": person.label,
@@ -527,6 +553,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
 
         sample_records.append(sample_entry)
         close_image(image)
+        maybe_save_intermediate()
 
     duration = time.time() - start_time
 
