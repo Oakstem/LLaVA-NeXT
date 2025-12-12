@@ -21,9 +21,9 @@ def load_combined_description_cache(csv_path: Path = COMBINED_CSV_PATH_TRAIN) ->
     """
     global _combined_dataset_cache
 
-    if _combined_dataset_cache is not None and csv_path == COMBINED_CSV_PATH_TRAIN:
-        return _combined_dataset_cache
-
+    # if _combined_dataset_cache is not None and csv_path == COMBINED_CSV_PATH_TRAIN:
+    #     return _combined_dataset_cache
+    print(f"Loading combined description CSV from {csv_path}...")
     mapping: Dict[str, Dict[str, str]] = {}
     if csv_path.exists():
         with open(csv_path, "r", encoding="utf-8") as csv_file:
@@ -38,8 +38,8 @@ def load_combined_description_cache(csv_path: Path = COMBINED_CSV_PATH_TRAIN) ->
     else:
         print(f"Warning: Combined description CSV not found at {csv_path}")
 
-    if csv_path == COMBINED_CSV_PATH_TRAIN:
-        _combined_dataset_cache = mapping
+    # if csv_path == COMBINED_CSV_PATH_TRAIN:
+    #     _combined_dataset_cache = mapping
 
     return mapping
 

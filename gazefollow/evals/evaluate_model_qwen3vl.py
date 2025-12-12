@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
-
+import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
@@ -82,6 +82,9 @@ from log_wandb_evaluations import (
     split_metrics,
 )
 
+
+DEFAULT_TRAIN_CSV = "gazefollow/data/combined_description_results.csv"
+DEFAULT_TEST_CSV = "gazefollow/data/test2_combined_description_results.csv"
 
 @dataclass
 class EvaluationSampleOutput:
@@ -226,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--in-out-labels-csv",
         type=str,
-        default="gazefollow/data/combined_description_results.csv",
+        default=DEFAULT_TRAIN_CSV,
         help="Optional CSV file that provides precomputed in/out labels (via add_in_out_labels.py).",
     )
     parser.add_argument("--disable-optimizations", action="store_true", help="Skip enabling CUDA optimizations.")
@@ -489,7 +492,8 @@ def process_sample_with_qwen_grounding(
             person_descriptions = parse_person_descriptions(f"Person 1: {prediction_text}")
 
         processor = qwen_model = None
-        if person_descriptions:
+        skip_grounding = predicted_in_out == 0
+        if person_descriptions and not skip_grounding:
             processor, qwen_model = ensure_gaze_resources()
 
         for person in person_descriptions:
@@ -502,7 +506,7 @@ def process_sample_with_qwen_grounding(
 
             detections: List[Dict[str, Any]] = []
             raw_response = ""
-            if processor is not None and qwen_model is not None:
+            if not skip_grounding and processor is not None and qwen_model is not None:
                 try:
                     detections, raw_response = run_qwen3vl_grounding(
                         image_path=str(full_image_path),
@@ -546,7 +550,16 @@ def process_sample_with_qwen_grounding(
                     "y": ground_truth_point[1],
                 }
                 predicted_box = person_entry.get("gaze_coordinates")
-                if predicted_box is not None:
+                if skip_grounding:
+                    nan_errors = {
+                        "gaze_l2_error": np.nan,
+                        "gaze_normalized_l2_error": np.nan,
+                        "gaze_angular_error": np.nan,
+                        "gaze_iou": np.nan,
+                        "gaze_modified_l2_error": np.nan,
+                    }
+                    person_entry.update(nan_errors)
+                elif predicted_box is not None:
                     errors = compute_gaze_errors(
                         predicted_box=predicted_box,
                         person_box=None,
@@ -1176,6 +1189,13 @@ def build_generation_kwargs(args: argparse.Namespace, tokenizer) -> Dict[str, An
 
 def main():
     args = parse_args()
+
+    if 'test' in args.dataset_json.lower():
+        print(f"Using default test CSV for in/out labels: {DEFAULT_TEST_CSV}")
+        args.in_out_labels_csv = DEFAULT_TEST_CSV
+    else:
+        args.in_out_labels_csv = DEFAULT_TRAIN_CSV
+        print(f"Using default train CSV for in/out labels: {DEFAULT_TRAIN_CSV}")
 
     if args.load_4bit and args.load_8bit:
         raise ValueError("Cannot enable both --load-4bit and --load-8bit.")

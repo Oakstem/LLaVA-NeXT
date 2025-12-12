@@ -82,7 +82,7 @@ CKPT_PATH="lmms-lab/llava-onevision-qwen2-7b-ov-chat"
 
 # ===== TRAINING PARAMETERS =====
 # Data configuration
-DATA_PATH="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/train.json"
+DATA_PATH="training_datasets/20251205_174741_sgl_conversation_data_20251206_191724/train.json"
 IMAGE_FOLDER="/galitylab/students/alonmardi/gazefollow"
 OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs"
 # DEEPSPEED_CONFIG="scripts/zero3.json"
@@ -106,7 +106,7 @@ MM_PATCH_MERGE_TYPE="spatial_unpad"
 # LoRA parameters
 LORA_ENABLE="True"
 LORA_R="16"
-LORA_ALPHA="16"
+LORA_ALPHA="32"
 MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
@@ -115,7 +115,7 @@ PER_DEVICE_TRAIN_BATCH_SIZE="1"  # Reduced from 2 to 1
 PER_DEVICE_EVAL_BATCH_SIZE="2"  # Reduced from 4 to 2
 GRADIENT_ACCUMULATION_STEPS="8"  # Increased to maintain effective batch size
 GRADIENT_CHECKPOINTING="False"
-LEARNING_RATE="5e-6"
+LEARNING_RATE="1e-5"
 WEIGHT_DECAY="0.01"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Match
 import sys
 
-TARGET_PHRASE = "something or someone outside the image"
+TARGET_PHRASE = "something or someone"
 LOOKING_AT_PATTERN = re.compile(r"(?i)(looking at)([^.?!]*)")
 LOOKING_OUTSIDE_PATTERN = re.compile(
     r"(?i)(looking)(\s+)(?:outside(?:\s+of)?|out of)\s+(?:the|the\s+frame|frame|scene|photo|picture|shot)"

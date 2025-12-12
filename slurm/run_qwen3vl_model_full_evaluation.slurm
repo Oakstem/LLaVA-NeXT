@@ -29,7 +29,7 @@ LOAD_4BIT="${LOAD_4BIT:-false}"
 LOAD_8BIT="${LOAD_8BIT:-false}"
 
 # Dataset configuration
-DATASET_JSON="${DATASET_JSON:-training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/val.json}"
+DATASET_JSON="${DATASET_JSON:-training_datasets/test2_20251207_203048_sgl_conversation_data.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 LIMIT="${LIMIT:-}"
 
