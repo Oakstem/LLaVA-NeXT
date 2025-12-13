@@ -90,9 +90,9 @@ DEEPSPEED_CONFIG="scripts/zero1.json"
 
 # Model architecture parameters
 MM_TUNABLE_PARTS="mm_projector,model.layers[-8:].self_attn.{q_proj,v_proj,o_proj},model.layers[-8:].mlp,"
-MM_TUNABLE_PARTS+="model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
+# MM_TUNABLE_PARTS+="model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
 #"mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},vision_tower.vision_model.encoder.layers[-4:].mlp"
-MM_VISION_TOWER_LR="3e-6"
+MM_VISION_TOWER_LR="1e-5"
 MM_PROJECTOR_TYPE="mlp2x_gelu"
 MM_VISION_SELECT_LAYER="-2"
 MM_USE_IM_START_END="False"
@@ -106,16 +106,16 @@ MM_PATCH_MERGE_TYPE="spatial_unpad"
 # LoRA parameters
 LORA_ENABLE="True"
 LORA_R="16"
-LORA_ALPHA="32"
+LORA_ALPHA="64"
 MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
-NUM_TRAIN_EPOCHS="2"
+NUM_TRAIN_EPOCHS="3"
 PER_DEVICE_TRAIN_BATCH_SIZE="1"  # Reduced from 2 to 1
 PER_DEVICE_EVAL_BATCH_SIZE="2"  # Reduced from 4 to 2
 GRADIENT_ACCUMULATION_STEPS="8"  # Increased to maintain effective batch size
 GRADIENT_CHECKPOINTING="False"
-LEARNING_RATE="1e-5"
+LEARNING_RATE="2e-5"
 WEIGHT_DECAY="0.01"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
