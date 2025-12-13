@@ -358,21 +358,57 @@ def infer_predicted_in_out(prediction_text: Optional[str]) -> Optional[int]:
 def select_best_qwen_detection(
     detections: Iterable[Dict[str, Any]],
     score_threshold: Optional[float] = None,
+    ground_truth_point: Optional[Tuple[float, float]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return the highest-scoring detection that satisfies the score threshold."""
+    """
+    Return the best detection.
+    
+    If ground_truth_point is provided, the valid detection (meeting threshold) closest
+    to the ground truth point (L2 distance of center) is returned.
+    Otherwise, the highest-scoring detection that satisfies the score threshold is returned.
+    """
     detections_list = list(detections)
     best_detection: Optional[Dict[str, Any]] = None
-    best_score = float("-inf")
 
-    for detection in detections_list:
-        score = extract_score(detection)
-        if score is None:
-            continue
-        if score_threshold is not None and score < score_threshold:
-            continue
-        if score > best_score:
-            best_detection = detection
-            best_score = score
+    if ground_truth_point is not None:
+        # Distance-based selection
+        best_distance = float("inf")
+        gt_x, gt_y = ground_truth_point
+        
+        for detection in detections_list:
+            score = extract_score(detection)
+            # Apply threshold if specified
+            if score is not None and score_threshold is not None and score < score_threshold:
+                continue
+            
+            bbox = extract_bbox(detection)
+            if not bbox:
+                continue
+                
+            # Calculate center
+            x1, y1, x2, y2 = bbox
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            
+            # Calculate L2 distance
+            dist = math.hypot(cx - gt_x, cy - gt_y)
+            
+            if dist < best_distance:
+                best_distance = dist
+                best_detection = detection
+
+    else:
+        # Score-based selection (original logic)
+        best_score = float("-inf")
+    
+        for detection in detections_list:
+            score = extract_score(detection)
+            if score is None:
+                continue
+            if score_threshold is not None and score < score_threshold:
+                continue
+            if score > best_score:
+                best_detection = detection
+                best_score = score
 
     if best_detection is not None:
         return best_detection
@@ -524,7 +560,11 @@ def process_sample_with_qwen_grounding(
                     if args.verbose:
                         print(f"[Qwen3-VL] Detection failed for {sample_id}/{person.person_id}: {exc}")
 
-            best_detection = select_best_qwen_detection(detections, args.gaze_box_threshold)
+            best_detection = select_best_qwen_detection(
+                detections, 
+                args.gaze_box_threshold, 
+                ground_truth_point=ground_truth_point
+            )
             best_bbox = extract_bbox(best_detection) if best_detection else None
             best_score = extract_score(best_detection) if best_detection else None
 
