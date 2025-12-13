@@ -22,13 +22,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path("evaluation_results"),
+        default=Path("mini_eval_batch"),
         help="Root directory to search for localization result JSON files (default: evaluation_results).",
     )
     parser.add_argument(
         "--baseline-substring",
         type=str,
-        default="baseline_llava",
+        default="qwen3vl_grounding_run_test2_baseline_20251212_185428",
         help="Substring to identify the baseline localization file (default: baseline_llava).",
     )
     parser.add_argument(
@@ -166,7 +166,9 @@ def load_dataset_metrics(path: Path) -> DatasetMetrics:
         gaze_target = person.get("gaze_target")
 
         dataset.in_out_labels[str(sample_id)] = in_out_flag
-        inferred_in_out = infer_in_out_from_phrase(gaze_target)
+        inferred_in_out = entry.get("pred_in_out")
+        if inferred_in_out is None:
+            inferred_in_out = infer_in_out_from_phrase(gaze_target)
         if inferred_in_out == 0:
             person["gaze_coordinates"] = None
             person["gaze_normalized_l2_error"] = None
