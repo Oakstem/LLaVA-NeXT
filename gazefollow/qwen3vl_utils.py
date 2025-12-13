@@ -70,7 +70,7 @@ class EvaluationConfig:
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "EvaluationConfig":
         if args.output_dir is None:
-            dataset_stem = Path(args.dataset_json).parent.stem
+            dataset_stem = Path(args.dataset_json).stem
             dataset_dir = Path(args.dataset_json).parent
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             args.output_dir = f"{dataset_dir}/qwen3vl_grounding_run_{dataset_stem}_{timestamp}"
@@ -371,7 +371,7 @@ def create_wandb_run(config: EvaluationConfig, metrics: Dict[str, Any]) -> Optio
     if config.wandb_run_name:
         run_name = config.wandb_run_name
     else:
-        run_name = f"dataset-eval-{dataset_stem}-{model_stem}-{timestamp}"
+        run_name = f"dataset-eval-{dataset_stem}-{timestamp}"
         if config.wandb_run_name_suffix:
             run_name = f"{run_name}-{config.wandb_run_name_suffix}"
 
