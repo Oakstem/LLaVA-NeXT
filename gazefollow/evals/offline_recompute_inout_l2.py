@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Recompute in/out labels and gaze metrics from an evaluation result directory."""
+"""Recompute in/out labels and gaze metrics for a finished eval run.
+
+This script reloads saved generation tables, re-derives in/out labels from the
+raw text predictions, and recomputes gaze errors so we can compare results even
+after changing label logic or filtering rules without rerunning the expensive
+vision-language model. In contrast to `evaluate_model_qwen3vl.py`, which assigns
+in/out during live evaluation with simple outside-phrase heuristics, this
+offline pass re-runs the full person parsing plus `resolve_in_out_label` on both
+ground truth and predictions (overriding stored `predicted_in_out`) so metrics
+reflect the latest label resolution rules."""
 
 from __future__ import annotations
 
