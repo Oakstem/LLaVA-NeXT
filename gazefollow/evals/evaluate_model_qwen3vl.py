@@ -395,7 +395,6 @@ def select_best_qwen_detection(
             if dist < best_distance:
                 best_distance = dist
                 best_detection = detection
-
     else:
         # Score-based selection (original logic)
         best_score = float("-inf")
@@ -451,8 +450,8 @@ def process_sample_with_qwen_grounding(
     if not ground_truth_descriptions and ground_truth:
         ground_truth_descriptions = parse_person_descriptions(f"Person 1: {ground_truth}")
 
-    in_out_value = resolve_in_out_label(sample, in_out_lookup, ground_truth_descriptions)
-    if in_out_value is None and (args.in_out_labels_csv or sample.get("in_out") is not None):
+    gt_in_out_value = resolve_in_out_label(sample, in_out_lookup, ground_truth_descriptions, use_model_prediction_offcamera=True)
+    if gt_in_out_value is None and (args.in_out_labels_csv or sample.get("in_out") is not None):
         state.missing_in_out_samples.add(str(sample_id))
 
     mapping_ref = state.combined_cache if state.combined_cache is not None else {}
@@ -517,8 +516,8 @@ def process_sample_with_qwen_grounding(
             "image_width": image_width_px,
             "image_height": image_height_px,
         }
-    if in_out_value is not None:
-        prediction_entry["in_out"] = in_out_value
+    if gt_in_out_value is not None:
+        prediction_entry["gt_in_out"] = gt_in_out_value
     state.predictions_output.append(prediction_entry)
 
     if generate_model_results:
@@ -592,11 +591,11 @@ def process_sample_with_qwen_grounding(
                 predicted_box = person_entry.get("gaze_coordinates")
                 if skip_grounding:
                     nan_errors = {
-                        "gaze_l2_error": np.nan,
-                        "gaze_normalized_l2_error": np.nan,
-                        "gaze_angular_error": np.nan,
-                        "gaze_iou": np.nan,
-                        "gaze_modified_l2_error": np.nan,
+                        "gaze_l2_error": None,
+                        "gaze_normalized_l2_error": None,
+                        "gaze_angular_error": None,
+                        "gaze_iou": None,
+                        "gaze_modified_l2_error": None,
                     }
                     person_entry.update(nan_errors)
                 elif predicted_box is not None:
@@ -608,12 +607,12 @@ def process_sample_with_qwen_grounding(
                         image_height=image_height_px,
                         iou_radius_ratio=args.gaze_iou_radius_ratio,
                     )
-                    if in_out_value == 0:
+                    if gt_in_out_value == 0:
                         sanitized_errors = {key: None for key in errors.keys()}
                     else:
                         sanitized_errors = errors
                     person_entry.update(sanitized_errors)
-                    if in_out_value != 0:
+                    if gt_in_out_value != 0:
                         if sanitized_errors.get("gaze_l2_error") is not None:
                             state.gaze_l2_errors.append(sanitized_errors["gaze_l2_error"])
                         if sanitized_errors.get("gaze_normalized_l2_error") is not None:
@@ -648,8 +647,8 @@ def process_sample_with_qwen_grounding(
                 "image_width": image_width_px,
                 "image_height": image_height_px,
             }
-        if in_out_value is not None:
-            model_entry["in_out"] = in_out_value
+        if gt_in_out_value is not None:
+            model_entry["gt_in_out"] = gt_in_out_value
         state.model_generation_records.append(model_entry)
         new_rows = format_generation_sample(model_entry)
         if new_rows:
@@ -1510,7 +1509,7 @@ def main():
     in_out_predictions: List[int] = []
     in_out_labels: List[int] = []
     for entry in predictions_output:
-        gt_label = entry.get("in_out")
+        gt_label = entry.get("gt_in_out")
         predicted_flag = entry.get("predicted_in_out")
         if not isinstance(predicted_flag, int) or not isinstance(gt_label, int):
             continue
