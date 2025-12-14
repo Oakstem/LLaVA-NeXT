@@ -23,13 +23,13 @@ PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/.ground-uv/bin/python}"
 # Model configuration
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-ADAPTER_PATH="${ADAPTER_PATH:-training_outputs/llava-20251104_230921/checkpoint-16000}"
+ADAPTER_PATH="${ADAPTER_PATH:-training_outputs/llava-20251212_203247/checkpoint-12000}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 LOAD_4BIT="${LOAD_4BIT:-false}"
 LOAD_8BIT="${LOAD_8BIT:-false}"
 
 # Dataset configuration
-DATASET_JSON="${DATASET_JSON:-training_datasets/test2_20251207_203048_sgl_conversation_data.json}"
+DATASET_JSON="${DATASET_JSON:-training_datasets/test2_20251210_160156_sgl_conversation_data.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 LIMIT="${LIMIT:-}"
 

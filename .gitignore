@@ -7,8 +7,8 @@ dist
 # Log
 *.log
 *.log.*
-# *.json
-# *.jsonl
+*.json
+*.jsonl
 
 # Data
 !**/alpaca-data-conversation.json
@@ -84,3 +84,4 @@ evaluation_result*/
 .venv/
 similarity_outputs/*
 text_embeddings/*
+*.bak*

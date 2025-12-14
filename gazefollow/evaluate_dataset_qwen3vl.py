@@ -242,7 +242,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     dataset = load_dataset(config.dataset_json, config.limit)
     images_dir = config.images_dir
     device_map = config.resolved_device_map()
-    train_set_mode = "train" in config.dataset_json.name.lower()
+    train_set_mode = "train" in config.dataset_json.name.lower() or 'val' in config.dataset_json.name.lower()
     gt_csv_path = COMBINED_CSV_PATH_TRAIN if train_set_mode else COMBINED_CSV_PATH_TEST
     config.in_out_labels_csv = COMBINED_CSV_PATH_TRAIN if train_set_mode else COMBINED_CSV_PATH_TEST
 
