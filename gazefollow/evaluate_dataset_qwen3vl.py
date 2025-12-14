@@ -465,7 +465,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
                 iou_radius_ratio=config.gaze_iou_radius_ratio,
             )
 
-            if gaze_target_text:
+            if gaze_target_text and gt_in_out_value == 1:
                 query = build_qwen_query(gaze_target_text)
                 try:
                     detections, _ = run_qwen3vl_grounding(
