@@ -1,13 +1,13 @@
 """Split combined conversation datasets into train and validation files.
 
-This utility scans each dataset directory inside ``training_datasets/qwen_sets`` (or a
-custom root) and looks for ``combined_conversations.json``. For every combined file it
-produces ``train.json`` and ``val.json`` in a user-specified subdirectory, either by
-matching a reference ``val.json`` file or by randomly sampling using a ratio.
+By default, the script splits a single combined JSON file (``--combined-path``). When a
+``--datasets-root`` is provided, it iterates over each subdirectory and looks for the
+combined JSON relative to that directory. Splits can be derived from a reference
+``val.json`` or a ratio-based sample.
 
 Usage examples:
-    python split_combined_conversations.py --reference-val path/to/val.json
-    python split_combined_conversations.py --val-ratio 0.15 --seed 123
+    python split_combined_conversations.py --combined-path sgl_conversation_data.json --val-ratio 0.15
+    python split_combined_conversations.py --datasets-root training_datasets/qwen_sets --combined-path combined_conversations.json --reference-val path/to/val.json
 """
 
 from __future__ import annotations
@@ -26,10 +26,19 @@ def parse_args() -> argparse.Namespace:
         description="Split combined_conversations.json files into train/val splits."
     )
     parser.add_argument(
+        "--combined-path",
+        type=Path,
+        default=Path("sgl_conversation_data.json"),
+        help=(
+            "Path to the combined dataset JSON when splitting a single dataset. "
+            "If --datasets-root is set and this path is relative, it is resolved inside each dataset directory."
+        ),
+    )
+    parser.add_argument(
         "--datasets-root",
         type=Path,
-        default=Path("training_datasets/qwen_sets"),
-        help="Directory containing per-run folders with combined_conversations.json files.",
+        default=None,
+        help="Optional root containing per-run folders. When set, the script iterates each subdirectory and looks for the combined JSON inside it.",
     )
     parser.add_argument(
         "--reference-val",
@@ -103,6 +112,7 @@ def build_image_id_map(samples: Sequence[dict]) -> dict:
         image_id = sample.get("image_id")
         if image_id is None:
             raise KeyError("Sample missing image_id after ensure_image_ids call")
+        image_id = Path(image_id).stem
         image_map.setdefault(image_id, []).append(sample)
     return image_map
 
@@ -151,6 +161,42 @@ def split_with_ratio(
     return train_samples, val_samples
 
 
+def split_and_save(
+    combined_path: Path,
+    target_dir: Path,
+    reference_val: Path | None,
+    val_ratio: float | None,
+    seed: int,
+) -> Tuple[int, int, int]:
+    combined_samples = ensure_image_ids(ensure_ids(load_json_list(combined_path)))
+    if reference_val:
+        train_samples, val_samples = split_from_reference(combined_samples, reference_val)
+    else:
+        train_samples, val_samples = split_with_ratio(combined_samples, val_ratio, seed)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    train_path = target_dir / "train.json"
+    val_path = target_dir / "val.json"
+
+    with train_path.open("w", encoding="utf-8") as f:
+        json.dump(train_samples, f, indent=2)
+    with val_path.open("w", encoding="utf-8") as f:
+        json.dump(val_samples, f, indent=2)
+
+    metrics_path = target_dir / "split_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "train_samples": len(train_samples),
+                "val_samples": len(val_samples),
+                "total_samples": len(combined_samples),
+            },
+            f,
+            indent=2,
+        )
+    return len(train_samples), len(val_samples), len(combined_samples)
+
+
 def iter_dataset_dirs(root: Path, datasets: Iterable[str] | None) -> Iterable[Path]:
     if datasets:
         for dataset_name in datasets:
@@ -161,68 +207,83 @@ def iter_dataset_dirs(root: Path, datasets: Iterable[str] | None) -> Iterable[Pa
             yield path
 
 
-def main() -> None:
-    args = parse_args()
-    datasets_root = args.datasets_root
+def split_datasets_root(
+    datasets_root: Path,
+    combined_path: Path,
+    output_subdir: str,
+    datasets: Iterable[str] | None,
+    reference_val: Path | None,
+    val_ratio: float | None,
+    seed: int,
+) -> int:
     if not datasets_root.exists():
         raise FileNotFoundError(f"Datasets root {datasets_root} does not exist")
 
-    if args.reference_val is None and args.val_ratio is None:
-        raise ValueError("Either --reference-val or --val-ratio must be provided.")
-
-    output_subdir = (
-        args.output_subdir if args.output_subdir else f"split_{int(time.time())}"
-    )
-
     processed = 0
-    for dataset_dir in iter_dataset_dirs(datasets_root, args.datasets):
-        combined_path = dataset_dir / "combined_conversations.json"
-        if not combined_path.exists():
+    for dataset_dir in iter_dataset_dirs(datasets_root, datasets):
+        resolved_combined = (
+            combined_path if combined_path.is_absolute() else dataset_dir / combined_path
+        )
+        if not resolved_combined.exists():
             continue
 
-        combined_samples = ensure_image_ids(ensure_ids(load_json_list(combined_path)))
-        if args.reference_val:
-            train_samples, val_samples = split_from_reference(
-                combined_samples, args.reference_val
-            )
-        else:
-            train_samples, val_samples = split_with_ratio(
-                combined_samples, args.val_ratio, args.seed
-            )
-
         target_dir = dataset_dir / output_subdir
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        train_path = target_dir / "train.json"
-        val_path = target_dir / "val.json"
-
-        with train_path.open("w", encoding="utf-8") as f:
-            json.dump(train_samples, f, indent=2)
-        with val_path.open("w", encoding="utf-8") as f:
-            json.dump(val_samples, f, indent=2)
-        metrics_path = target_dir / "split_metrics.json"
-        with metrics_path.open("w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "train_samples": len(train_samples),
-                    "val_samples": len(val_samples),
-                    "total_samples": len(combined_samples),
-                },
-                f,
-                indent=2,
-            )
-
+        train_count, val_count, total = split_and_save(
+            resolved_combined,
+            target_dir,
+            reference_val,
+            val_ratio,
+            seed,
+        )
         print(
-            f"[INFO] {dataset_dir.name}: wrote {len(train_samples)} train and {len(val_samples)} val samples "
-            f"to {target_dir}"
+            f"[INFO] {dataset_dir.name}: wrote {train_count} train and {val_count} val samples to {target_dir} "
+            f"(total {total})"
         )
         processed += 1
 
     if processed == 0:
         print(
-            f"[WARN] No combined_conversations.json files found under {datasets_root}",
+            f"[WARN] No combined files found under {datasets_root} using {combined_path}",
             file=sys.stderr,
         )
+    return processed
+
+
+def main() -> None:
+    args = parse_args()
+    if args.reference_val is None and args.val_ratio is None:
+        raise ValueError("Either --reference-val or --val-ratio must be provided.")
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    combined_stem = args.combined_path.stem
+    output_subdir = (
+        args.output_subdir if args.output_subdir else f"{combined_stem}_{timestamp}"
+    )
+
+    if args.datasets_root:
+        split_datasets_root(
+            args.datasets_root,
+            args.combined_path,
+            output_subdir,
+            args.datasets,
+            args.reference_val,
+            args.val_ratio,
+            args.seed,
+        )
+        return
+
+    combined_path = args.combined_path
+    if not combined_path.exists():
+        raise FileNotFoundError(f"Combined dataset file {combined_path} does not exist")
+    target_dir = (
+        combined_path.parent / output_subdir if combined_path.parent != Path("") else Path(output_subdir)
+    )
+    train_count, val_count, total = split_and_save(
+        combined_path, target_dir, args.reference_val, args.val_ratio, args.seed
+    )
+    print(
+        f"[INFO] Single dataset: wrote {train_count} train and {val_count} val samples to {target_dir} (total {total})"
+    )
 
 
 if __name__ == "__main__":
