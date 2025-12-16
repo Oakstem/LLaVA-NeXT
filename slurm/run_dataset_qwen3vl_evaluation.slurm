@@ -10,11 +10,12 @@
 #SBATCH --nodes=1
 
 # Configuration variables (override via environment if needed)
-DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val.json}"
+DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/train.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 DATASET_BASENAME=$(basename "$DATASET_JSON" .json)
 OUTPUT_DIR="${OUTPUT_DIR:-./dataset_evaluation_results/qwen3vl_${DATASET_BASENAME}_$(date +%Y%m%d_%H%M%S)}"
 LIMIT="${LIMIT:-}"  # Optional subset for quick checks
+RESUME_FROM="${RESUME_FROM:-dataset_evaluation_results/qwen3vl_train_20251213_223625/intermediate_results_latest.json}"  # Path to intermediate_results_latest.json
 
 GAZE_MODEL_ID="${GAZE_MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
 GAZE_BOX_THRESHOLD="${GAZE_BOX_THRESHOLD:-0.20}"
@@ -35,6 +36,9 @@ IN_OUT_LABELS_CSV="${IN_OUT_LABELS_CSV:-}"
 
 # Prepare directories
 mkdir -p logs
+if [ -n "$RESUME_FROM" ]; then
+    OUTPUT_DIR="$(dirname "$RESUME_FROM")"
+fi
 mkdir -p "$(dirname "$OUTPUT_DIR")"
 mkdir -p "$OUTPUT_DIR"
 
@@ -49,6 +53,9 @@ echo "Dataset JSON: $DATASET_JSON"
 echo "Images Directory: $IMAGES_DIR"
 echo "Output Directory: $OUTPUT_DIR"
 echo "Sample Limit: ${LIMIT:-none}"
+if [ -n "$RESUME_FROM" ]; then
+    echo "Resuming from: $RESUME_FROM"
+fi
 echo ""
 echo "Qwen3-VL:"
 echo "  Model ID: $GAZE_MODEL_ID"
@@ -140,6 +147,9 @@ fi
 
 if [ -n "$IN_OUT_LABELS_CSV" ]; then
     ARGS+=("--in-out-labels-csv" "$IN_OUT_LABELS_CSV")
+fi
+if [ -n "$RESUME_FROM" ]; then
+    ARGS+=("--resume-from" "$RESUME_FROM")
 fi
 
 if [ "$WANDB" = "false" ]; then

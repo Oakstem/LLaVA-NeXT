@@ -102,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory where evaluation artifacts will be stored.",
     )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Path to an intermediate_results_latest.json checkpoint to resume from.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of samples to process.")
     parser.add_argument(
         "--gaze-model-id",
@@ -240,6 +245,7 @@ def resolve_image_path(image_value: str, images_dir: Path) -> Optional[Path]:
 
 def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     dataset = load_dataset(config.dataset_json, config.limit)
+    total_samples = len(dataset)
     images_dir = config.images_dir
     device_map = config.resolved_device_map()
     train_set_mode = "train" in config.dataset_json.name.lower() or 'val' in config.dataset_json.name.lower()
@@ -267,6 +273,28 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     failed_samples: List[FailureRecord] = []
     dataset_gt_updates: List[DatasetUpdateRecord] = []
     dataset_updated = False
+    already_processed = 0
+
+    if config.resume_from:
+        resume_path = config.resume_from
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        with resume_path.open("r", encoding="utf-8") as resume_file:
+            resume_payload = json.load(resume_file)
+        sample_records = resume_payload.get("sample_records", [])
+        person_records = resume_payload.get("person_records", [])
+        failed_samples = resume_payload.get("failed_samples", [])
+        dataset_gt_updates = resume_payload.get("dataset_gt_updates", [])
+        dataset_updated = bool(resume_payload.get("dataset_updated", dataset_gt_updates))
+        already_processed = int(
+            resume_payload.get("processed_samples", len(sample_records) + len(failed_samples))
+        )
+        already_processed = max(already_processed, len(sample_records) + len(failed_samples))
+        start_index = min(already_processed, len(dataset))
+        if start_index:
+            dataset = dataset[start_index:]
+            print(f"Resuming from {resume_path} ({already_processed} samples already processed)")
+        total_samples = max(total_samples, already_processed)
 
     gaze_l2_errors: List[float] = []
     gaze_normalized_l2_errors: List[float] = []
@@ -274,17 +302,78 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     gaze_ious: List[float] = []
     gaze_modified_l2_errors: List[float] = []
 
-    total_samples = len(dataset)
     samples_with_ground_truth = 0
     samples_with_person_descriptions = 0
     samples_with_detections = 0
     total_person_descriptions = 0
     persons_with_detections = 0
 
+    processed_offset = max(already_processed, len(sample_records) + len(failed_samples)) - (
+        len(sample_records) + len(failed_samples)
+    )
+
+    def processed_count() -> int:
+        return processed_offset + len(sample_records) + len(failed_samples)
+
+    def restore_resume_state() -> None:
+        nonlocal samples_with_ground_truth
+        nonlocal samples_with_person_descriptions
+        nonlocal samples_with_detections
+        nonlocal total_person_descriptions
+        nonlocal persons_with_detections
+
+        if not sample_records and not failed_samples and not person_records:
+            return
+
+        samples_with_ground_truth = len(sample_records) + sum(
+            1 for failure in failed_samples if failure.get("reason") != "Missing ground truth text"
+        )
+        samples_with_person_descriptions = len(sample_records)
+        samples_with_detections = sum(
+            1
+            for record in sample_records
+            if any(det.get("gaze_coordinates") for det in record.get("gaze_detections", {}).values())
+        )
+        total_person_descriptions = sum(len(record.get("gaze_detections", {})) for record in sample_records)
+        persons_with_detections = sum(
+            1
+            for record in sample_records
+            for det in record.get("gaze_detections", {}).values()
+            if det.get("gaze_coordinates")
+        )
+
+        for person in person_records:
+            l2_error = person.get("gaze_l2_error")
+            normalized_error = person.get("gaze_normalized_l2_error")
+            angular_error = person.get("gaze_angular_error")
+            iou_error = person.get("gaze_iou")
+            modified_l2_error = person.get("gaze_modified_l2_error")
+            if l2_error is not None:
+                gaze_l2_errors.append(l2_error)
+            if normalized_error is not None:
+                gaze_normalized_l2_errors.append(normalized_error)
+            if angular_error is not None:
+                gaze_angular_errors.append(angular_error)
+            if iou_error is not None:
+                gaze_ious.append(iou_error)
+            if modified_l2_error is not None:
+                gaze_modified_l2_errors.append(modified_l2_error)
+
+        for record in sample_records:
+            pred_in_out = record.get("predicted_in_out")
+            if pred_in_out is None:
+                if config.in_out_labels_csv:
+                    missing_in_out.add(str(record.get("id")))
+                continue
+            normalized_pred = 1 if int(pred_in_out) >= 1 else 0
+            in_out_counts[normalized_pred] = in_out_counts.get(normalized_pred, 0) + 1
+
+    restore_resume_state()
+
     def maybe_save_intermediate() -> None:
         if config.save_every <= 0:
             return
-        processed = len(sample_records) + len(failed_samples)
+        processed = processed_count()
         if processed == 0 or processed % config.save_every != 0:
             return
         checkpoint_path = persist_intermediate_results(
@@ -293,6 +382,8 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
             person_records=person_records,
             failed_samples=failed_samples,
             processed_samples=processed,
+            dataset_gt_updates=dataset_gt_updates,
+            dataset_updated=dataset_updated,
         )
         print(f"Saved intermediate results after {processed} samples to {checkpoint_path}")
 
@@ -561,16 +652,18 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
         maybe_save_intermediate()
 
     duration = time.time() - start_time
+    processed_total = processed_count()
+    reported_total = max(total_samples, processed_total)
 
     metrics: Dict[str, Any] = {
-        "total_samples": total_samples,
+        "total_samples": reported_total,
         "samples_with_ground_truth": samples_with_ground_truth,
         "samples_with_person_descriptions": samples_with_person_descriptions,
         "samples_with_gaze_detections": samples_with_detections,
         "total_person_descriptions": total_person_descriptions,
         "persons_with_gaze_detections": persons_with_detections,
         "evaluation_time_seconds": duration,
-        "average_time_per_sample": duration / total_samples if total_samples else 0.0,
+        "average_time_per_sample": duration / reported_total if reported_total else 0.0,
         "failed_samples": len(failed_samples),
     }
     metrics["samples_with_in_out"] = in_out_counts[0] + in_out_counts[1]
