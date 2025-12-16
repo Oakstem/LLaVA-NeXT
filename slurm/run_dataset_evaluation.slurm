@@ -10,9 +10,10 @@
 #SBATCH --nodes=1
 
 # Configuration variables (override via environment if needed)
-DATASET_JSON="${DATASET_JSON:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/val.json}"
+DATASET_JSON="${DATASET_JSON:-training_datasets/test2_20251210_160156_sgl_conversation_data.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-OUTPUT_DIR="${OUTPUT_DIR:-./dataset_evaluation_results/eval_$(date +%Y%m%d_%H%M%S)}"
+DATASET_BASENAME=$(basename "$DATASET_JSON" .json)
+OUTPUT_DIR="${OUTPUT_DIR:-./dataset_evaluation_results/${DATASET_BASENAME}_$(date +%Y%m%d_%H%M%S)}"
 LIMIT="${LIMIT:-}"  # Optional subset for quick checks
 
 GAZE_MODEL_ID="${GAZE_MODEL_ID:-IDEA-Research/grounding-dino-base}"

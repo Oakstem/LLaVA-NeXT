@@ -13,13 +13,10 @@ reflect the latest label resolution rules."""
 from __future__ import annotations
 
 import argparse
+import sys
 import json
-import math
-import statistics
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
-
-import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -30,7 +27,6 @@ from gazefollow.auto_phrase_grounding.detect_gaze_targets import (  # noqa: E402
     parse_person_descriptions,
 )
 from gazefollow.data_proc.add_in_out_labels import load_in_out_lookup  # noqa: E402
-from gazefollow.evals.in_out_metrics import compute_binary_precision, serialize_binary_precision  # noqa: E402
 from gazefollow.evals.log_wandb_evaluations import (  # noqa: E402
     DEFAULT_PROJECT,
     GENERATION_TABLE_COLUMNS,
@@ -38,24 +34,8 @@ from gazefollow.evals.log_wandb_evaluations import (  # noqa: E402
     format_generation_sample,
     split_metrics,
 )
+from gazefollow.evals.metric_utils import filter_gaze_metrics, flatten_recomputed_metrics, summarize_metrics  # noqa: E402
 from gazefollow.qwen3vl_utils import coerce_in_out_value, resolve_in_out_label  # noqa: E402
-
-
-METRIC_FIELDS = (
-    "gaze_l2_error",
-    "gaze_normalized_l2_error",
-    "gaze_angular_error",
-    "gaze_iou",
-    "gaze_modified_l2_error",
-)
-
-METRIC_NAME_ALIASES: Dict[str, str] = {
-    "gaze_l2_error": "gaze_l2_error",
-    "gaze_normalized_l2_error": "gaze_l2_normalized",
-    "gaze_angular_error": "gaze_angular_error",
-    "gaze_iou": "gaze_iou",
-    "gaze_modified_l2_error": "gaze_modified_l2",
-}
 
 
 def parse_people(text: Optional[str]) -> List[PersonDescription]:
@@ -108,127 +88,6 @@ def load_json_list(path: Path) -> List[Dict[str, Any]]:
     return payload
 
 
-def summarize_metrics(
-    generations: List[Dict[str, Any]],
-    binary_predictions: List[int],
-    binary_labels: List[int],
-    total_counts: Dict[str, int],
-    filtered_counts: Dict[str, int],
-) -> Dict[str, Any]:
-    metric_summary: Dict[str, Dict[str, Any]] = {}
-
-    for field in METRIC_FIELDS:
-        values: List[float] = []
-        for entry in generations:
-            for person in entry.get("gaze_detections", {}).values():
-                value = person.get(field)
-                if value is None:
-                    continue
-                if isinstance(value, float) and math.isnan(value):
-                    continue
-                values.append(value)
-
-        if values:
-            metric_summary[field] = {
-                "mean": sum(values) / len(values),
-                "median": statistics.median(values),
-                "count": len(values),
-                "filtered_out": filtered_counts.get(field, 0),
-                "total": total_counts.get(field, 0),
-            }
-        else:
-            metric_summary[field] = {
-                "mean": None,
-                "median": None,
-                "count": 0,
-                "filtered_out": filtered_counts.get(field, 0),
-                "total": total_counts.get(field, 0),
-            }
-
-    binary_result = compute_binary_precision(binary_predictions, binary_labels) if binary_labels else None
-
-    confusion: Dict[str, Any] = {}
-    if binary_labels:
-        tp = fp = fn = tn = 0
-        for predicted, label in zip(binary_predictions, binary_labels):
-            if predicted == 1 and label == 1:
-                tp += 1
-            elif predicted == 1 and label == 0:
-                fp += 1
-            elif predicted == 0 and label == 1:
-                fn += 1
-            else:
-                tn += 1
-        total = tp + fp + fn + tn
-        recall = tp / (tp + fn) if (tp + fn) else None
-        precision = tp / (tp + fp) if (tp + fp) else None
-        accuracy = (tp + tn) / total if total else None
-        f1 = (
-            2 * precision * recall / (precision + recall)
-            if precision is not None and recall is not None and (precision + recall)
-            else None
-        )
-        confusion = {
-            "true_positives": tp,
-            "false_positives": fp,
-            "false_negatives": fn,
-            "true_negatives": tn,
-            "total": total,
-            "precision": precision,
-            "recall": recall,
-            "accuracy": accuracy,
-            "f1": f1,
-        }
-
-    summary: Dict[str, Any] = {
-        "gaze_metrics": metric_summary,
-        "samples_evaluated": len(binary_labels),
-    }
-    if binary_result is not None:
-        summary["in_out_precision"] = serialize_binary_precision(binary_result)
-        summary["in_out_confusion"] = confusion
-
-    return summary
-
-
-def flatten_recomputed_metrics(summary: Dict[str, Any]) -> Dict[str, float]:
-    flat: Dict[str, float] = {}
-    gaze_metrics = summary.get("gaze_metrics", {})
-    for field, payload in gaze_metrics.items():
-        if not isinstance(payload, Mapping):
-            continue
-        base_name = METRIC_NAME_ALIASES.get(field, field)
-        for key_name, metric_key in (
-            ("mean", f"{base_name}_mean"),
-            ("median", f"{base_name}_median"),
-            ("count", f"{base_name}_count"),
-            ("filtered_out", f"{base_name}_filtered_out"),
-            ("total", f"{base_name}_total"),
-        ):
-            value = payload.get(key_name)
-            if isinstance(value, (int, float)) and not (isinstance(value, float) and math.isnan(value)):
-                flat[metric_key] = float(value)
-
-    precision_block = summary.get("in_out_precision", {})
-    if isinstance(precision_block, Mapping):
-        for key, value in precision_block.items():
-            if isinstance(value, (int, float)):
-                metric_key = "in_out_precision" if key == "precision" else f"in_out_precision_{key}"
-                flat[metric_key] = float(value)
-
-    confusion = summary.get("in_out_confusion", {})
-    if isinstance(confusion, Mapping):
-        for key, value in confusion.items():
-            if isinstance(value, (int, float)):
-                flat[f"in_out_confusion_{key}"] = float(value)
-
-    samples = summary.get("samples_evaluated")
-    if isinstance(samples, (int, float)):
-        flat["samples_evaluated"] = float(samples)
-
-    return flat
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline recomputation of in/out and gaze metrics.")
     parser.add_argument(
@@ -275,8 +134,6 @@ def main() -> None:
     generations_list = load_json_list(generations_path)
     in_out_lookup = load_in_out_lookup(args.gt_csv)
 
-    total_counts = {field: 0 for field in METRIC_FIELDS}
-    filtered_counts = {field: 0 for field in METRIC_FIELDS}
     binary_predictions: List[int] = []
     binary_labels: List[int] = []
 
@@ -291,21 +148,16 @@ def main() -> None:
         entry.pop("in_out", None)
         entry.pop("predicted_in_out", None)
 
-        keep_metric = gt_flag == 1 and pred_flag == 1
-        for person in entry.get("gaze_detections", {}).values():
-            for field in METRIC_FIELDS:
-                value = person.get(field)
-                if value is None:
-                    continue
-                total_counts[field] += 1
-                if not keep_metric:
-                    filtered_counts[field] += 1
-                    person[field] = None
-
         if gt_flag is None or pred_flag is None:
             continue
         binary_predictions.append(pred_flag)
         binary_labels.append(gt_flag)
+
+    total_counts, filtered_counts = filter_gaze_metrics(
+        generations_list,
+        keep_metric=lambda entry: entry.get("gt_in_out") == 1 and entry.get("pred_in_out") == 1,
+        mutate=True,
+    )
 
     summary = summarize_metrics(generations_list, binary_predictions, binary_labels, total_counts, filtered_counts)
     print(json.dumps(summary, indent=2))

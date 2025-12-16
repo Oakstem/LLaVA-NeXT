@@ -10,7 +10,6 @@ import argparse
 import json
 import math
 import os
-import statistics
 import sys
 import time
 from dataclasses import dataclass, field
@@ -50,10 +49,10 @@ from gazefollow.qwen3vl_utils import (
     extract_score,
     resolve_in_out_label,
 )
-from gazefollow.evals.in_out_metrics import (
-    BinaryPrecisionResult,
-    compute_binary_precision,
-    serialize_binary_precision,
+from gazefollow.evals.metric_utils import (
+    filter_gaze_metrics,
+    flatten_recomputed_metrics,
+    summarize_metrics,
 )
 
 from generation_utils import (
@@ -110,11 +109,6 @@ class GazeEvaluationState:
     dataset_gt_updates: List[Dict[str, Any]] = field(default_factory=list)
     dataset_updated: bool = False
     combined_cache: Optional[Dict[str, Dict[str, str]]] = None
-    gaze_l2_errors: List[float] = field(default_factory=list)
-    gaze_normalized_l2_errors: List[float] = field(default_factory=list)
-    gaze_angular_errors: List[float] = field(default_factory=list)
-    gaze_iou_scores: List[float] = field(default_factory=list)
-    gaze_modified_l2_errors: List[float] = field(default_factory=list)
     generation_rows_buffer: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -612,17 +606,6 @@ def process_sample_with_qwen_grounding(
                     else:
                         sanitized_errors = errors
                     person_entry.update(sanitized_errors)
-                    if gt_in_out_value != 0:
-                        if sanitized_errors.get("gaze_l2_error") is not None:
-                            state.gaze_l2_errors.append(sanitized_errors["gaze_l2_error"])
-                        if sanitized_errors.get("gaze_normalized_l2_error") is not None:
-                            state.gaze_normalized_l2_errors.append(sanitized_errors["gaze_normalized_l2_error"])
-                        if sanitized_errors.get("gaze_angular_error") is not None:
-                            state.gaze_angular_errors.append(sanitized_errors["gaze_angular_error"])
-                        if sanitized_errors.get("gaze_iou") is not None:
-                            state.gaze_iou_scores.append(sanitized_errors["gaze_iou"])
-                        if sanitized_errors.get("gaze_modified_l2_error") is not None:
-                            state.gaze_modified_l2_errors.append(sanitized_errors["gaze_modified_l2_error"])
 
             processed_people[person.person_id] = person_entry
 
@@ -1446,11 +1429,6 @@ def main():
     missing_in_out_samples = evaluation_state.missing_in_out_samples
     dataset_gt_updates = evaluation_state.dataset_gt_updates
     dataset_updated = evaluation_state.dataset_updated
-    gaze_l2_errors = evaluation_state.gaze_l2_errors
-    gaze_normalized_l2_errors = evaluation_state.gaze_normalized_l2_errors
-    gaze_angular_errors = evaluation_state.gaze_angular_errors
-    gaze_iou_scores = evaluation_state.gaze_iou_scores
-    gaze_modified_l2_errors = evaluation_state.gaze_modified_l2_errors
 
     total_samples = len(dataset_samples)
     processed_samples = len(sample_outputs)
@@ -1484,28 +1462,6 @@ def main():
     if generate_model_results:
         final_metrics["model_generation_samples"] = len(model_generation_records)
 
-    if gaze_l2_errors:
-        final_metrics["gaze_l2_error_mean"] = sum(gaze_l2_errors) / len(gaze_l2_errors)
-        final_metrics["gaze_l2_error_median"] = statistics.median(gaze_l2_errors)
-        final_metrics["gaze_l2_error_count"] = len(gaze_l2_errors)
-    if gaze_normalized_l2_errors:
-        final_metrics["gaze_l2_normalized_mean"] = sum(gaze_normalized_l2_errors) / len(gaze_normalized_l2_errors)
-        final_metrics["gaze_l2_normalized_median"] = statistics.median(gaze_normalized_l2_errors)
-        final_metrics["gaze_l2_normalized_count"] = len(gaze_normalized_l2_errors)
-    if gaze_angular_errors:
-        final_metrics["gaze_angular_error_mean"] = sum(gaze_angular_errors) / len(gaze_angular_errors)
-        final_metrics["gaze_angular_error_median"] = statistics.median(gaze_angular_errors)
-        final_metrics["gaze_angular_error_count"] = len(gaze_angular_errors)
-    if gaze_iou_scores:
-        final_metrics["gaze_iou_mean"] = sum(gaze_iou_scores) / len(gaze_iou_scores)
-        final_metrics["gaze_iou_median"] = statistics.median(gaze_iou_scores)
-        final_metrics["gaze_iou_count"] = len(gaze_iou_scores)
-    if gaze_modified_l2_errors:
-        final_metrics["gaze_modified_l2_mean"] = sum(gaze_modified_l2_errors) / len(gaze_modified_l2_errors)
-        final_metrics["gaze_modified_l2_median"] = statistics.median(gaze_modified_l2_errors)
-        final_metrics["gaze_modified_l2_count"] = len(gaze_modified_l2_errors)
-
-    binary_precision_result: Optional[BinaryPrecisionResult] = None
     in_out_predictions: List[int] = []
     in_out_labels: List[int] = []
     for entry in predictions_output:
@@ -1516,18 +1472,27 @@ def main():
         in_out_predictions.append(predicted_flag)
         in_out_labels.append(gt_label)
 
-    if in_out_predictions and in_out_labels:
-        binary_precision_result = compute_binary_precision(
+    metric_summary: Optional[Dict[str, Any]] = None
+    if model_generation_records:
+        total_counts, filtered_counts = filter_gaze_metrics(
+            model_generation_records,
+            keep_metric=lambda record: record.get("gt_in_out") == 1 and record.get("predicted_in_out") == 1,
+            mutate=True,
+        )
+        metric_summary = summarize_metrics(
+            model_generation_records,
             in_out_predictions,
             in_out_labels,
-            positive_label=1,
+            total_counts,
+            filtered_counts,
         )
-        precision_value = binary_precision_result.precision
-        if precision_value is not None:
-            final_metrics["in_out_precision"] = precision_value
-        final_metrics["in_out_precision_support"] = binary_precision_result.predicted_positives
-        final_metrics["in_out_positive_label"] = binary_precision_result.positive_label
-        final_metrics["in_out_precision_total"] = binary_precision_result.total_samples
+        final_metrics.update(flatten_recomputed_metrics(metric_summary))
+        final_metrics["gaze_metrics"] = metric_summary.get("gaze_metrics")
+        if "inout_precision" in metric_summary:
+            final_metrics["inout_precision"] = metric_summary["inout_precision"]
+        if "inout_confusion" in metric_summary:
+            final_metrics["inout_confusion"] = metric_summary["inout_confusion"]
+        final_metrics["samples_evaluated"] = metric_summary.get("samples_evaluated", 0)
 
     print("\n4. Calculating metrics...")
     print("\nEvaluation summary:")
@@ -1540,14 +1505,18 @@ def main():
     if loss_values:
         print(f"  Average loss: {final_metrics['average_loss']:.6f}")
         print(f"  Loss range: {min(loss_values):.6f} - {max(loss_values):.6f}")
-    if gaze_l2_errors:
-        print(f"  Gaze L2 mean: {final_metrics['gaze_l2_error_mean']:.4f}")
-    if binary_precision_result is not None:
-        precision_value = binary_precision_result.precision
-        if precision_value is not None:
-            print(f"  In/out precision: {precision_value:.4f}")
-        else:
-            print("  In/out precision: undefined (no predicted positives)")
+    if metric_summary:
+        l2_block = (metric_summary.get("gaze_metrics") or {}).get("gaze_l2_error") or {}
+        l2_mean = l2_block.get("mean")
+        if isinstance(l2_mean, (int, float)):
+            print(f"  Gaze L2 mean: {l2_mean:.4f}")
+        precision_block = metric_summary.get("inout_precision")
+        if isinstance(precision_block, dict):
+            precision_value = precision_block.get("precision")
+            if precision_value is not None:
+                print(f"  In/out precision: {precision_value:.4f}")
+            else:
+                print("  In/out precision: undefined (no predicted positives)")
 
     if dataset_updated and dataset_gt_updates:
         try:
@@ -1560,13 +1529,6 @@ def main():
     print(f"\n5. Saving results to {output_dir}...")
 
     metrics_file = output_dir / "metrics.json"
-    precision_metrics_file = output_dir / "in_out_precision_metrics.json"
-    if binary_precision_result is not None:
-        metrics_payload = serialize_binary_precision(binary_precision_result)
-        with open(precision_metrics_file, "w", encoding="utf-8") as f:
-            json.dump(metrics_payload, f, indent=2, ensure_ascii=False)
-        print(f"In/out precision metrics saved to: {precision_metrics_file}")
-
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(final_metrics, f, indent=2, ensure_ascii=False)
     print(f"Metrics saved to: {metrics_file}")

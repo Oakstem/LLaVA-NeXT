@@ -10,7 +10,7 @@
 #SBATCH --nodes=1
 
 # Configuration variables (override via environment if needed)
-DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251206_191724/val.json}"
+DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 DATASET_BASENAME=$(basename "$DATASET_JSON" .json)
 OUTPUT_DIR="${OUTPUT_DIR:-./dataset_evaluation_results/qwen3vl_${DATASET_BASENAME}_$(date +%Y%m%d_%H%M%S)}"

@@ -50,6 +50,7 @@ class EvaluationConfig:
     dataset_json: Path
     images_dir: Path
     output_dir: Path
+    resume_from: Optional[Path]
     limit: Optional[int]
     gaze_model_id: str
     gaze_box_threshold: float
@@ -69,15 +70,20 @@ class EvaluationConfig:
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "EvaluationConfig":
+        resume_from = Path(args.resume_from) if getattr(args, "resume_from", None) else None
         if args.output_dir is None:
             dataset_stem = Path(args.dataset_json).stem
             dataset_dir = Path(args.dataset_json).parent
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             args.output_dir = f"{dataset_dir}/qwen3vl_grounding_run_{dataset_stem}_{timestamp}"
+        output_dir = Path(args.output_dir)
+        if resume_from is not None:
+            output_dir = resume_from.parent
         return cls(
             dataset_json=Path(args.dataset_json),
             images_dir=Path(args.images_dir),
-            output_dir=Path(args.output_dir),
+            output_dir=output_dir,
+            resume_from=resume_from,
             limit=args.limit,
             gaze_model_id=args.gaze_model_id,
             gaze_box_threshold=args.gaze_box_threshold,
@@ -403,12 +409,14 @@ def persist_intermediate_results(
     person_records: List[PersonLevelRecord],
     failed_samples: List[FailureRecord],
     processed_samples: int,
+    dataset_gt_updates: Optional[List[DatasetUpdateRecord]] = None,
+    dataset_updated: bool = False,
 ) -> Path:
     """
     Write a checkpoint of the current evaluation progress.
 
-    Saves the latest sample and person-level records (when enabled) along with failures
-    so long-running runs can be resumed after interruptions.
+    Saves the latest sample and person-level records (when enabled), ground-truth updates,
+    and failures so long-running runs can be resumed after interruptions.
     """
     checkpoint_path = config.output_dir / "intermediate_results_latest.json"
     payload: Dict[str, Any] = {
@@ -416,6 +424,9 @@ def persist_intermediate_results(
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "failed_samples": failed_samples,
     }
+    if dataset_gt_updates is not None:
+        payload["dataset_gt_updates"] = dataset_gt_updates
+        payload["dataset_updated"] = dataset_updated or bool(dataset_gt_updates)
     if config.save_records:
         payload["sample_records"] = sample_records
         payload["person_records"] = person_records
