@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -179,10 +180,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     input_path: Path = args.input_path
     records = load_records(input_path)
     metrics: dict = {
         "input_path": str(input_path),
+        "run_timestamp": run_timestamp,
         "threshold": args.threshold,
         "keep_mismatched_inout": bool(args.keep_mismatched_inout),
     }
@@ -209,7 +212,7 @@ def main() -> None:
     histogram_path = (
         args.histogram_output
         if args.histogram_output
-        else input_path.with_name(f"{input_path.stem}_l2_histogram.png")
+        else input_path.with_name(f"{input_path.stem}_l2_histogram_{run_timestamp}.png")
     )
     if error_values:
         saved_path = plot_histogram(error_values, args.histogram_bins, histogram_path)
@@ -253,7 +256,7 @@ def main() -> None:
     output_path = (
         args.output_path
         if args.output_path
-        else input_path.with_name(f"{input_path.stem}_filtered.json")
+        else input_path.with_name(f"{input_path.stem}_filtered_{run_timestamp}.json")
     )
     write_json(output_path, filtered_records)
     print(f"Wrote filtered records to {output_path}")
@@ -353,7 +356,7 @@ def main() -> None:
         conversation_output = (
             args.conversation_output
             if args.conversation_output
-            else convo_path.with_name(f"{convo_path.stem}_filtered.json")
+            else convo_path.with_name(f"{convo_path.stem}_filtered_{run_timestamp}.json")
         )
         write_json(conversation_output, conversation_filtered)
 
@@ -380,7 +383,8 @@ def main() -> None:
     else:
         metrics["conversation"] = None
 
-    metrics_output = output_path.with_name(f"{output_path.stem}_metrics.json")
+    metrics_suffix = "" if output_path.stem.endswith(run_timestamp) else f"_{run_timestamp}"
+    metrics_output = output_path.with_name(f"{output_path.stem}_metrics{metrics_suffix}.json")
     write_json(metrics_output, metrics)
     print(f"\nSaved metrics summary to {metrics_output}")
 

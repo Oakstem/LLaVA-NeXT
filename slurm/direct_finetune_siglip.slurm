@@ -106,7 +106,7 @@ MM_PATCH_MERGE_TYPE="spatial_unpad"
 # LoRA parameters
 LORA_ENABLE="True"
 LORA_R="16"
-LORA_ALPHA="64"
+LORA_ALPHA="16"
 MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
@@ -115,7 +115,7 @@ PER_DEVICE_TRAIN_BATCH_SIZE="1"  # Reduced from 2 to 1
 PER_DEVICE_EVAL_BATCH_SIZE="2"  # Reduced from 4 to 2
 GRADIENT_ACCUMULATION_STEPS="8"  # Increased to maintain effective batch size
 GRADIENT_CHECKPOINTING="False"
-LEARNING_RATE="2e-5"
+LEARNING_RATE="5e-6"
 WEIGHT_DECAY="0.01"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"

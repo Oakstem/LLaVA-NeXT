@@ -573,7 +573,7 @@ def collect_topk_token_probabilities(
     }
 
 
-def print_topk_summary(payload: Dict[str, Any], max_steps: int = 5, max_candidates: int = 5) -> None:
+def print_topk_summary(payload: Dict[str, Any], max_steps: int = 50, max_candidates: int = 5) -> None:
     """Emit a concise console summary of the recorded top-k statistics."""
     steps = payload.get("steps") or []
     if not steps:

@@ -32,9 +32,9 @@ LOAD_4BIT="${LOAD_4BIT:-false}"
 LOAD_8BIT="${LOAD_8BIT:-false}"
 
 # Dataset configuration
-DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val.json}"
+DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val_filtered.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-LIMIT="${LIMIT:-3000}"
+LIMIT="${LIMIT:-}"
 
 # Generation controls
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
@@ -63,7 +63,7 @@ GAZE_TEMPERATURE="${GAZE_TEMPERATURE:-0.0}"
 GAZE_IOU_RADIUS_RATIO="${GAZE_IOU_RADIUS_RATIO:-0.05}"
 
 # Checkpoint sweep selection
-TRAINING_RUN_DIR="${TRAINING_RUN_DIR:-training_outputs/llava-20251213_210351}"
+TRAINING_RUN_DIR="${TRAINING_RUN_DIR:-training_outputs/llava-20251213_210514}"
 START_CHECKPOINT="${START_CHECKPOINT:-9000}"
 END_CHECKPOINT="${END_CHECKPOINT:-}"
 CHECKPOINT_SPACING="${CHECKPOINT_SPACING:-1000}"

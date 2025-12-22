@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results-dir",
         type=Path,
-        default=Path("evaluation_results/eval_qwen3vl_qwen3vl_20251210_230318"),
+        default=Path("dataset_evaluation_results/qwen3vl_val_llava_gpt_gaze_extracted_20251218_082131"),
         help="Evaluation results directory (contains model_generation_results.json).",
     )
     parser.add_argument(

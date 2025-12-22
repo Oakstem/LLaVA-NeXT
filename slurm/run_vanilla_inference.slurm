@@ -15,7 +15,9 @@ MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
 # ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20250922_124635/checkpoint-12000}"
 # ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20251007_011312/checkpoint-10000}"
-ADAPTER_PATH="${ADAPTER_PATH:-}"
+ADAPTER_PATH="${ADAPTER_PATH:--1}"        # set to -1 for baseline (no adapter)
+# training_outputs/llava-20251207_192205/checkpoint-8000        # quite elaborate in our long prompt but wrong
+# training_outputs/llava-20251207_192147/checkpoint-8000
 # Prompt for adapter path if not set
 if [ -z "$ADAPTER_PATH" ]; then
     echo "=========================================="
@@ -56,6 +58,10 @@ if [ -z "$ADAPTER_PATH" ]; then
     fi
 fi
 
+if [ "$ADAPTER_PATH" = "-1" ]; then
+    ADAPTER_PATH=""
+fi
+
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 
@@ -68,7 +74,7 @@ Step 1 - Caption
 • Provide one concise sentence that broadly describes the entire scene.
 • Begin the line with: Caption:
 Step 2 - Foreground people & gaze
-1. Detect every person whose height is at least 5% of the image (foreground).
+1. Detect every person in the image.
 2. List them from left to right and number sequentially starting at 1.
 For each person output exactly one line in this format:
 Person {N}: {short description}, looking at {target | outside the frame | uncertain}
@@ -94,15 +100,15 @@ fi
 # PROMPT="${PROMPT:-Complete the sentence: the woman is looking at ...}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
-TEMPERATURE="${TEMPERATURE:-0.8}"
+TEMPERATURE="${TEMPERATURE:-1.1}"
 TOP_P="${TOP_P:-0.9}"
 NUM_BEAMS="${NUM_BEAMS:-1}"
 DO_SAMPLE="${DO_SAMPLE:-false}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
 SAVE_OUTPUT="${SAVE_OUTPUT:-true}"
-CHAT_MODE="${CHAT_MODE:-false}"
+CHAT_MODE="${CHAT_MODE:-true}"
 NO_STREAM="${NO_STREAM:-false}"
-DETECT_GAZE_BBOXES="${DETECT_GAZE_BBOXES:-true}"
+DETECT_GAZE_BBOXES="${DETECT_GAZE_BBOXES:-false}"
 IMAGE_ASPECT_RATIO_FALLBACK="${IMAGE_ASPECT_RATIO_FALLBACK:-anyres_max_4}"
 IMAGE_GRID_PINPOINTS_FALLBACK="${IMAGE_GRID_PINPOINTS_FALLBACK:-(1x1),...,(2x2)}"  # "(1x1),...,(6x6)"
 # Create logs directory if it doesn't exist
