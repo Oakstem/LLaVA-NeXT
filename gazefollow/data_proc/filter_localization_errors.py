@@ -135,8 +135,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.15,
-        help="Threshold for normalized L2 error to keep gt_in_out=1 samples (default: 0.15)",
+        default=0.2,
+        help="Threshold for normalized L2 error to keep gt_in_out=1 samples (default: 0.2)",
     )
     parser.add_argument(
         "--histogram-bins",
@@ -161,6 +161,22 @@ def parse_args() -> argparse.Namespace:
         "--keep-mismatched-inout",
         action="store_true",
         help="Keep samples where predicted_in_out differs from gt_in_out (default: drop them).",
+    )
+    parser.add_argument(
+        "--dropped-mismatched-output",
+        type=Path,
+        help=(
+            "Optional path to write dropped mismatched samples "
+            "(defaults to <input>_dropped_mismatched_<timestamp>.json)."
+        ),
+    )
+    parser.add_argument(
+        "--dropped-high-error-output",
+        type=Path,
+        help=(
+            "Optional path to write dropped high-error samples "
+            "(defaults to <input>_dropped_high_error_<timestamp>.json)."
+        ),
     )
     parser.add_argument(
         "--conversation-json",
@@ -240,16 +256,21 @@ def main() -> None:
     drop_mismatched = not args.keep_mismatched_inout
     filtered_records = []
     dropped_mismatched = 0
+    dropped_mismatched_records = []
+    dropped_high_error_records = []
     for record in records:
         record_id = str(record.get("id"))
         gt_flag, _ = flag_lookup.get(record_id, (None, None))
         if drop_mismatched and record_id in mismatched_ids:
             dropped_mismatched += 1
+            dropped_mismatched_records.append(record)
             continue
         if gt_flag == 0:
             filtered_records.append(record)
         elif gt_flag == 1 and record_id in low_error_ids:
             filtered_records.append(record)
+        elif gt_flag == 1 and record_id in high_error_ids:
+            dropped_high_error_records.append(record)
         elif gt_flag is None and not drop_mismatched:
             filtered_records.append(record)
 
@@ -260,6 +281,30 @@ def main() -> None:
     )
     write_json(output_path, filtered_records)
     print(f"Wrote filtered records to {output_path}")
+
+    dropped_mismatched_output: Optional[Path] = None
+    if drop_mismatched and dropped_mismatched_records:
+        dropped_mismatched_output = (
+            args.dropped_mismatched_output
+            if args.dropped_mismatched_output
+            else input_path.with_name(
+                f"{input_path.stem}_dropped_mismatched_{run_timestamp}.json"
+            )
+        )
+        write_json(dropped_mismatched_output, dropped_mismatched_records)
+        print(f"Wrote dropped mismatched records to {dropped_mismatched_output}")
+
+    dropped_high_error_output: Optional[Path] = None
+    if dropped_high_error_records:
+        dropped_high_error_output = (
+            args.dropped_high_error_output
+            if args.dropped_high_error_output
+            else input_path.with_name(
+                f"{input_path.stem}_dropped_high_error_{run_timestamp}.json"
+            )
+        )
+        write_json(dropped_high_error_output, dropped_high_error_records)
+        print(f"Wrote dropped high-error records to {dropped_high_error_output}")
 
     kept_ids: Set[str] = {str(record.get("id")) for record in filtered_records}
     total_records = len(records)
@@ -274,6 +319,12 @@ def main() -> None:
     metrics.update(
         {
             "output_path": str(output_path),
+            "dropped_mismatched_output": str(dropped_mismatched_output)
+            if dropped_mismatched_output
+            else None,
+            "dropped_high_error_output": str(dropped_high_error_output)
+            if dropped_high_error_output
+            else None,
             "counts": {
                 "total_records": total_records,
                 "gt_in_out_1_records": total_in_image,
@@ -281,6 +332,7 @@ def main() -> None:
                 "records_with_normalized_l2_error": total_with_errors,
                 "predicted_in_out_mismatched": total_mismatched,
                 "dropped_mismatched": dropped_mismatched,
+                "dropped_high_error": len(dropped_high_error_records),
                 "records_above_threshold": total_high_error,
                 "records_below_or_equal_threshold": total_low_error,
                 "filtered_dataset_size": total_filtered,

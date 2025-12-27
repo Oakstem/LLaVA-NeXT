@@ -119,8 +119,8 @@ from llava.constants import (  # noqa: E402
 from llava.conversation import conv_templates  # noqa: E402
 
 
-DEFAULT_IMAGE_ASPECT_RATIO = "anyres_max_9"
-DEFAULT_IMAGE_GRID_PINPOINTS_EXPR = "(1x1),...,(3x3)"
+DEFAULT_IMAGE_ASPECT_RATIO = "anyres_max_4"
+DEFAULT_IMAGE_GRID_PINPOINTS_EXPR = "(1x1),...,(2x2)"
 
 
 def _normalize_absolute_grid_pinpoints(pairs: List[Any]) -> List[List[int]]:

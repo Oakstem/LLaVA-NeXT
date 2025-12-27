@@ -99,7 +99,7 @@ def adjust_records(records: list[dict]) -> tuple[int, int]:
         ground_truth = record.get("ground_truth")
         text = ground_truth if isinstance(ground_truth, str) else None
 
-        if record.get("in_out") == 0:
+        if record.get("gt_in_out") == 0:
             total_out += 1
             if text is not None:
                 normalized, changed = normalize_ground_truth(text)
