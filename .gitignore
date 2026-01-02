@@ -85,3 +85,6 @@ evaluation_result*/
 similarity_outputs/*
 text_embeddings/*
 *.bak*
+*.txt
+*.err
+*.out
