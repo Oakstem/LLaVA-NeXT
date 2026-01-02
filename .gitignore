@@ -92,3 +92,4 @@ evaluation_results*/
 *.onnx
 *.jsonl
 *.npz
+datasets/
