@@ -9,6 +9,8 @@ import pathlib
 import time
 from collections import OrderedDict
 
+from PIL import Image
+
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
 from torch.utils.data import Dataset, Sampler, DataLoader
@@ -52,6 +54,10 @@ if is_accelerate_available():
 if is_datasets_available():
     import datasets
 
+from llava import conversation as conversation_lib
+from llava.constants import DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
+from llava.conversation import SeparatorStyle
+from llava.mm_utils import process_images, tokenizer_image_token, KeywordsStoppingCriteria
 from llava.utils import rank0_print
 
 
@@ -990,6 +996,98 @@ class LLaVATrainer(Trainer):
 
         return self.optimizer
 
+    def _run_checkpoint_sanity_check(self) -> bool:
+        should_stop = False
+        if self.is_world_process_zero():
+            image_processor = None
+            if hasattr(self.model, "get_vision_tower") and self.model.get_vision_tower() is not None:
+                image_processor = self.model.get_vision_tower().image_processor
+
+            if image_processor is None:
+                rank0_print("Sanity check skipped: image processor not available.")
+            else:
+                image_path = pathlib.Path(__file__).resolve().parents[2] / "baseline_images" / "39740.png"
+                if not image_path.is_file():
+                    rank0_print(f"Sanity check skipped: image not found at {image_path}.")
+                else:
+                    prompt_text = "describe the people in the image and the overall scene"
+                    conv = conversation_lib.default_conversation.copy()
+                    conv.tokenizer = self.tokenizer
+                    if getattr(self.model.config, "mm_use_im_start_end", False):
+                        user_content = f"{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN}{DEFAULT_IM_END_TOKEN}\n{prompt_text}"
+                    else:
+                        user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt_text}"
+                    conv.append_message(conv.roles[0], user_content)
+                    conv.append_message(conv.roles[1], None)
+                    prompt = conv.get_prompt()
+
+                    image = Image.open(image_path).convert("RGB")
+                    image_sizes = [image.size]
+                    image_tensor = process_images([image], image_processor, self.model.config)
+                    if isinstance(image_tensor, tuple):
+                        image_tensor = image_tensor[0]
+                    if isinstance(image_tensor, list):
+                        image_tensor = image_tensor[0] if image_tensor else None
+
+                    if image_tensor is None:
+                        rank0_print("Sanity check skipped: failed to process image.")
+                    else:
+                        if isinstance(image_tensor, torch.Tensor) and image_tensor.ndim == 3:
+                            image_tensor = image_tensor.unsqueeze(0)
+
+                        param = next(self.model.parameters())
+                        device = param.device
+                        image_tensor = image_tensor.to(device=device, dtype=param.dtype)
+                        input_ids = tokenizer_image_token(
+                            prompt,
+                            self.tokenizer,
+                            IMAGE_TOKEN_INDEX,
+                            return_tensors="pt",
+                        ).unsqueeze(0).to(device)
+
+                        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+                        stopping_criteria = KeywordsStoppingCriteria([stop_str], self.tokenizer, input_ids)
+
+                        was_training = self.model.training
+                        self.model.eval()
+                        with torch.inference_mode():
+                            output_ids = self.model.generate(
+                                inputs=input_ids,
+                                images=image_tensor,
+                                image_sizes=image_sizes,
+                                do_sample=False,
+                                max_new_tokens=256,
+                                use_cache=True,
+                                stopping_criteria=[stopping_criteria],
+                            )
+                        if was_training:
+                            self.model.train()
+
+                        output_text = self.tokenizer.decode(
+                            output_ids[0, input_ids.shape[1] :],
+                            skip_special_tokens=True,
+                        ).strip()
+                        output_token_count = len(self.tokenizer.encode(output_text, add_special_tokens=False))
+
+                        safe_wandb_log(self.args, {
+                            "sanity/checkpoint_prompt": prompt_text,
+                            "sanity/checkpoint_output": output_text,
+                            "sanity/checkpoint_output_tokens": output_token_count,
+                        }, step=self.state.global_step)
+
+                        if output_token_count < 50:
+                            rank0_print(
+                                f"Sanity check failed: output had {output_token_count} tokens (<50)."
+                            )
+                            should_stop = True
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            stop_tensor = torch.tensor(int(should_stop), device=self.args.device)
+            torch.distributed.broadcast(stop_tensor, src=0)
+            should_stop = bool(stop_tensor.item())
+
+        return should_stop
+
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False) or (
             hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
@@ -1035,6 +1133,10 @@ class LLaVATrainer(Trainer):
                     projector_weights = {k: v for k, v in non_lora_weight_to_save.items() if "mm_projector" in k or "vision_resampler" in k}
                     if projector_weights:
                         torch.save(projector_weights, os.path.join(output_dir, "mm_projector.bin"))
+
+        if self._run_checkpoint_sanity_check():
+            rank0_print("Stopping training: sanity check output too short.")
+            self.control.should_training_stop = True
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
