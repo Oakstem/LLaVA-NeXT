@@ -74,7 +74,6 @@ def extract_gaze_info_with_gpt(
             {"role": "user", "content": response_text},
         ],
         response_format=GPT_EXTRACTION_SCHEMA,
-        temperature=0,  # Deterministic output (equivalent to do_sample=False)
     )
     
     content = completion.choices[0].message.content
