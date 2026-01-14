@@ -316,6 +316,7 @@ class LLaVATrainer(Trainer):
         self.sequence_stats_max_length = 0
         self.sequence_stats_cap = 4096
         self.sequence_stats_window = 512
+        self._sanity_table = None
 
     def evaluate(
         self,
@@ -1010,7 +1011,7 @@ class LLaVATrainer(Trainer):
                 if not image_path.is_file():
                     rank0_print(f"Sanity check skipped: image not found at {image_path}.")
                 else:
-                    prompt_text = "describe the people in the image and the overall scene"
+                    prompt_text = "First analyze where each person is looking, then infer the social interaction between them."
                     conv = conversation_lib.default_conversation.copy()
                     conv.tokenizer = self.tokenizer
                     if getattr(self.model.config, "mm_use_im_start_end", False):
@@ -1064,10 +1065,15 @@ class LLaVATrainer(Trainer):
                             self.model.train()
 
                         output_text = self.tokenizer.decode(
-                            output_ids[0, input_ids.shape[1] :],
+                            output_ids[0, :],
                             skip_special_tokens=True,
                         ).strip()
                         output_token_count = len(self.tokenizer.encode(output_text, add_special_tokens=False))
+                        passed_min_tokens = output_token_count >= 50
+                        checkpoint_name = f"checkpoint-{self.state.global_step}"
+                        
+                        rank0_print(f"Sanity check for step {self.state.global_step} resulted text: {output_text}")
+                        rank0_print(f"Sanity check output token count: {output_token_count} tokens")
 
                         safe_wandb_log(self.args, {
                             "sanity/checkpoint_prompt": prompt_text,
@@ -1075,7 +1081,31 @@ class LLaVATrainer(Trainer):
                             "sanity/checkpoint_output_tokens": output_token_count,
                         }, step=self.state.global_step)
 
-                        if output_token_count < 50:
+                        if wandb.run is not None:
+                            if self._sanity_table is None:
+                                rank0_print("Initializing sanity check wandb table.")
+                                self._sanity_table = wandb.Table(columns=[
+                                    "step",
+                                    "checkpoint",
+                                    "prompt",
+                                    "output",
+                                    "output_tokens",
+                                    "passed_min_tokens",
+                                ], log_mode="MUTABLE")
+                            rank0_print(f"Adding sanity check entry to wandb table for step {self.state.global_step}.")
+                            self._sanity_table.add_data(
+                                int(self.state.global_step),
+                                checkpoint_name,
+                                prompt_text,
+                                output_text,
+                                int(output_token_count),
+                                bool(passed_min_tokens),
+                            )
+                            safe_wandb_log(self.args, {
+                                "sanity/checkpoint_table": self._sanity_table
+                            }, step=self.state.global_step)
+
+                        if not passed_min_tokens:
                             rank0_print(
                                 f"Sanity check failed: output had {output_token_count} tokens (<50)."
                             )
