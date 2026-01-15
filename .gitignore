@@ -93,3 +93,5 @@ evaluation_results*/
 *.jsonl
 *.npz
 datasets/
+*.txt
+*.bak*
