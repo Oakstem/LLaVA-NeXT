@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from generation_utils import (  # noqa: E402
+from gazefollow.generation_utils import (  # noqa: E402
     enable_inference_optimizations,
     load_model_and_setup,
     fix_wsl_paths,
