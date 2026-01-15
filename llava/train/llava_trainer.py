@@ -317,6 +317,8 @@ class LLaVATrainer(Trainer):
         self.sequence_stats_cap = 4096
         self.sequence_stats_window = 512
         self._sanity_table = None
+        self._sanity_consecutive_failures = 0
+        self._sanity_failure_limit = getattr(self.args, "sanity_check_failures_to_stop", 5)
 
     def evaluate(
         self,
@@ -1058,8 +1060,7 @@ class LLaVATrainer(Trainer):
                                 image_sizes=image_sizes,
                                 do_sample=False,
                                 max_new_tokens=256,
-                                use_cache=True,
-                                stopping_criteria=[stopping_criteria],
+                                use_cache=True
                             )
                         if was_training:
                             self.model.train()
@@ -1106,10 +1107,22 @@ class LLaVATrainer(Trainer):
                             }, step=self.state.global_step)
 
                         if not passed_min_tokens:
+                            self._sanity_consecutive_failures += 1
                             rank0_print(
-                                f"Sanity check failed: output had {output_token_count} tokens (<50)."
+                                "Sanity check failed: output had "
+                                f"{output_token_count} tokens (<50). "
+                                "Consecutive failures: "
+                                f"{self._sanity_consecutive_failures}/{self._sanity_failure_limit}."
                             )
-                            should_stop = True
+                            if self._sanity_consecutive_failures >= self._sanity_failure_limit:
+                                should_stop = True
+                        else:
+                            if self._sanity_consecutive_failures:
+                                rank0_print(
+                                    "Sanity check passed: resetting consecutive failure count "
+                                    f"(was {self._sanity_consecutive_failures})."
+                                )
+                            self._sanity_consecutive_failures = 0
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             stop_tensor = torch.tensor(int(should_stop), device=self.args.device)
