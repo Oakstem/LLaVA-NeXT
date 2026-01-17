@@ -13,6 +13,7 @@ Features:
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -48,7 +49,18 @@ from openai import OpenAI
 DEFAULT_ANNOTATIONS = "datasets/Vacation/test_annotations.csv"
 DEFAULT_FRAMES_DIR = "datasets/Vacation/frames"
 
-DEFAULT_PROMPT = "For each person in the image, describe who they are, what they are looking at, and then classify the interaction as non-communicative gaze, mutual gaze, or joint attention toward a shared object."
+# DEFAULT_PROMPT = "For each person in the image, describe who they are, what they are looking at, and then classify the interaction as non-communicative gaze, mutual gaze, or joint attention toward a shared object."
+DEFAULT_PROMPT = """For each person in the image:
+Briefly describe who they are (role/appearance) and what they are looking at (another person, an object, or off e.g. “off-screen left”).
+Then choose exactly one social interaction label using the rules below in this priority order:
+Priority order (apply top to bottom):
+Mutual gaze: at least two people are looking at each other (A→B and B→A).
+If this is true, the label must be Mutual gaze, even if you think they share attention.
+Single: one person looks at another (A→B) while the other looks elsewhere (B→≠A).
+Joint attention: two or more people are looking at the same external target (same object/location), and that target is not any person.
+Non-communicative gaze: none of the above apply; no clear gaze-based interaction.
+Important constraint:
+Joint attention never applies when the shared target is a person. If people are looking at each other, that is Mutual gaze, not Joint attention."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +119,19 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Resume from existing output JSON file",
+    )
+    
+    # Queue randomization arguments
+    parser.add_argument(
+        "--randomize",
+        action="store_true",
+        help="Randomize the processing queue order instead of running consecutively",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible queue randomization (only used with --randomize)",
     )
     
     # Model arguments (inherited from generate_vanilla_inference.py)
@@ -401,6 +426,15 @@ def main():
     if args.limit:
         print(f"Limiting to {args.limit} frames...")
         selected_frames = selected_frames.head(args.limit)
+    
+    # Randomize queue if requested
+    if args.randomize:
+        if args.seed is not None:
+            random.seed(args.seed)
+            print(f"Randomizing queue with seed={args.seed}...")
+        else:
+            print("Randomizing queue (no seed, non-reproducible)...")
+        selected_frames = selected_frames.sample(frac=1).reset_index(drop=True)
         
     print(f"Remaining frames to process: {len(selected_frames)}")
     
