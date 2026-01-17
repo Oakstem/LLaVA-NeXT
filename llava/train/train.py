@@ -15,7 +15,6 @@
 #    limitations under the License.
 
 import ast
-import os
 import copy
 from dataclasses import dataclass, field
 import json
@@ -25,7 +24,7 @@ from typing import Dict, Optional, Sequence, List, Any
 from PIL import Image, ImageFile
 from packaging import version
 import numpy as np
-
+import warnings
 import time
 import random
 import yaml
@@ -46,6 +45,35 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
+from llava.model.builder import load_pretrained_model
+from typing import Dict, Optional, Sequence, List, Any
+
+
+def safe_wandb_log(training_args, metrics_dict, step=None):
+    """Safely log metrics to wandb if available and initialized."""
+    if not (training_args.report_to and "wandb" in training_args.report_to):
+        return
+    
+    try:
+        import wandb
+        if wandb.run is not None:
+            if step is not None:
+                metrics_dict["step"] = step
+            wandb.log(metrics_dict)
+    except Exception as e:
+        rank0_print(f"Warning: Could not log to wandb: {e}")
+
+
+# Import custom evaluation functions
+try:
+    from evaluate_model import (
+        evaluate_dataset_for_training,
+        determine_template,
+    )
+    CUSTOM_EVAL_AVAILABLE = True
+except ImportError:
+    CUSTOM_EVAL_AVAILABLE = False
+    print("Warning: evaluate_model not available for custom evaluation")
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -137,6 +165,12 @@ class DataArguments:
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
+    image_processor: Optional[Any] = field(default=None, metadata={"help": "Image processor for processing images"})
+    
+    # Evaluation parameters
+    eval_split_ratio: float = field(default=0.0, metadata={"help": "Ratio of data to use for evaluation (e.g., 0.2 for 20%)"})
+    enable_evaluation: bool = field(default=True, metadata={"help": "Whether to enable evaluation during training"})
+    eval_data_path: Optional[str] = field(default=None, metadata={"help": "Optional separate evaluation data path. If not provided, will split from training data."})
 
 
 @dataclass
@@ -160,15 +194,33 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    mm_projector_full_finetune: bool = field(default=False, metadata={"help": "If true, train mm_projector base weights directly even when LoRA is enabled."})
     mm_projector_lr: Optional[float] = None
     mm_vision_tower_lr: Optional[float] = None
     group_by_varlen: bool = field(default=False)
     group_by_modality_length: bool = field(default=False)
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
-    gradient_checkpointing: bool = field(default=True)
+    gradient_checkpointing: bool = field(default=False)
+    gradient_checkpointing_kwargs: Optional[dict] = field(default_factory=lambda: {"use_reentrant": False})
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    bf16: bool = field(default=True, metadata={"help": "Whether to use bf16 training."})
+    fp16: bool = field(default=False, metadata={"help": "Whether to use fp16 training."})
+    
+    # Evaluation parameters
+    eval_steps: Optional[int] = field(default=5000, metadata={"help": "Number of training steps between evaluations. If None, uses evaluation_strategy."})
+    evaluation_strategy: str = field(default="steps", metadata={"help": "Evaluation strategy: 'no', 'steps', 'epoch'."})
+    eval_accumulation_steps: Optional[int] = field(default=None, metadata={"help": "Number of predictions steps to accumulate before moving tensors to CPU."})
+    
+    # Custom evaluation parameters (from evaluate_model.py)
+    use_custom_eval: bool = field(default=False, metadata={"help": "Use custom evaluation from evaluate_model.py"})
+    eval_max_new_tokens: int = field(default=128, metadata={"help": "Max new tokens for evaluation generation"})
+    eval_limit: Optional[int] = field(default=5, metadata={"help": "Limit number of samples for custom evaluation (None for no limit)"})
+    no_loss: bool = field(default=False, metadata={"help": "Disable loss calculation in evaluation"})
+    focus_loss_after_looking: bool = field(default=True, metadata={"help": "Focus loss on tokens after 'looking at' phrase"})
+    focus_loss_phrase: str = field(default="looking at", metadata={"help": "Phrase to focus loss calculation"})
+    focus_loss_threshold: float = field(default=5.0, metadata={"help": "Maximum loss when focus phrase not found"})
 
 
 # @dataclass
@@ -189,14 +241,60 @@ class TrainingArguments(transformers.TrainingArguments):
 #     output_path: Optional[str] = field(default="./logs/")
 
 
+def _infer_zero_stage(param) -> Optional[int]:
+    """Best-effort extraction of the ZeRO stage from a parameter."""
+    stage_like = getattr(param, "ds_zero_stage", None)
+    if stage_like is not None:
+        try:
+            return int(stage_like)
+        except (TypeError, ValueError):
+            pass
+
+    for attr_name in ("ds_zero_config",):
+        zero_cfg = getattr(param, attr_name, None)
+        if zero_cfg is not None:
+            if isinstance(zero_cfg, dict):
+                stage_like = zero_cfg.get("stage")
+            else:
+                stage_like = getattr(zero_cfg, "stage", None)
+            if stage_like is not None:
+                try:
+                    return int(stage_like)
+                except (TypeError, ValueError):
+                    pass
+
+    ds_config = getattr(param, "ds_config", None)
+    if ds_config is not None:
+        for attr_name in ("zero_config", "zero_optimization"):
+            zero_cfg = getattr(ds_config, attr_name, None)
+            if zero_cfg is None:
+                continue
+            if isinstance(zero_cfg, dict):
+                stage_like = zero_cfg.get("stage")
+            else:
+                stage_like = getattr(zero_cfg, "stage", None)
+            if stage_like is not None:
+                try:
+                    return int(stage_like)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
-    if hasattr(param, "ds_id"):
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if not ignore_status:
-                logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
+    zero_stage = _infer_zero_stage(param)
+    should_gather = hasattr(param, "ds_id") and (zero_stage is None or zero_stage == 3)
+    if zero_stage in (1, 2):
+        should_gather = False
+
+    warn_unavailable = hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+
+    if should_gather:
+        if warn_unavailable and not ignore_status:
+            logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
         with zero.GatheredParameters([param]):
             param = param.data.detach().cpu().clone()
     else:
@@ -244,21 +342,235 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
-def find_all_linear_names(model):
+
+PREDEFINED_TUNABLE_PARTS = {
+    "mm_mlp_adapter",
+    "mm_vision_resampler",
+    "mm_vision_tower",
+    "mm_projector",
+    "mm_language_model",
+    "lm_head",
+}
+
+
+def _split_tunable_specs(parts: Optional[str]) -> List[str]:
+    if not parts:
+        return []
+    tokens: List[str] = []
+    current: List[str] = []
+    depth_brace = depth_bracket = depth_paren = 0
+    for char in parts:
+        if char == ',' and depth_brace == depth_bracket == depth_paren == 0:
+            token = ''.join(current).strip()
+            if token:
+                tokens.append(token)
+            current = []
+            continue
+        if char == '{':
+            depth_brace += 1
+        elif char == '}':
+            depth_brace = max(depth_brace - 1, 0)
+        elif char == '[':
+            depth_bracket += 1
+        elif char == ']':
+            depth_bracket = max(depth_bracket - 1, 0)
+        elif char == '(':
+            depth_paren += 1
+        elif char == ')':
+            depth_paren = max(depth_paren - 1, 0)
+        current.append(char)
+    token = ''.join(current).strip()
+    if token:
+        tokens.append(token)
+    return tokens
+
+
+def _expand_index_selector(selector: str, length: int) -> List[int]:
+    selector = selector.strip()
+    if ':' not in selector:
+        index = int(selector)
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            raise IndexError(f"Index {selector} out of bounds for length {length}")
+        return [index]
+
+    parts = selector.split(':')
+    if len(parts) > 3:
+        raise ValueError(f"Unsupported slice selector '{selector}'")
+    while len(parts) < 3:
+        parts.append('')
+    start_str, stop_str, step_str = parts
+    start = int(start_str) if start_str else None
+    stop = int(stop_str) if stop_str else None
+    step = int(step_str) if step_str else None
+
+    full_range = list(range(length))
+    indices = full_range[slice(start, stop, step)]
+    if not isinstance(indices, list):
+        indices = list(indices)
+    if not indices:
+        raise ValueError(f"Slice '{selector}' resolved to empty selection for length {length}")
+    return [int(i) for i in indices]
+
+
+def _expand_module_spec(model: torch.nn.Module, spec: str, module_map: Dict[str, torch.nn.Module]) -> List[str]:
+    pending = [spec.strip()]
+    expanded: List[str] = []
+
+    while pending:
+        current = pending.pop()
+        if not current:
+            continue
+
+        brace_match = re.search(r"\{([^{}]+)\}", current)
+        if brace_match:
+            choices = [option.strip() for option in brace_match.group(1).split(',') if option.strip()]
+            prefix = current[: brace_match.start()]
+            suffix = current[brace_match.end() :]
+            if not choices:
+                rank0_print(f"Warning: Empty brace expansion in spec '{spec}'")
+            for choice in choices:
+                pending.append(f"{prefix}{choice}{suffix}")
+            continue
+
+        bracket_match = re.search(r"\[([^\[\]]+)\]", current)
+        if bracket_match:
+            prefix = current[: bracket_match.start()]
+            selector = bracket_match.group(1)
+            suffix = current[bracket_match.end() :]
+
+            base_path = prefix.rstrip('.')
+            suffix = suffix.lstrip('.')
+
+            container = module_map.get(base_path)
+            length = None
+            available_indices = None
+            if container is not None and hasattr(container, '__len__'):
+                try:
+                    length = len(container)
+                    available_indices = set(range(length))
+                except TypeError:
+                    length = None
+
+            if length is None:
+                prefix_key = f"{base_path}." if base_path else ""
+                child_indices = set()
+                for name in module_map.keys():
+                    if not prefix_key and name == "":
+                        continue
+                    if not name.startswith(prefix_key):
+                        continue
+                    remainder = name[len(prefix_key):]
+                    if not remainder:
+                        continue
+                    child = remainder.split('.', 1)[0]
+                    if child.isdigit():
+                        child_indices.add(int(child))
+                if not child_indices:
+                    rank0_print(f"Warning: Unable to resolve module path '{base_path}' in spec '{spec}'")
+                    continue
+                length = max(child_indices) + 1
+                available_indices = child_indices
+
+            try:
+                indices = _expand_index_selector(selector, length)
+            except Exception as exc:
+                rank0_print(f"Warning: Unable to resolve selector '{selector}' in spec '{spec}': {exc}")
+                continue
+
+            valid_indices = []
+            for index in indices:
+                if index not in available_indices:
+                    rank0_print(f"Warning: Index {index} not available under '{base_path}' in spec '{spec}'")
+                    continue
+                valid_indices.append(index)
+
+            if not valid_indices:
+                rank0_print(f"Warning: Selector '{selector}' produced no valid indices for '{base_path}' in spec '{spec}'")
+                continue
+
+            for index in valid_indices:
+                parts = []
+                if base_path:
+                    parts.append(base_path)
+                parts.append(str(index))
+                if suffix:
+                    parts.append(suffix)
+                pending.append('.'.join(parts))
+            continue
+
+        expanded.append(current)
+
+    return sorted(set(expanded))
+
+
+def resolve_custom_tunable_modules(model: torch.nn.Module, tunable_parts: Sequence[str]) -> List[str]:
+    custom_specs = [part for part in tunable_parts if part not in PREDEFINED_TUNABLE_PARTS]
+    if not custom_specs:
+        return []
+    module_map = dict(model.named_modules())
+    module_map.setdefault('', model)
+    resolved: List[str] = []
+    for spec in custom_specs:
+        resolved.extend(_expand_module_spec(model, spec, module_map))
+    return sorted(set(resolved))
+
+
+def find_all_linear_names(model, mm_tunable_parts=None, exclude_mm_projector: bool = False):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
+
+    tunable_parts_list = _split_tunable_specs(mm_tunable_parts)
+
+    if not tunable_parts_list:
+        print("No mm_tunable_parts specified, will tune all linear layers in the model.")
+        for name, module in model.named_modules():
+            if isinstance(module, cls):
+                if "mm_projector" in name:
+                    if exclude_mm_projector:
+                        continue
+                    lora_module_names.add(name)
+                else:
+                    names = name.split('.')
+                    lora_module_names.add(names[-1])
+        print(f"mm_tunable_parts: {mm_tunable_parts}")
+        print(f"Found these linear module names for LoRA: {lora_module_names}")
+        return list(lora_module_names)
+
+    custom_module_targets = resolve_custom_tunable_modules(model, tunable_parts_list)
+    substring_filters = [part for part in tunable_parts_list if part in PREDEFINED_TUNABLE_PARTS]
+
     for name, module in model.named_modules():
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
+        if not isinstance(module, cls):
             continue
-        if isinstance(module, cls):
-            names = name.split(".")
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
-    if "lm_head" in lora_module_names:  # needed for 16-bit
-        lora_module_names.remove("lm_head")
+        matched = False
+        for target in custom_module_targets:
+            if target == name or name.startswith(f"{target}."):
+                lora_module_names.add(name)
+                matched = True
+                break
+        if matched:
+            continue
+
+        if substring_filters and not any(filter_key in name for filter_key in substring_filters):
+            continue
+
+        if not substring_filters and custom_module_targets:
+            continue
+
+        if "mm_projector" in name:
+            if exclude_mm_projector:
+                continue
+            lora_module_names.add(name)
+        else:
+            names = name.split('.')
+            lora_module_names.add(names[-1])
+
+    print(f"mm_tunable_parts: {mm_tunable_parts}")
+    print(f"Found these linear module names for LoRA: {lora_module_names}")
     return list(lora_module_names)
-
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -280,6 +592,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(trainer.model.named_parameters())
+        for key in list(non_lora_weight_to_save.keys()):
+            if key in weight_to_save:
+                del non_lora_weight_to_save[key]
         trainer.model.config.save_pretrained(output_dir)
 
         current_folder = output_dir.split("/")[-1]
@@ -288,9 +604,17 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
             if current_folder.startswith("checkpoint-"):
                 mm_projector_folder = os.path.join(parent_folder, "mm_projector")
                 os.makedirs(mm_projector_folder, exist_ok=True)
-                torch.save(weight_to_save, os.path.join(mm_projector_folder, f"{current_folder}.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(mm_projector_folder, f"{current_folder}.bin"))
+                if non_lora_weight_to_save:
+                    non_lora_folder = os.path.join(parent_folder, "non_lora_trainables")
+                    os.makedirs(non_lora_folder, exist_ok=True)
+                    torch.save(non_lora_weight_to_save, os.path.join(non_lora_folder, f"{current_folder}.bin"))
             else:
-                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(output_dir, "mm_projector.bin"))
+                if non_lora_weight_to_save:
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
         return
 
     if trainer.deepspeed:
@@ -1002,33 +1326,26 @@ def load_split_dataset(data_args: DataArguments, split: str = "train") -> List[D
 
 
 class LazySupervisedDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, split: str = "train"):
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, split_indices: Optional[List[int]] = None):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.list_data_dict = []
-        self.split = split
+        self.split_indices = split_indices
 
-        # Check if using split dataset mode
-        if data_args.use_split_dataset:
-            rank0_print(f"Loading split dataset for {split}")
-            self.list_data_dict = load_split_dataset(data_args, split)
-            data_args.dataset_paths = [os.path.join(data_args.split_dataset_dir, data_args.dataset_name, f"{split}.json")]
-        else:
-            # Original dataset loading logic
-            # Handle multiple JSON files specified in the data_path
-            if "{" in data_path and "}" in data_path:
-                base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
-                file_names = file_pattern.split(",")
-                rank0_print(f"Loading {file_names} from {base_path}")
-                data_args.dataset_paths = []
-                for file_name in file_names:
-                    data_args.dataset_paths.append(f"{base_path}{file_name}.json")
-                    full_path = f"{base_path}{file_name}.json"
-                    rank0_print(f"Loading {full_path}")
-                    with open(full_path, "r") as file:
-                        cur_data_dict = json.load(file)
-                        rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
-                        self.list_data_dict.extend(cur_data_dict)
+        # Handle multiple JSON files specified in the data_path
+        if "{" in data_path and "}" in data_path:
+            base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+            file_names = file_pattern.split(",")
+            rank0_print(f"Loading {file_names} from {base_path}")
+            data_args.dataset_paths = []
+            for file_name in file_names:
+                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                full_path = f"{base_path}{file_name}.json"
+                rank0_print(f"Loading {full_path}")
+                with open(full_path, "r") as file:
+                    cur_data_dict = json.load(file)
+                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                    self.list_data_dict.extend(cur_data_dict)
         elif data_path.endswith(".yaml"):
             with open(data_path, "r") as file:
                 yaml_data = yaml.safe_load(file)
@@ -1084,12 +1401,20 @@ class LazySupervisedDataset(Dataset):
             with open(data_path, "r") as file:
                 cur_data_dict = json.load(file)
                 rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
+                random.shuffle(cur_data_dict)
+                rank0_print(f"Shuffled {len(cur_data_dict)} samples")
                 self.list_data_dict.extend(cur_data_dict)
 
         rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
+        
+        # Apply split indices if provided
+        if self.split_indices is not None:
+            original_data = self.list_data_dict
+            self.list_data_dict = [original_data[i] for i in self.split_indices]
+            rank0_print(f"Applied split: using {len(self.list_data_dict)} samples from the split")
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -1118,6 +1443,8 @@ class LazySupervisedDataset(Dataset):
         image_folder = self.data_args.image_folder
         processor = self.data_args.image_processor
         # print(f"\n\nInspecting the image path, folder = {image_folder}, image={image_file}\n\n")
+        if not image_file.endswith(".jpg"):
+            image_file = image_file + ".jpg"
         try:
             image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
         except Exception as exn:
@@ -1343,38 +1670,105 @@ class DataCollatorForSupervisedDataset(object):
         return batch
 
 
+def create_train_eval_splits(data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, eval_split_ratio: float = 0.2, seed: int = 42):
+    """Create train and eval datasets with the specified split ratio."""
+    # First create a full dataset to get all the data
+    full_dataset = LazySupervisedDataset(data_path, tokenizer, data_args)
+    total_samples = len(full_dataset.list_data_dict)
+    
+    # Create indices for splitting
+    indices = list(range(total_samples))
+    random.seed(seed)
+    random.shuffle(indices)
+    
+    # Split indices
+    eval_size = int(total_samples * eval_split_ratio)
+    eval_indices = indices[:eval_size]
+    train_indices = indices[eval_size:]
+    
+    rank0_print(f"Split dataset: {len(train_indices)} train samples, {len(eval_indices)} eval samples")
+    
+    # Create split datasets by reusing the loaded data and directly applying splits
+    train_dataset = LazySupervisedDataset.__new__(LazySupervisedDataset)
+    train_dataset.tokenizer = tokenizer
+    train_dataset.data_args = data_args
+    train_dataset.split_indices = train_indices
+    train_dataset.list_data_dict = [full_dataset.list_data_dict[i] for i in train_indices]
+    rank0_print(f"Applied split: using {len(train_dataset.list_data_dict)} samples for training")
+    
+    eval_dataset = LazySupervisedDataset.__new__(LazySupervisedDataset)
+    eval_dataset.tokenizer = tokenizer
+    eval_dataset.data_args = data_args
+    eval_dataset.split_indices = eval_indices
+    eval_dataset.list_data_dict = [full_dataset.list_data_dict[i] for i in eval_indices]
+    rank0_print(f"Applied split: using {len(eval_dataset.list_data_dict)} samples for evaluation")
+    
+    return train_dataset, eval_dataset
+
+
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    
-    if data_args.use_split_dataset:
-        # Create both train and validation datasets from split data
-        rank0_print("Creating train and validation datasets from split data")
-        train_dataset = LazySupervisedDataset(
-            tokenizer=tokenizer, 
-            data_path=data_args.data_path, 
-            data_args=data_args, 
-            split="train"
-        )
-        eval_dataset = LazySupervisedDataset(
-            tokenizer=tokenizer, 
-            data_path=data_args.data_path, 
-            data_args=data_args, 
-            split="val"
-        )
-        rank0_print(f"Created train dataset with {len(train_dataset)} samples")
-        rank0_print(f"Created validation dataset with {len(eval_dataset)} samples")
-    else:
-        # Original behavior - only training dataset
-        train_dataset = LazySupervisedDataset(
-            tokenizer=tokenizer, 
-            data_path=data_args.data_path, 
-            data_args=data_args,
-            split="train"
-        )
-        eval_dataset = None
-    
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
+    
+    # Check if evaluation is enabled
+    if data_args.enable_evaluation:
+        if data_args.eval_data_path is not None:
+            # Use separate eval dataset
+            train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+            eval_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.eval_data_path, data_args=data_args)
+            rank0_print(f"Using separate eval dataset: {len(train_dataset)} train, {len(eval_dataset)} eval")
+        else:
+            # Split the training data
+            train_dataset, eval_dataset = create_train_eval_splits(
+                data_path=data_args.data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                eval_split_ratio=data_args.eval_split_ratio
+            )
+        return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
+    else:
+        # No evaluation - use all data for training
+        train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+        return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+
+def print_model_structure(model, show_params=True, show_gradients=True):
+    """Print comprehensive model structure with parameter counts and gradient status."""
+    rank0_print("=" * 80)
+    rank0_print("MODEL STRUCTURE")
+    rank0_print("=" * 80)
+    
+    total_params = 0
+    trainable_params = 0
+    
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight') and module.weight is not None:
+            param_count = module.weight.numel()
+            total_params += param_count
+            is_trainable = module.weight.requires_grad
+            if is_trainable:
+                trainable_params += param_count
+            
+            if show_params:
+                rank0_print(f"{name:60} | {str(type(module).__name__):20} | {param_count:>10,} params | {'✓' if is_trainable else '✗'} trainable")
+    
+    if show_gradients:
+        rank0_print("\n" + "=" * 60)
+        rank0_print("PARAMETER GRADIENT STATUS")
+        rank0_print("=" * 60)
+        
+        for name, param in model.named_parameters():
+            status = "✓ TRAINABLE" if param.requires_grad else "✗ FROZEN"
+            rank0_print(f"{name:60} | {status}")
+    
+    rank0_print("\n" + "=" * 60)
+    rank0_print("SUMMARY")
+    rank0_print("=" * 60)
+    rank0_print(f"Total parameters: {total_params:,}")
+    rank0_print(f"Trainable parameters: {trainable_params:,}")
+    rank0_print(f"Frozen parameters: {total_params - trainable_params:,}")
+    rank0_print(f"Trainable ratio: {trainable_params/total_params*100:.2f}%")
+    rank0_print("=" * 80)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -1532,10 +1926,19 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
 def train(attn_implementation=None):
     global local_rank
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    # Initialize overall timing
+    overall_start = time.time()
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     parsed_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     model_args, data_args, training_args = parsed_args[:3]
+    
+    rank0_print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    rank0_print("Starting training setup...")
+    setup_start = time.time()
     
 
     if training_args.verbose_logging:
@@ -1569,7 +1972,40 @@ def train(attn_implementation=None):
             )
         )
 
-    model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    # Load pretrained LLaVA model (already includes mm_mlp_adapter)
+    pretrained = "lmms-lab/llava-onevision-qwen2-7b-ov-chat"
+    model_name = "llava_qwen"
+    device = "cuda"
+    device_map = "auto"
+    llava_model_args = {
+        "multimodal": True,
+        "torch_dtype": "bfloat16" if training_args.bf16 else "float16" if training_args.fp16 else "float32",
+        # "attn_implementation": "sdpa",
+    }
+    
+    # Time model loading
+    model_load_start = time.time()
+    rank0_print("Starting model loading...")
+    
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.module")
+        tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, **llava_model_args)
+    
+    model_load_time = time.time() - model_load_start
+    rank0_print(f"Model loading completed in {model_load_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {"timing/model_load_seconds": model_load_time})
+    
+    # Store the image processor from the pretrained model
+    if image_processor is not None:
+        data_args.image_processor = image_processor
+        data_args.is_multimodal = True
+        rank0_print("Image processor loaded from pretrained model")
+    
+    rank0_print(f"Model Class: {model.__class__.__name__}")
+    rank0_print(f"Prompt version: {model_args.version}")
+
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
@@ -1595,6 +2031,10 @@ def train(attn_implementation=None):
                 output.requires_grad_(True)
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+        
+        # Configure gradient checkpointing with use_reentrant=False
+        # if hasattr(model, 'gradient_checkpointing_enable'):
+        #     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=training_args.gradient_checkpointing_kwargs)
 
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
@@ -1602,38 +2042,42 @@ def train(attn_implementation=None):
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=find_all_linear_names(
+                model,
+                mm_tunable_parts=model_args.mm_tunable_parts,
+                exclude_mm_projector=training_args.mm_projector_full_finetune,
+            ),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
+        # if training_args.bits == 16:
+        #     if training_args.bf16:
+        #         model.to(torch.bfloat16)
+        #     if training_args.fp16:
+        #         model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
-    elif "qwen" in model_args.model_name_or_path.lower():
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right")
-    elif (
-        "wizardlm-2" in model_args.model_name_or_path.lower()
-        or "vicuna" in model_args.model_name_or_path.lower()
-        or "llama" in model_args.model_name_or_path.lower()
-        or "yi" in model_args.model_name_or_path.lower()
-        or "nous-hermes" in model_args.model_name_or_path.lower()
-        and "wizard-2" in model_args.model_name_or_path.lower()
-    ):
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=False,
-        )
+    # if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
+    #     tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
+    # elif "qwen" in model_args.model_name_or_path.lower():
+    #     tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right")
+    # elif (
+    #     "wizardlm-2" in model_args.model_name_or_path.lower()
+    #     or "vicuna" in model_args.model_name_or_path.lower()
+    #     or "llama" in model_args.model_name_or_path.lower()
+    #     or "yi" in model_args.model_name_or_path.lower()
+    #     or "nous-hermes" in model_args.model_name_or_path.lower()
+    #     and "wizard-2" in model_args.model_name_or_path.lower()
+    # ):
+    #     tokenizer = transformers.AutoTokenizer.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         cache_dir=training_args.cache_dir,
+    #         model_max_length=training_args.model_max_length,
+    #         padding_side="right",
+    #         use_fast=False,
+    #     )
 
     rank0_print(f"Prompt version: {model_args.version}")
     if model_args.version == "v0":
@@ -1652,115 +2096,234 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
-
-    if model_args.vision_tower is not None:
-        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
-
+    
+    # Set vision tower parameter from model args if provided, otherwise use pretrained
+    if model_args.vision_tower is None:
+        # Use the vision tower from the pretrained model
+        model_args.vision_tower = getattr(model.config, 'mm_vision_tower', 'google/siglip-so400m-patch14-384')
+    
+    rank0_print(f"Using vision tower: {model_args.vision_tower}")
+    
+    # Only initialize vision modules if they're not already present or if we need to update them
+    vision_init_start = time.time()
+    
+    if hasattr(model, 'get_vision_tower') and model.get_vision_tower() is not None:
+        rank0_print("Vision modules already initialized from pretrained model")
         vision_tower = model.get_vision_tower()
-        vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+    else:
+        rank0_print("Initializing vision modules")
+        model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
+        vision_tower = model.get_vision_tower()
+    
+    vision_init_time = time.time() - vision_init_start
+    rank0_print(f"Vision initialization completed in {vision_init_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {"timing/vision_init_seconds": vision_init_time})
+    
+    # Ensure vision tower is moved to the correct device and dtype
+    # vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+    vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16)
 
+    # Set image processor and multimodal flag regardless of initialization path
+    if vision_tower.image_processor is not None:
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
+        rank0_print("Image processor set from vision tower")
+    elif data_args.image_processor is None:
+        rank0_print("WARNING: No image processor found, this may cause issues with image processing")
+    
+    # Verify image processor is properly set
+    if data_args.image_processor is None:
+        raise ValueError("Image processor is None - this will cause errors during data loading")
 
-        model.config.image_aspect_ratio = data_args.image_aspect_ratio
-        if data_args.image_grid_pinpoints is not None:
-            if isinstance(data_args.image_grid_pinpoints, str) and "x" in data_args.image_grid_pinpoints:
-                try:
-                    patch_size = data_args.image_processor.size[0]
-                except Exception as e:
-                    patch_size = data_args.image_processor.size["shortest_edge"]
+    model.config.image_aspect_ratio = data_args.image_aspect_ratio
+    if data_args.image_grid_pinpoints is not None:
+        if isinstance(data_args.image_grid_pinpoints, str) and "x" in data_args.image_grid_pinpoints:
+            try:
+                patch_size = data_args.image_processor.size[0]
+            except Exception as e:
+                patch_size = data_args.image_processor.size["shortest_edge"]
 
-                assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
-                # Use regex to extract the range from the input string
-                matches = re.findall(r"\((\d+)x(\d+)\)", data_args.image_grid_pinpoints)
-                range_start = tuple(map(int, matches[0]))
-                range_end = tuple(map(int, matches[-1]))
-                # Generate a matrix of tuples from (range_start[0], range_start[1]) to (range_end[0], range_end[1])
-                grid_pinpoints = [(i, j) for i in range(range_start[0], range_end[0] + 1) for j in range(range_start[1], range_end[1] + 1)]
-                # Multiply all elements by patch_size
-                data_args.image_grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
-            elif isinstance(data_args.image_grid_pinpoints, str):
-                data_args.image_grid_pinpoints = ast.literal_eval(data_args.image_grid_pinpoints)
+            assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
+            # Use regex to extract the range from the input string
+            matches = re.findall(r"\((\d+)x(\d+)\)", data_args.image_grid_pinpoints)
+            range_start = tuple(map(int, matches[0]))
+            range_end = tuple(map(int, matches[-1]))
+            # Generate a matrix of tuples from (range_start[0], range_start[1]) to (range_end[0], range_end[1])
+            grid_pinpoints = [(i, j) for i in range(range_start[0], range_end[0] + 1) for j in range(range_start[1], range_end[1] + 1)]
+            # Multiply all elements by patch_size
+            data_args.image_grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
+        elif isinstance(data_args.image_grid_pinpoints, str):
+            data_args.image_grid_pinpoints = ast.literal_eval(data_args.image_grid_pinpoints)
 
-        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
-        model.config.image_crop_resolution = data_args.image_crop_resolution
-        model.config.image_split_resolution = data_args.image_split_resolution
-        model.config.tokenizer_padding_side = tokenizer.padding_side
-        model.config.tokenizer_model_max_length = tokenizer.model_max_length
-        model.config.mm_newline_position = model_args.mm_newline_position
-        model.config.add_faster_video = model_args.add_faster_video
-        model.config.faster_token_stride = model_args.faster_token_stride
-        model.config.add_time_instruction = data_args.add_time_instruction
-        model.config.force_sample = data_args.force_sample
-        model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
+    model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
+    model.config.image_crop_resolution = data_args.image_crop_resolution
+    model.config.image_split_resolution = data_args.image_split_resolution
+    model.config.tokenizer_padding_side = tokenizer.padding_side
+    model.config.tokenizer_model_max_length = tokenizer.model_max_length
+    model.config.mm_newline_position = model_args.mm_newline_position
+    model.config.add_faster_video = model_args.add_faster_video
+    model.config.faster_token_stride = model_args.faster_token_stride
+    model.config.add_time_instruction = data_args.add_time_instruction
+    model.config.force_sample = data_args.force_sample
+    model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
 
-        ### Deciding train which part of the model
-        if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
-            model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
-            model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
-            if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
-                model.requires_grad_(False)
-            if model_args.tune_mm_mlp_adapter:
-                for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = True
-            if model_args.tune_mm_vision_resampler:
-                for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = True
-
-            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-            if training_args.freeze_mm_mlp_adapter:
-                for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = False
-
-            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
-            if training_args.freeze_mm_vision_resampler:
-                for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = False
-
-            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
-            if model_args.unfreeze_mm_vision_tower:
-                vision_tower.requires_grad_(True)
-            else:
-                vision_tower.requires_grad_(False)
-
-        else:
-            rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
-            model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
-            # Set the entire model to not require gradients by default
+    ### Deciding train which part of the model
+    if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
+        model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
+        if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
             model.requires_grad_(False)
+        if model_args.tune_mm_mlp_adapter:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = True
+        if model_args.tune_mm_vision_resampler:
+            for p in model.get_model().vision_resampler.parameters():
+                p.requires_grad = True
+
+        model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+        if training_args.freeze_mm_mlp_adapter:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = False
+
+        model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
+        if training_args.freeze_mm_vision_resampler:
+            for p in model.get_model().vision_resampler.parameters():
+                p.requires_grad = False
+
+        model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
+        if model_args.unfreeze_mm_vision_tower:
+            vision_tower.requires_grad_(True)
+        else:
             vision_tower.requires_grad_(False)
-            model.get_model().mm_projector.requires_grad_(False)
-            model.get_model().vision_resampler.requires_grad_(False)
-            # Parse the mm_tunable_parts to decide which parts to unfreeze
-            tunable_parts = model_args.mm_tunable_parts.split(",")
-            if "mm_mlp_adapter" in tunable_parts:
+
+
+    else:
+        rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
+        tunable_parts = _split_tunable_specs(model_args.mm_tunable_parts)
+        sanitized_parts = ','.join(tunable_parts)
+        model.config.mm_tunable_parts = training_args.mm_tunable_parts = sanitized_parts or model_args.mm_tunable_parts
+        # custom_module_targets = resolve_custom_tunable_modules(model, tunable_parts)
+        # model.config.resolved_custom_tunable_modules = custom_module_targets
+        custom_module_targets = True
+        # Set the entire model to not require gradients by default
+        model.requires_grad_(False)
+        vision_tower.requires_grad_(False)
+        model.get_model().mm_projector.requires_grad_(False)
+        model.get_model().vision_resampler.requires_grad_(False)
+        if "mm_mlp_adapter" in tunable_parts:
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "mlp" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = True
-            if "mm_vision_resampler" in tunable_parts:
+        if "mm_vision_resampler" in tunable_parts:
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "vision_resampler" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = True
-            if "mm_vision_tower" in tunable_parts:
+        if "mm_vision_tower" in tunable_parts:
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "vision_tower" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
                 for name, param in model.named_parameters():
                     if "vision_tower" in name:
                         param.requires_grad_(True)
-            if "mm_language_model" in tunable_parts:
+        if "mm_projector" in tunable_parts:
+            print("Enabling mm_projector parameters")
+            if training_args.mm_projector_full_finetune:
+                rank0_print("mm_projector_full_finetune enabled: training base projector weights without LoRA adapters")
+                if hasattr(model.get_model(), "mm_projector"):
+                    model.get_model().mm_projector.requires_grad_(True)
+                for name, param in model.named_parameters():
+                    if "mm_projector" not in name:
+                        continue
+                    if "lora_" in name:
+                        param.requires_grad_(False)
+                    else:
+                        param.requires_grad_(True)
+            elif training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "mm_projector" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
+                for name, param in model.named_parameters():
+                    if "mm_projector" in name:
+                        param.requires_grad_(True)
+        if "lm_head" in tunable_parts:
+            print("Enabling lm_head parameters")
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "lm_head" in name and "lora_" in name:
+                        param.requires_grad_(True)
+            else:
+                for name, param in model.named_parameters():
+                    if "lm_head" in name:
+                        param.requires_grad_(True)
+        if "mm_language_model" in tunable_parts:
+            if training_args.lora_enable:
+                rank0_print("Language model training enabled via LoRA adapters (base model parameters remain frozen)")
+                language_model_params = []
+                for name, param in model.named_parameters():
+                    if "lora_" in name and "model.model.layers" in name:
+                        param.requires_grad_(True)
+                        language_model_params.append(name)
+            else:
+                language_model_params = []
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         param.requires_grad_(True)
+                        language_model_params.append(name)
 
-        total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
-        trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
-        rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
-        rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
-        if training_args.bits in [4, 8]:
-            model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+            rank0_print(f"Language model parameters set to require gradients ({len(language_model_params)} parameters):")
+            for param_name in language_model_params:
+                rank0_print(f"  {param_name}")
 
-        model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
-        model.config.mm_projector_lr = training_args.mm_projector_lr
-        model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
-        training_args.use_im_start_end = model_args.mm_use_im_start_end
-        model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
-        model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+        if custom_module_targets:
+            rank0_print(f"Enabling custom tunable modules: {custom_module_targets}")
+            custom_params = set()
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "lora_" in name:
+                        param.requires_grad_(True)
+                        custom_params.add(name)
+            # else:
+            #     for name, param in model.named_parameters():
+            #         if any(name.startswith(target) for target in custom_module_targets):
+            #             param.requires_grad_(True)
+            #             custom_params.add(name)
+            rank0_print(f"Custom module parameters set to require gradients ({len(custom_params)} parameters):")
+            for param_name in sorted(custom_params):
+                rank0_print(f"  {param_name}")
+    total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
+    trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
+    rank0_print(f"Total parameters: {total_params:,}")
+    rank0_print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Add comprehensive model structure print
+    print_model_structure(model, show_params=True, show_gradients=True)
+    
+    # Clear any cached memory after model setup
+    torch.cuda.empty_cache()
+    
+    if training_args.bits in [4, 8]:
+        model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+
+    model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
+    model.config.mm_projector_lr = training_args.mm_projector_lr
+    model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
+    model.config.mm_projector_full_finetune = training_args.mm_projector_full_finetune
+    training_args.use_im_start_end = model_args.mm_use_im_start_end
+    model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
+    # model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)        # todo: test if this really required
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -1776,13 +2339,94 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    # Time data module creation
+    data_module_start = time.time()
+    rank0_print("Creating data module...")
+    
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    
+    data_module_time = time.time() - data_module_start
+    rank0_print(f"Data module creation completed in {data_module_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {"timing/data_module_creation_seconds": data_module_time})
+    
+    # Determine conversation template for evaluation
+    conv_template = "qwen_1_5"
+    
+    # Configure evaluation settings before creating trainer
+    if data_args.enable_evaluation and data_module["eval_dataset"] is not None:
+        # Set evaluation strategy if not already set
+        if training_args.evaluation_strategy == "no":
+            training_args.evaluation_strategy = "steps"
+        
+        # Set eval_steps if provided
+        if training_args.eval_steps is None and training_args.evaluation_strategy == "steps":
+            training_args.eval_steps = 500  # Default to every 500 steps
+        
+        rank0_print(f"Evaluation enabled: strategy={training_args.evaluation_strategy}, eval_steps={training_args.eval_steps}")
+        rank0_print(f"Eval dataset size: {len(data_module['eval_dataset'])}")
     else:
+        # Explicitly disable evaluation when no eval dataset is available
+        training_args.evaluation_strategy = "no"
+        training_args.eval_steps = None
+        rank0_print("Evaluation disabled")
+    
+    # Time trainer creation
+    trainer_creation_start = time.time()
+    rank0_print("Creating trainer...")
+    
+    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    
+    trainer_creation_time = time.time() - trainer_creation_start
+    setup_time = time.time() - setup_start
+    
+    rank0_print(f"Trainer creation completed in {trainer_creation_time:.2f} seconds")
+    rank0_print(f"Total setup time: {setup_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {
+        "timing/trainer_creation_seconds": trainer_creation_time,
+        "timing/total_setup_seconds": setup_time
+    })
+
+    # Time actual training
+    training_start = time.time()
+    rank0_print("Starting training...")
+    
+    # Check for existing checkpoints and resume from the latest one
+    checkpoint_dirs = sorted(pathlib.Path(training_args.output_dir).glob("checkpoint-*"), 
+                            key=lambda x: int(x.name.split("-")[-1]))
+    print(f"Checkpoint dirs: {checkpoint_dirs}")
+    if checkpoint_dirs:
+        latest_checkpoint = str(checkpoint_dirs[-1])
+        rank0_print(f"Found {len(checkpoint_dirs)} checkpoint(s) in {training_args.output_dir}")
+        rank0_print(f"Resuming training from: {latest_checkpoint}")
+        
+        # Verify checkpoint contains trainer_state.json
+        trainer_state_file = pathlib.Path(latest_checkpoint) / "trainer_state.json"
+        if trainer_state_file.exists():
+            rank0_print(f"✓ Trainer state found: {trainer_state_file}")
+        else:
+            rank0_print(f"⚠ Warning: No trainer_state.json found in {latest_checkpoint}")
+        
+        trainer.train(resume_from_checkpoint=latest_checkpoint)
+    else:
+        rank0_print("No checkpoints found, starting fresh training")
         trainer.train()
+    
+    training_time = time.time() - training_start
+    total_time = time.time() - overall_start
+    
+    rank0_print(f"Training completed in {training_time:.2f} seconds")
+    rank0_print(f"Total execution time: {total_time:.2f} seconds")
+    
+    # Log to wandb if available and initialized
+    safe_wandb_log(training_args, {
+        "timing/total_training_seconds": training_time,
+        "timing/total_execution_seconds": total_time
+    })
+        
     trainer.save_state()
 
     model.config.use_cache = True
@@ -1801,6 +2445,7 @@ def train(attn_implementation=None):
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
     rank0_print(f"Model saved to {training_args.output_dir}")
+    rank0_print(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 if __name__ == "__main__":

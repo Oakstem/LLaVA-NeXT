@@ -97,27 +97,21 @@ def parse_grounding_predictions(raw_text: str) -> list[dict[str, Any]]:
         cleaned = fenced_match.group(1).strip()
 
     decoder = json.JSONDecoder()
+    parsed_arr = []
     for idx, char in enumerate(cleaned):
         if char not in "[{":
             continue
         try:
             parsed, _ = decoder.raw_decode(cleaned[idx:])
         except json.JSONDecodeError:
-                # Fallback: search for bbox pattern with 4 numbers
-            bbox_match = re.search(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)', cleaned)
-            if bbox_match:
-                bbox = [int(bbox_match.group(i)) for i in range(1, 5)]
-                return [{"bbox": bbox}]
-            else:
-                continue
+            continue
 
         if isinstance(parsed, dict):
-            return [parsed]
+            parsed_arr.append(parsed)
         if isinstance(parsed, list):
-            return parsed
+            parsed_arr.extend(parsed)
 
-    return []
-
+    return parsed_arr
 
 
 def load_qwen3vl_model(
@@ -221,9 +215,6 @@ def run_qwen3vl_grounding(
             continue
 
         bbox_value = detection.get(bbox_key)
-        # Flatten if nested (e.g., [[x1, y1, x2, y2]])
-        if isinstance(bbox_value, list) and len(bbox_value) == 1 and isinstance(bbox_value[0], list):
-            bbox_value = bbox_value[0]
         if (
             not isinstance(bbox_value, (list, tuple))
             or len(bbox_value) != 4
@@ -254,8 +245,8 @@ def run_qwen3vl_grounding(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen3-VL grounding detection")
-    parser.add_argument("--image-path", type=str, default="/mnt/d/Projects/data/gazefollow/train/00000065/00065874.jpg", help="Path to input image")
-    parser.add_argument("--query", type=str, default="Locate the wooden planks, output its bbox coordinates using JSON format.", help="Detection query")
+    parser.add_argument("--image-path", type=str, default="/galitylab/students/alonmardi/gazefollow/train/00000093/00093143.jpg", help="Path to input image")
+    parser.add_argument("--query", type=str, default="Locate the 'woman who’s walking towards the camera, wearing a vibrant red dress and heels, looking over her shoulder with a smile', output its bbox coordinates using JSON format.", help="Detection query")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen3-VL-4B-Instruct", help="Model ID")
     parser.add_argument("--max-new-tokens", type=int, default=300, help="Max tokens to generate")
     parser.add_argument("--output-json", type=str, default=None, help="Optional path to save detections as JSON")

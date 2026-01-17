@@ -1,7 +1,15 @@
 import os
+import wandb
+import inspect
 import torch
 import torch.nn as nn
 import datetime
+import json
+import pathlib
+import time
+from collections import OrderedDict
+
+from PIL import Image
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
@@ -15,8 +23,30 @@ from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, h
 from transformers.trainer_utils import seed_worker
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
-from typing import List, Optional
+
+# Import sagemaker functions if available
+try:
+    from transformers.trainer_pt_utils import smp_forward_backward
+except ImportError:
+    smp_forward_backward = None
+
+# Import apex if available
+try:
+    from apex import amp
+except ImportError:
+    amp = None
+from typing import List, Optional, Dict
 from datetime import timedelta
+
+# Import custom evaluation functions
+try:
+    from evaluate_model import (
+        evaluate_dataset_for_training,
+        determine_template,
+    )
+    CUSTOM_EVAL_AVAILABLE = True
+except ImportError:
+    CUSTOM_EVAL_AVAILABLE = False
 
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs
@@ -24,7 +54,25 @@ if is_accelerate_available():
 if is_datasets_available():
     import datasets
 
+from llava import conversation as conversation_lib
+from llava.constants import DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
+from llava.conversation import SeparatorStyle
+from llava.mm_utils import process_images, tokenizer_image_token, KeywordsStoppingCriteria
 from llava.utils import rank0_print
+
+
+def safe_wandb_log(args, metrics_dict, step=None):
+    """Safely log metrics to wandb if available and initialized."""
+    if not (args.report_to and "wandb" in args.report_to):
+        return
+    
+    try:
+        if wandb.run is not None:
+            if step is not None:
+                metrics_dict["step"] = step
+            wandb.log(metrics_dict)
+    except Exception as e:
+        rank0_print(f"Warning: Could not log to wandb: {e}")
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -44,6 +92,16 @@ def maybe_zero_3(param, ignore_status=False, name=None):
 
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
+    to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
+    return to_return
+
+
+def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only: bool = True):
+    """Collect non-LoRA parameters (optionally only trainable ones) from possibly ZeRO sharded models."""
+
+    to_return = {k: t for k, t in named_params if "lora_" not in k}
+    if require_grad_only:
+        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
     to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
     return to_return
 
@@ -239,6 +297,130 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize timing counters
+        self.step_times = {
+            "data_loading": [],
+            "forward_pass": [],
+            "backward_pass": [],
+            "optimizer_step": [],
+            "total_step": []
+        }
+        self.last_log_step = 0
+        self.sequence_stats = {
+            "total_tokens": [],
+            "target_tokens": [],
+            "truncations": []
+        }
+        self.sequence_stats_max_length = 0
+        self.sequence_stats_cap = 4096
+        self.sequence_stats_window = 512
+        self._sanity_table = None
+        self._sanity_consecutive_failures = 0
+        self._sanity_failure_limit = getattr(self.args, "sanity_check_failures_to_stop", 5)
+
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Override evaluate method to use custom evaluation from evaluate_model.py
+        when use_custom_eval is enabled.
+        """
+        # Check if custom evaluation is enabled
+        if hasattr(self.args, 'use_custom_eval') and self.args.use_custom_eval and CUSTOM_EVAL_AVAILABLE:
+            rank0_print("\n" + "="*60)
+            rank0_print("Running Custom Evaluation (Overridden)")
+            rank0_print("="*60)
+            
+            # Pick dataset
+            eval_ds = eval_dataset if eval_dataset is not None else self.eval_dataset
+            
+            if eval_ds is None:
+                rank0_print("No eval dataset available")
+                return {}
+            
+            # Get required components
+            try:
+                # Get image processor from model or data_args
+                if hasattr(self.model, 'get_vision_tower') and self.model.get_vision_tower() is not None:
+                    image_processor = self.model.get_vision_tower().image_processor
+                elif hasattr(self, 'data_args') and hasattr(self.data_args, 'image_processor'):
+                    image_processor = self.data_args.image_processor
+                else:
+                    rank0_print("Warning: No image processor found, falling back to standard evaluation")
+                    return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+                
+                # Determine conversation template
+                model_name = getattr(self.model.config, '_name_or_path', 'llava_qwen')
+                if hasattr(self, 'model_args') and hasattr(self.model_args, 'version'):
+                    version = self.model_args.version
+                else:
+                    version = getattr(self.model.config, 'version', 'qwen_1_5')
+                
+                conv_template = determine_template(model_name, version)
+                
+                # Run custom evaluation
+                custom_metrics = evaluate_dataset_for_training(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    image_processor=image_processor,
+                    eval_dataset=eval_ds,
+                    conv_template=conv_template,
+                    max_new_tokens=getattr(self.args, 'eval_max_new_tokens', 128),
+                    focus_loss_after_looking=getattr(self.args, 'focus_loss_after_looking', False),
+                    focus_loss_phrase=getattr(self.args, 'focus_loss_phrase', 'looking at'),
+                    focus_loss_threshold=getattr(self.args, 'focus_loss_threshold', 5.0),
+                    no_loss=getattr(self.args, 'no_loss', False),
+                    verbose=getattr(self.args, 'verbose_logging', False),
+                    limit=getattr(self.args, 'eval_limit', None),
+                )
+                
+                # Add metric prefix and log
+                metrics = OrderedDict()
+                if custom_metrics:
+                    for key, value in custom_metrics.items():
+                        # Add prefix to metrics
+                        prefixed_key = f"{metric_key_prefix}_{key}" if not key.startswith(metric_key_prefix) else key
+                        metrics[prefixed_key] = value
+                    
+                    # Log metrics
+                    rank0_print("\nCustom Evaluation Metrics:")
+                    for key, value in metrics.items():
+                        if isinstance(value, float):
+                            rank0_print(f"  {key}: {value:.4f}")
+                        else:
+                            rank0_print(f"  {key}: {value}")
+                    
+                    # Save to file
+                    output_dir = pathlib.Path(self.args.output_dir)
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    metrics_file = output_dir / f"custom_eval_step_{self.state.global_step}.json"
+                    with open(metrics_file, 'w') as f:
+                        json.dump(dict(metrics), f, indent=2)
+                    rank0_print(f"\nCustom metrics saved to: {metrics_file}")
+                    rank0_print("="*60 + "\n")
+                    
+                    # Log to trainer
+                    self.log(metrics)
+                    self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+                    
+                return metrics
+                
+            except Exception as e:
+                rank0_print(f"Error in custom evaluation: {e}")
+                rank0_print("Falling back to standard evaluation")
+                import traceback
+                traceback.print_exc()
+                return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+        
+        else:
+            # Use standard HF evaluation
+            return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
         grad_acc_kwargs["sync_with_dataloader"] = False
@@ -246,11 +428,40 @@ class LLaVATrainer(Trainer):
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         rank0_print("Setting NCCL timeout to INF to avoid running errors.")
+    
+        grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
+        grad_acc_kwargs["sync_with_dataloader"] = False
+        gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs)
 
-        # create accelerator object
-        self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
-        )
+        accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+        rank0_print("Setting NCCL timeout to INF to avoid running errors.")
+
+        # Build accelerator parameters based on what's supported in this version
+        accelerator_params = {
+            "deepspeed_plugin": self.args.deepspeed_plugin,
+            "gradient_accumulation_plugin": gradient_accumulation_plugin,
+            "kwargs_handlers": [accelerator_kwargs]
+        }
+        
+        # Check which parameters are supported in this accelerate version
+        accelerator_signature = inspect.signature(Accelerator.__init__).parameters
+        
+        # Add parameters conditionally based on what's available
+        if "dispatch_batches" in accelerator_signature:
+            accelerator_params["dispatch_batches"] = getattr(self.args, "dispatch_batches", None)
+        
+        if "split_batches" in accelerator_signature:
+            accelerator_params["split_batches"] = getattr(self.args, "split_batches", False)
+        
+        # In newer versions, gradient_accumulation_steps is passed directly instead of through plugin
+        if "gradient_accumulation_steps" in accelerator_signature:
+            accelerator_params["gradient_accumulation_steps"] = self.args.gradient_accumulation_steps
+            # Remove the plugin if we're using the direct parameter
+            if "gradient_accumulation_plugin" in accelerator_params:
+                del accelerator_params["gradient_accumulation_plugin"]
+            
+            # Create accelerator object
+        self.accelerator = Accelerator(**accelerator_params)
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
 
@@ -318,7 +529,7 @@ class LLaVATrainer(Trainer):
 
     def get_train_dataloader(self) -> DataLoader:
         """
-        Returns the training [`~torch.utils.data.DataLoader`].
+        Returns the training [`~torch.utils.data.DataLoader`] with timing instrumentation.
 
         Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
         training if necessary) otherwise.
@@ -327,6 +538,9 @@ class LLaVATrainer(Trainer):
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
+
+        dataloader_creation_start = time.time()
+        rank0_print("Creating train dataloader...")
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
@@ -351,7 +565,360 @@ class LLaVATrainer(Trainer):
 
         dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
+        dataloader_creation_time = time.time() - dataloader_creation_start
+        rank0_print(f"Train dataloader created in {dataloader_creation_time:.2f} seconds")
+        
+        # Log to wandb if available and initialized
+        safe_wandb_log(self.args, {"timing/dataloader_creation_seconds": dataloader_creation_time})
+
         return dataloader
+    
+    def training_step(self, model, inputs):
+        """Override training step with detailed timing."""
+        step_start = time.time()
+        
+        model.train()
+        
+        # Time input preparation (data movement to GPU, etc.)
+        input_prep_start = time.time()
+        inputs = self._prepare_inputs(inputs)
+        input_prep_time = time.time() - input_prep_start
+
+        if is_sagemaker_mp_enabled() and smp_forward_backward:
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        # Forward pass timing
+        forward_start = time.time()
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        forward_time = time.time() - forward_start
+
+        self._collect_sequence_length_metrics(model)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        # Backward pass timing  
+        backward_start = time.time()
+        if self.use_apex and amp:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+        backward_time = time.time() - backward_start
+        
+        total_step_time = time.time() - step_start
+        
+        # Store timing data
+        self.step_times["data_loading"].append(input_prep_time)  # Input prep is part of data loading overhead
+        self.step_times["forward_pass"].append(forward_time)
+        self.step_times["backward_pass"].append(backward_time)
+        self.step_times["total_step"].append(total_step_time)
+        
+        # Debug: Print timing details for first few steps
+        if self.state.global_step <= 3:
+            rank0_print(f"[DEBUG] Step {self.state.global_step}: input_prep={input_prep_time:.4f}s, "
+                       f"forward={forward_time:.4f}s, backward={backward_time:.4f}s, total={total_step_time:.4f}s")
+            rank0_print(f"[DEBUG] data_loading list has {len(self.step_times['data_loading'])} entries, "
+                       f"last value: {self.step_times['data_loading'][-1]:.4f}s")
+
+        # Log timing every 50 steps to avoid overhead
+        if self.state.global_step % 50 == 0 and self.state.global_step > self.last_log_step:
+            self._log_step_timings()
+            self.log_memory_usage()
+            self._log_sequence_length_stats()
+            self.last_log_step = self.state.global_step
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+    def _collect_sequence_length_metrics(self, model):
+        try:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+        except Exception:
+            unwrapped_model = model
+
+        if not hasattr(unwrapped_model, "pop_sequence_length_stats"):
+            return
+
+        stats = unwrapped_model.pop_sequence_length_stats()
+        if not stats:
+            return
+
+        total_tokens = stats.get("total_tokens")
+        if total_tokens is None:
+            return
+        total_tokens = total_tokens.detach()
+
+        target_tokens = stats.get("target_tokens")
+        if target_tokens is not None:
+            target_tokens = target_tokens.detach()
+
+        trunc_flags = stats.get("hit_max_length")
+        if trunc_flags is not None:
+            trunc_flags = trunc_flags.detach()
+
+        max_length = stats.get("max_length", 0) or 0
+
+        gathered_total = self.accelerator.gather(total_tokens)
+        gathered_target = self.accelerator.gather(target_tokens) if target_tokens is not None else None
+        gathered_trunc = self.accelerator.gather(trunc_flags.long()) if trunc_flags is not None else None
+
+        if self.is_world_process_zero():
+            self.sequence_stats["total_tokens"].extend(gathered_total.long().cpu().tolist())
+            if gathered_target is not None:
+                self.sequence_stats["target_tokens"].extend(gathered_target.long().cpu().tolist())
+            else:
+                self.sequence_stats["target_tokens"].extend([0] * gathered_total.numel())
+            if gathered_trunc is not None:
+                self.sequence_stats["truncations"].extend(gathered_trunc.long().cpu().tolist())
+            else:
+                self.sequence_stats["truncations"].extend([0] * gathered_total.numel())
+            self.sequence_stats_max_length = max(self.sequence_stats_max_length, max_length)
+            self._trim_sequence_stats()
+
+    def _trim_sequence_stats(self):
+        for key in ("total_tokens", "target_tokens", "truncations"):
+            if len(self.sequence_stats[key]) > self.sequence_stats_cap:
+                self.sequence_stats[key] = self.sequence_stats[key][-self.sequence_stats_cap:]
+
+    def _log_sequence_length_stats(self):
+        if not self.is_world_process_zero():
+            return
+        if not self.sequence_stats["total_tokens"]:
+            return
+
+        window = min(len(self.sequence_stats["total_tokens"]), self.sequence_stats_window)
+        total_tensor = torch.tensor(self.sequence_stats["total_tokens"][-window:], dtype=torch.float32)
+        target_tensor = torch.tensor(self.sequence_stats["target_tokens"][-window:], dtype=torch.float32)
+        context_tensor = total_tensor - target_tensor
+        trunc_tensor = torch.tensor(self.sequence_stats["truncations"][-window:], dtype=torch.float32)
+
+        full_mean = total_tensor.mean().item()
+        full_max = total_tensor.max().item()
+        full_p95 = torch.quantile(total_tensor, 0.95).item() if total_tensor.numel() > 1 else full_max
+        target_mean = target_tensor.mean().item() if target_tensor.numel() > 0 else 0.0
+        target_max = target_tensor.max().item() if target_tensor.numel() > 0 else 0.0
+        context_mean = context_tensor.mean().item() if context_tensor.numel() > 0 else 0.0
+        context_max = context_tensor.max().item() if context_tensor.numel() > 0 else 0.0
+        trunc_rate = trunc_tensor.mean().item() if trunc_tensor.numel() > 0 else 0.0
+
+        rank0_print(
+            f"Sequence lengths (last {window} samples) - mean: {full_mean:.1f}, p95: {full_p95:.1f}, max: {int(full_max)}, "
+            f"target mean: {target_mean:.1f}, context mean: {context_mean:.1f}, truncation: {trunc_rate * 100:.1f}%"
+        )
+
+        metrics = {
+            "sequence/full_tokens_mean": full_mean,
+            "sequence/full_tokens_max": full_max,
+            "sequence/full_tokens_p95": full_p95,
+            "sequence/context_tokens_mean": context_mean,
+            "sequence/context_tokens_max": context_max,
+            "sequence/target_tokens_mean": target_mean,
+            "sequence/target_tokens_max": target_max,
+            "sequence/truncation_rate": trunc_rate,
+        }
+        if self.sequence_stats_max_length:
+            metrics["sequence/max_config_length"] = self.sequence_stats_max_length
+
+        safe_wandb_log(self.args, metrics, step=self.state.global_step)
+
+
+    
+    def _log_step_timings(self):
+        """Log average timing for the last batch of steps."""
+        if not self.step_times["total_step"]:
+            return
+            
+        # Calculate averages for the last 10 steps
+        recent_steps = min(10, len(self.step_times["total_step"]))
+        
+        avg_forward = sum(self.step_times["forward_pass"][-recent_steps:]) / recent_steps
+        avg_backward = sum(self.step_times["backward_pass"][-recent_steps:]) / recent_steps  
+        avg_total = sum(self.step_times["total_step"][-recent_steps:]) / recent_steps
+        
+        # Calculate data loading average if we have data
+        avg_data_loading = 0
+        if self.step_times["data_loading"]:
+            recent_data_steps = min(recent_steps, len(self.step_times["data_loading"]))
+            if recent_data_steps > 0:
+                recent_data_values = self.step_times["data_loading"][-recent_data_steps:]
+                avg_data_loading = sum(recent_data_values) / recent_data_steps
+                
+                # Debug first few logging calls
+                if self.state.global_step <= 30:
+                    rank0_print(f"[DEBUG] Data loading timing - recent {recent_data_steps} steps: "
+                               f"{[f'{v:.4f}' for v in recent_data_values]}, avg={avg_data_loading:.4f}s")
+        
+        # Log to console
+        rank0_print(f"Step {self.state.global_step} timing - "
+                   f"Data: {avg_data_loading:.3f}s, Forward: {avg_forward:.3f}s, "
+                   f"Backward: {avg_backward:.3f}s, Total: {avg_total:.3f}s")
+        
+        # Log to wandb if available and initialized
+        metrics = {
+            "timing/avg_forward_pass_seconds": avg_forward,
+            "timing/avg_backward_pass_seconds": avg_backward,
+            "timing/avg_total_step_seconds": avg_total,
+            "timing/forward_backward_ratio": avg_forward / (avg_backward + 1e-8)
+        }
+        
+        # Only add data loading if we have meaningful data
+        if avg_data_loading > 0:
+            metrics["timing/avg_data_loading_seconds"] = avg_data_loading
+            
+        safe_wandb_log(self.args, metrics, step=self.state.global_step)
+        
+        # Keep only recent timing data to avoid memory buildup
+        max_history = 100
+        for key in self.step_times:
+            if len(self.step_times[key]) > max_history:
+                self.step_times[key] = self.step_times[key][-max_history:]
+    
+    def optimizer_step(self, optimizer):
+        """Override optimizer step with timing."""
+        optimizer_start = time.time()
+        
+        # Call the parent optimizer step
+        super().optimizer_step(optimizer)
+        
+        optimizer_time = time.time() - optimizer_start
+        self.step_times["optimizer_step"].append(optimizer_time)
+        
+        # Log optimizer timing every 10 steps
+        if self.state.global_step % 10 == 0:
+            recent_steps = min(10, len(self.step_times["optimizer_step"]))
+            avg_optimizer = sum(self.step_times["optimizer_step"][-recent_steps:]) / recent_steps
+            
+            safe_wandb_log(self.args, {
+                "timing/avg_optimizer_step_seconds": avg_optimizer
+            }, step=self.state.global_step)
+    
+    def log_memory_usage(self):
+        """Log GPU memory usage if available."""
+        if torch.cuda.is_available() and self.state.global_step % 50 == 0:
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            
+            rank0_print(f"Step {self.state.global_step} - GPU Memory: "
+                       f"Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            
+            safe_wandb_log(self.args, {
+                "memory/gpu_allocated_gb": allocated,
+                "memory/gpu_reserved_gb": reserved
+            }, step=self.state.global_step)
+    
+    def log_training_summary(self):
+        """Log a comprehensive training timing summary."""
+        if not any(self.step_times.values()):
+            return
+            
+        rank0_print("\n" + "="*60)
+        rank0_print("TRAINING TIMING SUMMARY")
+        rank0_print("="*60)
+        
+        total_steps = len(self.step_times["total_step"])
+        if total_steps > 0:
+            # Calculate averages
+            avg_forward = sum(self.step_times["forward_pass"]) / len(self.step_times["forward_pass"]) if self.step_times["forward_pass"] else 0
+            avg_backward = sum(self.step_times["backward_pass"]) / len(self.step_times["backward_pass"]) if self.step_times["backward_pass"] else 0
+            avg_optimizer = sum(self.step_times["optimizer_step"]) / len(self.step_times["optimizer_step"]) if self.step_times["optimizer_step"] else 0
+            avg_data_loading = sum(self.step_times["data_loading"]) / len(self.step_times["data_loading"]) if self.step_times["data_loading"] else 0
+            avg_total = sum(self.step_times["total_step"]) / len(self.step_times["total_step"])
+            
+            rank0_print(f"Total training steps: {total_steps}")
+            rank0_print(f"Average per step:")
+            rank0_print(f"  - Data loading: {avg_data_loading:.3f}s ({avg_data_loading/avg_total*100:.1f}%)")
+            rank0_print(f"  - Forward pass: {avg_forward:.3f}s ({avg_forward/avg_total*100:.1f}%)")
+            rank0_print(f"  - Backward pass: {avg_backward:.3f}s ({avg_backward/avg_total*100:.1f}%)")
+            rank0_print(f"  - Optimizer step: {avg_optimizer:.3f}s ({avg_optimizer/avg_total*100:.1f}%)")
+            rank0_print(f"  - Total step: {avg_total:.3f}s")
+            rank0_print(f"  - Steps per second: {1.0/avg_total:.2f}")
+            
+            # Calculate bottleneck
+            max_component = max([
+                ("Data loading", avg_data_loading),
+                ("Forward pass", avg_forward), 
+                ("Backward pass", avg_backward),
+                ("Optimizer step", avg_optimizer)
+            ], key=lambda x: x[1])
+            
+            rank0_print(f"\nBottleneck: {max_component[0]} ({max_component[1]:.3f}s)")
+            
+            # Log final summary to wandb
+            safe_wandb_log(self.args, {
+                "summary/avg_data_loading_seconds": avg_data_loading,
+                "summary/avg_forward_pass_seconds": avg_forward,
+                "summary/avg_backward_pass_seconds": avg_backward,
+                "summary/avg_optimizer_step_seconds": avg_optimizer,
+                "summary/avg_total_step_seconds": avg_total,
+                "summary/steps_per_second": 1.0/avg_total,
+                "summary/bottleneck_component": max_component[0],
+                "summary/bottleneck_time": max_component[1],
+                "summary/total_training_steps": total_steps
+            })
+        if self.sequence_stats["total_tokens"] and self.is_world_process_zero():
+            total_tensor = torch.tensor(self.sequence_stats["total_tokens"], dtype=torch.float32)
+            target_tensor = torch.tensor(self.sequence_stats["target_tokens"], dtype=torch.float32)
+            context_tensor = total_tensor - target_tensor
+            trunc_tensor = torch.tensor(self.sequence_stats["truncations"], dtype=torch.float32) if self.sequence_stats["truncations"] else torch.tensor([], dtype=torch.float32)
+
+            full_mean = total_tensor.mean().item()
+            full_max = total_tensor.max().item()
+            full_p95 = torch.quantile(total_tensor, 0.95).item() if total_tensor.numel() > 1 else full_max
+            target_mean = target_tensor.mean().item() if target_tensor.numel() > 0 else 0.0
+            target_max = target_tensor.max().item() if target_tensor.numel() > 0 else 0.0
+            context_mean = context_tensor.mean().item() if context_tensor.numel() > 0 else 0.0
+            context_max = context_tensor.max().item() if context_tensor.numel() > 0 else 0.0
+            trunc_rate = trunc_tensor.mean().item() if trunc_tensor.numel() > 0 else 0.0
+
+            rank0_print("\nSequence length summary:")
+            rank0_print(f"  - Mean full length: {full_mean:.1f}")
+            rank0_print(f"  - 95th percentile full length: {full_p95:.1f}")
+            rank0_print(f"  - Max full length: {int(full_max)}")
+            rank0_print(f"  - Mean context length: {context_mean:.1f}")
+            rank0_print(f"  - Mean target length: {target_mean:.1f}")
+            rank0_print(f"  - Truncation rate: {trunc_rate * 100:.2f}% (max config {self.sequence_stats_max_length})")
+
+            safe_wandb_log(self.args, {
+                "summary/sequence_full_mean": full_mean,
+                "summary/sequence_full_p95": full_p95,
+                "summary/sequence_full_max": full_max,
+                "summary/sequence_context_mean": context_mean,
+                "summary/sequence_context_max": context_max,
+                "summary/sequence_target_mean": target_mean,
+                "summary/sequence_target_max": target_max,
+                "summary/sequence_truncation_rate": trunc_rate,
+            }, step=self.state.global_step)
+
+        
+        rank0_print("="*60 + "\n")
+    
+    def train(self, *args, **kwargs):
+        """Override train method to add timing summary at the end."""
+        try:
+            result = super().train(*args, **kwargs)
+            self.log_training_summary()
+            return result
+        except Exception as e:
+            self.log_training_summary()
+            raise e
+    
+    def _save_checkpoint(self, model, trial, metrics=None):
+        """Override checkpoint saving with timing."""
+        checkpoint_start = time.time()
+        rank0_print("Starting checkpoint save...")
+        
+        # Call parent save checkpoint method
+        super()._save_checkpoint(model, trial, metrics)
+        
+        checkpoint_time = time.time() - checkpoint_start
+        rank0_print(f"Checkpoint saved in {checkpoint_time:.2f} seconds")
+        
+        # Log to wandb if available and initialized
+        safe_wandb_log(self.args, {
+            "timing/checkpoint_save_seconds": checkpoint_time
+        }, step=self.state.global_step)
 
     def create_optimizer(self):
         """
@@ -432,6 +999,138 @@ class LLaVATrainer(Trainer):
 
         return self.optimizer
 
+    def _run_checkpoint_sanity_check(self) -> bool:
+        should_stop = False
+        if self.is_world_process_zero():
+            image_processor = None
+            if hasattr(self.model, "get_vision_tower") and self.model.get_vision_tower() is not None:
+                image_processor = self.model.get_vision_tower().image_processor
+
+            if image_processor is None:
+                rank0_print("Sanity check skipped: image processor not available.")
+            else:
+                image_path = pathlib.Path(__file__).resolve().parents[2] / "baseline_images" / "39740.png"
+                if not image_path.is_file():
+                    rank0_print(f"Sanity check skipped: image not found at {image_path}.")
+                else:
+                    prompt_text = "First analyze where each person is looking, then infer the social interaction between them."
+                    conv = conversation_lib.default_conversation.copy()
+                    conv.tokenizer = self.tokenizer
+                    if getattr(self.model.config, "mm_use_im_start_end", False):
+                        user_content = f"{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN}{DEFAULT_IM_END_TOKEN}\n{prompt_text}"
+                    else:
+                        user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt_text}"
+                    conv.append_message(conv.roles[0], user_content)
+                    conv.append_message(conv.roles[1], None)
+                    prompt = conv.get_prompt()
+
+                    image = Image.open(image_path).convert("RGB")
+                    image_sizes = [image.size]
+                    image_tensor = process_images([image], image_processor, self.model.config)
+                    if isinstance(image_tensor, tuple):
+                        image_tensor = image_tensor[0]
+                    if isinstance(image_tensor, list):
+                        image_tensor = image_tensor[0] if image_tensor else None
+
+                    if image_tensor is None:
+                        rank0_print("Sanity check skipped: failed to process image.")
+                    else:
+                        if isinstance(image_tensor, torch.Tensor) and image_tensor.ndim == 3:
+                            image_tensor = image_tensor.unsqueeze(0)
+
+                        param = next(self.model.parameters())
+                        device = param.device
+                        image_tensor = image_tensor.to(device=device, dtype=param.dtype)
+                        input_ids = tokenizer_image_token(
+                            prompt,
+                            self.tokenizer,
+                            IMAGE_TOKEN_INDEX,
+                            return_tensors="pt",
+                        ).unsqueeze(0).to(device)
+
+                        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+                        stopping_criteria = KeywordsStoppingCriteria([stop_str], self.tokenizer, input_ids)
+
+                        was_training = self.model.training
+                        self.model.eval()
+                        with torch.inference_mode():
+                            output_ids = self.model.generate(
+                                inputs=input_ids,
+                                images=image_tensor,
+                                image_sizes=image_sizes,
+                                do_sample=False,
+                                max_new_tokens=256,
+                                use_cache=True
+                            )
+                        if was_training:
+                            self.model.train()
+
+                        output_text = self.tokenizer.decode(
+                            output_ids[0, :],
+                            skip_special_tokens=True,
+                        ).strip()
+                        output_token_count = len(self.tokenizer.encode(output_text, add_special_tokens=False))
+                        passed_min_tokens = output_token_count >= 50
+                        checkpoint_name = f"checkpoint-{self.state.global_step}"
+                        
+                        rank0_print(f"Sanity check for step {self.state.global_step} resulted text: {output_text}")
+                        rank0_print(f"Sanity check output token count: {output_token_count} tokens")
+
+                        safe_wandb_log(self.args, {
+                            "sanity/checkpoint_prompt": prompt_text,
+                            "sanity/checkpoint_output": output_text,
+                            "sanity/checkpoint_output_tokens": output_token_count,
+                        }, step=self.state.global_step)
+
+                        if wandb.run is not None:
+                            if self._sanity_table is None:
+                                rank0_print("Initializing sanity check wandb table.")
+                                self._sanity_table = wandb.Table(columns=[
+                                    "step",
+                                    "checkpoint",
+                                    "prompt",
+                                    "output",
+                                    "output_tokens",
+                                    "passed_min_tokens",
+                                ], log_mode="MUTABLE")
+                            rank0_print(f"Adding sanity check entry to wandb table for step {self.state.global_step}.")
+                            self._sanity_table.add_data(
+                                int(self.state.global_step),
+                                checkpoint_name,
+                                prompt_text,
+                                output_text,
+                                int(output_token_count),
+                                bool(passed_min_tokens),
+                            )
+                            safe_wandb_log(self.args, {
+                                "sanity/checkpoint_table": self._sanity_table
+                            }, step=self.state.global_step)
+
+                        if not passed_min_tokens:
+                            self._sanity_consecutive_failures += 1
+                            rank0_print(
+                                "Sanity check failed: output had "
+                                f"{output_token_count} tokens (<50). "
+                                "Consecutive failures: "
+                                f"{self._sanity_consecutive_failures}/{self._sanity_failure_limit}."
+                            )
+                            if self._sanity_consecutive_failures >= self._sanity_failure_limit:
+                                should_stop = True
+                        else:
+                            if self._sanity_consecutive_failures:
+                                rank0_print(
+                                    "Sanity check passed: resetting consecutive failure count "
+                                    f"(was {self._sanity_consecutive_failures})."
+                                )
+                            self._sanity_consecutive_failures = 0
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            stop_tensor = torch.tensor(int(should_stop), device=self.args.device)
+            torch.distributed.broadcast(stop_tensor, src=0)
+            should_stop = bool(stop_tensor.item())
+
+        return should_stop
+
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False) or (
             hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
@@ -449,18 +1148,79 @@ class LLaVATrainer(Trainer):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
             weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+            for key in list(non_lora_weight_to_save.keys()):
+                if key in weight_to_save:
+                    del non_lora_weight_to_save[key]
 
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
-                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(output_dir, "mm_projector.bin"))
+                if non_lora_weight_to_save:
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+
+            if getattr(self.args, "lora_enable", False):
+                from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+                checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+                run_dir = self._get_output_dir(trial=trial)
+                output_dir = os.path.join(run_dir, checkpoint_folder)
+
+                non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+                if non_lora_weight_to_save:
+                    os.makedirs(output_dir, exist_ok=True)
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
+                    projector_weights = {k: v for k, v in non_lora_weight_to_save.items() if "mm_projector" in k or "vision_resampler" in k}
+                    if projector_weights:
+                        torch.save(projector_weights, os.path.join(output_dir, "mm_projector.bin"))
+
+        if self._run_checkpoint_sanity_check():
+            rank0_print("Stopping training: sanity check output too short.")
+            self.control.should_training_stop = True
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+
+        target_model = model if model is not None else self.model
+        if target_model is None:
+            return
+
+        non_lora_path = os.path.join(resume_from_checkpoint, "non_lora_trainables.bin")
+        if os.path.isfile(non_lora_path):
+            state_dict = torch.load(non_lora_path, map_location="cpu")
+            if state_dict:
+                load_result = target_model.load_state_dict(state_dict, strict=False)
+                self._issue_warnings_after_load(load_result)
+
+    def _move_model_to_device(self, model: nn.Module, device: torch.device) -> None:
+        """
+        Move model to device, handling meta tensors properly.
+        """
+        try:
+            # Check if any parameters are meta tensors
+            has_meta_params = any(param.is_meta for param in model.parameters())
+            
+            if has_meta_params:
+                # Use to_empty() for meta tensors
+                model = model.to_empty(device=device)
+            else:
+                # Use standard to() for regular tensors
+                model = model.to(device)
+        except (RuntimeError, NotImplementedError) as e:
+            if "meta tensor" in str(e).lower():
+                # Fallback to to_empty() if meta tensor error occurs
+                model = model.to_empty(device=device)
+            else:
+                raise e
 
 
 class LLaVADPOTrainer(DPOTrainer):
@@ -497,10 +1257,17 @@ class LLaVADPOTrainer(DPOTrainer):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
             weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+            for key in list(non_lora_weight_to_save.keys()):
+                if key in weight_to_save:
+                    del non_lora_weight_to_save[key]
 
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
-                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+                if weight_to_save:
+                    torch.save(weight_to_save, os.path.join(output_dir, "mm_projector.bin"))
+                if non_lora_weight_to_save:
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
         else:
             # super(LLaVADPOTrainer, self)._save_checkpoint(model, trial, metrics)
             # print(type(model))
@@ -516,6 +1283,13 @@ class LLaVADPOTrainer(DPOTrainer):
                 from transformers.modeling_utils import unwrap_model
 
                 unwrapped_model = unwrap_model(model)
+                non_lora_weight_to_save = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+                if non_lora_weight_to_save:
+                    os.makedirs(output_dir, exist_ok=True)
+                    torch.save(non_lora_weight_to_save, os.path.join(output_dir, "non_lora_trainables.bin"))
+                    projector_weights = {k: v for k, v in non_lora_weight_to_save.items() if "mm_projector" in k or "vision_resampler" in k}
+                    if projector_weights:
+                        torch.save(projector_weights, os.path.join(output_dir, "mm_projector.bin"))
                 self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
             else:
                 super(LLaVADPOTrainer, self)._save_checkpoint(model, trial, metrics)
@@ -525,3 +1299,17 @@ class LLaVADPOTrainer(DPOTrainer):
             pass
         else:
             super(LLaVADPOTrainer, self)._save(output_dir, state_dict)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+
+        target_model = model if model is not None else self.model
+        if target_model is None:
+            return
+
+        non_lora_path = os.path.join(resume_from_checkpoint, "non_lora_trainables.bin")
+        if os.path.isfile(non_lora_path):
+            state_dict = torch.load(non_lora_path, map_location="cpu")
+            if state_dict:
+                load_result = target_model.load_state_dict(state_dict, strict=False)
+                self._issue_warnings_after_load(load_result)

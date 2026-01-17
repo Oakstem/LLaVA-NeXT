@@ -27,7 +27,7 @@ from torch.nn import CrossEntropyLoss
 # from .modeling_llama import LlamaModel, LlamaForCausalLM
 from transformers import LlamaModel, LlamaForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.generation.utils import GenerateOutput
+from transformers.generation.utils import GenerateOutput, GenerationMixin
 
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
@@ -139,7 +139,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
-        return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
+        try:
+            return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
+        except AttributeError:
+            return GenerationMixin.generate(self, position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)

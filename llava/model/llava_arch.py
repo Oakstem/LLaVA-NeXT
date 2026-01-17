@@ -337,6 +337,8 @@ class LlavaMetaForCausalLM(ABC):
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
 
+            # print(f"INFO: image_aspect_ratio: {image_aspect_ratio}")
+
             if mm_patch_merge_type == "flat":
                 image_features = [x.flatten(0, 1) for x in image_features]
 
@@ -480,6 +482,8 @@ class LlavaMetaForCausalLM(ABC):
             labels = torch.full_like(input_ids, IGNORE_INDEX)
             # insert the image token labels
             labels = torch.where(input_ids == IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, labels)
+            # insert the image token labels
+            labels = torch.where(input_ids == IMAGE_TOKEN_INDEX, IMAGE_TOKEN_INDEX, labels)
 
         # remove the padding using attention_mask -- FIXME
         _input_ids = input_ids
@@ -522,12 +526,14 @@ class LlavaMetaForCausalLM(ABC):
                     try:
                         cur_image_features = image_features[cur_image_idx]
                         label_type = IMAGE_TOKEN_INDEX
+                        label_type = IMAGE_TOKEN_INDEX
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
                         label_type = IGNORE_INDEX
                     cur_image_features = _apply_image_token_filter(cur_image_features, normalized_filter_indices)
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
+                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), label_type, device=cur_labels.device, dtype=cur_labels.dtype))
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), label_type, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
@@ -543,8 +549,27 @@ class LlavaMetaForCausalLM(ABC):
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Finishing Inserting")
 
+        original_seq_lengths = [x.shape[0] for x in new_input_embeds]
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
+        truncated_seq_lengths = [x.shape[0] for x in new_input_embeds]
+
+        target_token_lengths = []
+        for labels_tensor in new_labels:
+            if labels_tensor.numel() == 0:
+                target_token_lengths.append(0)
+            else:
+                target_token_lengths.append(int((labels_tensor != IGNORE_INDEX).sum().item()))
+
+        truncation_flags = [new_len < old_len for new_len, old_len in zip(truncated_seq_lengths, original_seq_lengths)]
+
+        stats_device = new_input_embeds[0].device if truncated_seq_lengths else self.device
+        self._sequence_length_stats = {
+            "total_tokens": torch.tensor(truncated_seq_lengths, device=stats_device, dtype=torch.long),
+            "target_tokens": torch.tensor(target_token_lengths, device=stats_device, dtype=torch.long),
+            "hit_max_length": torch.tensor(truncation_flags, device=stats_device, dtype=torch.bool),
+            "max_length": tokenizer_model_max_length if tokenizer_model_max_length is not None else 0,
+        }
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
         #     new_input_embeds = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
@@ -638,6 +663,11 @@ class LlavaMetaForCausalLM(ABC):
         # rank0_print("Finish preparing")
         user_prompt_features = cur_input_embeds_no_im[-1]
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, image_features, user_prompt_features, tokens_indexing
+
+    def pop_sequence_length_stats(self):
+        stats = getattr(self, "_sequence_length_stats", None)
+        self._sequence_length_stats = None
+        return stats
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

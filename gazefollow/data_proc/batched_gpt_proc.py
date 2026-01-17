@@ -111,13 +111,13 @@ def merge_results(input_json, results_jsonl, merged_out):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("input_json", help="model_generation_results.json")
-    ap.add_argument("--workdir", default="batch_out", help="where to write files")
+    ap.add_argument("--workdir", default="batch_out/test2_baseline", help="where to write files")
     args = ap.parse_args()
 
     Path(args.workdir).mkdir(parents=True, exist_ok=True)
-    batch_in = str(Path(args.workdir) / "requests_baseline_test2.jsonl")
-    batch_out = str(Path(args.workdir) / "requests_baseline_test2_out.jsonl")
-    merged = str(Path(args.workdir) / "gpt_gaze_llava_baseline_extracted_test2.json")
+    batch_in = str(Path(args.workdir) / "requests.jsonl")
+    batch_out = str(Path(args.workdir) / "results.jsonl")
+    merged = str(Path(args.workdir) / "gpt_gaze_extracted.json")
 
     build_batch_jsonl(args.input_json, batch_in)
     batch_id = submit_batch(batch_in, endpoint="/v1/chat/completions")

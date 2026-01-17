@@ -3,7 +3,8 @@
 #SBATCH --output=logs/vanilla_inference_%j.out
 #SBATCH --error=logs/vanilla_inference_%j.err
 #SBATCH --time=00:10:00
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu-tad-pool
+#SBATCH --qos=owner
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=10G
@@ -13,53 +14,103 @@
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
 # ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20250922_124635/checkpoint-12000}"
-ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/evaluated/llava-20250926_144813/checkpoint-10000}"
+# ADAPTER_PATH="${ADAPTER_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-20251007_011312/checkpoint-10000}"
+ADAPTER_PATH="${ADAPTER_PATH:--1}"        # set to -1 for baseline (no adapter)
+# training_outputs/llava-20251207_192205/checkpoint-8000        # quite elaborate in our long prompt but wrong
+# training_outputs/llava-20251207_192147/checkpoint-8000
+# Prompt for adapter path if not set
+if [ -z "$ADAPTER_PATH" ]; then
+    echo "=========================================="
+    echo "Available recent checkpoints:"
+    
+    # Store checkpoints in an array
+    mapfile -t checkpoints < <(ls -dt /galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs/llava-*/checkpoint-* 2>/dev/null | head -10)
+    
+    if [ ${#checkpoints[@]} -eq 0 ]; then
+        echo "No checkpoints found."
+        ADAPTER_PATH=""
+    else
+        for i in "${!checkpoints[@]}"; do
+            echo "  [$i] ${checkpoints[$i]}"
+        done
+        
+        echo "  [-1] No adapter (base model only)"
+        echo "=========================================="
+        echo "Default: [0] ${checkpoints[0]}"
+        read -p "Enter checkpoint number, -1 for no adapter, full path, or press Enter for default: " user_input
+        
+        if [ -z "$user_input" ]; then
+            # User pressed Enter, use the most recent checkpoint
+            ADAPTER_PATH="${checkpoints[0]}"
+            echo "Selected: $ADAPTER_PATH"
+        elif [ "$user_input" = "-1" ]; then
+            # User explicitly chose no adapter
+            ADAPTER_PATH=""
+            echo "Selected: No adapter (base model only)"
+        elif [[ "$user_input" =~ ^[0-9]+$ ]] && [ "$user_input" -lt "${#checkpoints[@]}" ]; then
+            # User entered a valid number
+            ADAPTER_PATH="${checkpoints[$user_input]}"
+            echo "Selected: $ADAPTER_PATH"
+        else
+            # User entered a full path
+            ADAPTER_PATH="$user_input"
+        fi
+    fi
+fi
+
+if [ "$ADAPTER_PATH" = "-1" ]; then
+    ADAPTER_PATH=""
+fi
+
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 
 # Inference parameters
 IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/projects/LLaVA-NeXT/baseline_images/39740.png}"
-# if [ -z "$PROMPT" ]; then
-#     read -r -d '' PROMPT <<'EOF'
-# You are an expert vision assistant.
-# Step 1 - Caption
-# • Provide one concise sentence that broadly describes the entire scene.
-# • Begin the line with: Caption:
-# Step 2 - Foreground people & gaze
-# 1. Detect every person whose height is at least 5% of the image (foreground).
-# 2. List them from left to right and number sequentially starting at 1.
-# For each person output exactly one line in this format:
-# Person {N}: {short description}, looking at {target | outside the frame | uncertain}
-# 3. If there are more then 1 person, describe their social interactions.
-# Output format (no extra lines, no prose other than what is specified):
-# -------------------------------------------------
-# Caption: {your one-sentence scene description}
-# Person 1: {short description}, looking at ...
-# Person 2: {short description}, looking at ...
-# ...
-# Social interactions: {describe any social interactions briefly}
-# -------------------------------------------------
-# Additional rules
-# • Keep the phrase "looking at" unchanged.
-# • {short description} must be 6 words or fewer (e.g., "man in red jacket").
-# • If no foreground person is detected, write exactly: No foreground people detected.
-# • If gaze cannot be determined, use "uncertain".
-# • Do not output your reasoning or any extra text.
-# EOF
-# fi
+if [ -z "$PROMPT" ]; then
+    read -r -d '' PROMPT <<'EOF'
+You are an expert vision assistant.
+Step 1 - Caption
+• Provide one concise sentence that broadly describes the entire scene.
+• Begin the line with: Caption:
+Step 2 - Foreground people & gaze
+1. Detect every person in the image.
+2. List them from left to right and number sequentially starting at 1.
+For each person output exactly one line in this format:
+Person {N}: {short description}, looking at {target | outside the frame | uncertain}
+3. If there are more then 1 person, describe their social interactions.
+Output format (no extra lines, no prose other than what is specified):
+-------------------------------------------------
+Caption: {your one-sentence scene description}
+Person 1: {short description}, looking at ...
+Person 2: {short description}, looking at ...
+...
+Social interactions: {describe any social interactions briefly}
+-------------------------------------------------
+Additional rules
+• Keep the phrase "looking at" unchanged.
+• {short description} must be 6 words or fewer (e.g., "man in red jacket").
+• If no foreground person is detected, write exactly: No foreground people detected.
+• If gaze cannot be determined, use "uncertain".
+• Do not output your reasoning or any extra text.
+EOF
+fi
 # PROMPT="${PROMPT:-Describe the scene and then where every person in the image is looking.}"
-PROMPT="${PROMPT:-Describe where every person in the image is looking.}"
+# PROMPT="${PROMPT:-Describe where every person in the image is looking.}"
+# PROMPT="${PROMPT:-Complete the sentence: the woman is looking at ...}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
-TEMPERATURE="${TEMPERATURE:-0.9}"
-TOP_P="${TOP_P:-0.8}"
+TEMPERATURE="${TEMPERATURE:-1.1}"
+TOP_P="${TOP_P:-0.9}"
 NUM_BEAMS="${NUM_BEAMS:-1}"
-DO_SAMPLE="${DO_SAMPLE:-true}"
+DO_SAMPLE="${DO_SAMPLE:-false}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
-SAVE_OUTPUT="${SAVE_OUTPUT:-}"
+SAVE_OUTPUT="${SAVE_OUTPUT:-true}"
 CHAT_MODE="${CHAT_MODE:-true}"
 NO_STREAM="${NO_STREAM:-false}"
-
+DETECT_GAZE_BBOXES="${DETECT_GAZE_BBOXES:-false}"
+IMAGE_ASPECT_RATIO_FALLBACK="${IMAGE_ASPECT_RATIO_FALLBACK:-anyres_max_4}"
+IMAGE_GRID_PINPOINTS_FALLBACK="${IMAGE_GRID_PINPOINTS_FALLBACK:-(1x1),...,(2x2)}"  # "(1x1),...,(6x6)"
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
@@ -86,6 +137,9 @@ echo "Num Beams: $NUM_BEAMS"
 echo "Do Sample: $DO_SAMPLE"
 echo "Chat Mode: $CHAT_MODE"
 echo "Save Output: $SAVE_OUTPUT"
+echo "Detect Gaze Bboxes: $DETECT_GAZE_BBOXES"
+echo "Fallback Image Aspect Ratio: $IMAGE_ASPECT_RATIO_FALLBACK"
+echo "Fallback Image Grid Pinpoints: $IMAGE_GRID_PINPOINTS_FALLBACK"
 echo "=========================================="
 
 # Load any required modules (uncomment and modify as needed)
@@ -120,6 +174,8 @@ ARGS=(
     "--model-path" "$MODEL_PATH"
     "--attn-implementation" "$ATTN_IMPLEMENTATION"
     "--image-path" "$IMAGE_PATH"
+    "--image-aspect-ratio" "$IMAGE_ASPECT_RATIO_FALLBACK"
+    "--image-grid-pinpoints" "$IMAGE_GRID_PINPOINTS_FALLBACK"
     "--prompt" "$PROMPT"
     "--max-new-tokens" "$MAX_NEW_TOKENS"
     "--temperature" "$TEMPERATURE"
@@ -172,6 +228,10 @@ if [ -n "$SAVE_OUTPUT" ]; then
     ARGS+=("--save-output" "$SAVE_OUTPUT")
 fi
 
+# Add gaze detection option
+if [ "$DETECT_GAZE_BBOXES" = "true" ]; then
+    ARGS+=("--run-gdino")
+fi
 # Print the command that will be executed
 echo "Executing command:"
 echo "python generate_vanilla_inference.py ${ARGS[*]}"
