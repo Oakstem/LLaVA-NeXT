@@ -23,18 +23,18 @@ GPT_EXTRACTION_SCHEMA = {
                         "properties": {
                             "person_id": {"type": "integer"},
                             "description": {"type": "string"},
-                            "gaze_target": {"type": ["string", "null"]},
+                            "attention_focus": {"type": ["string", "null"]},
                         },
-                        "required": ["person_id", "description", "gaze_target"],
+                        "required": ["person_id", "description", "attention_focus"],
                         "additionalProperties": False
                     }
                 },
-                "inferred_gaze_interaction": {
-                    "type": "string",
-                    "enum": ["non-communicative gaze", "mutual gaze", "joint attention toward a shared object"]
+                "social_interaction_label": {
+                    "type": ["string", "null"],
+                    "enum": ["Mutual", "Single", "Joint attention", "Non-communicative", null]
                 }
             },
-            "required": ["persons", "inferred_gaze_interaction"],
+            "required": ["persons", "social_interaction_label"],
             "additionalProperties": False
         },
         "strict": True
@@ -43,10 +43,15 @@ GPT_EXTRACTION_SCHEMA = {
 
 GPT_EXTRACTION_SYSTEM_PROMPT = """You are an expert at extracting structured gaze information from text descriptions.
 Given a description of people in an image and their gaze behavior, extract:
-1. For each person mentioned: their description and what they are looking at (gaze target)
-2. The overall gaze interaction type: "non-communicative gaze", "mutual gaze", or "joint attention toward a shared object"
 
-Reply with JSON only, following the schema exactly. Number persons in the order they appear in the description."""
+1. For each person mentioned:
+   - description: Their appearance/role description
+   - attention_focus: What they are explicitly described as looking at. Set to null if no explicit looking direction/target is mentioned for this person.
+   - person_id: Only include a numeric ID if the text explicitly identifies WHO this person is (e.g., "Person 1", "the first person") or provides clear distinguishing characteristics that could serve as an identifier. Do not include the person is not explicitly identified or distinguished.
+
+2. social_interaction_label: If an EXPLICIT social interaction label is provided in the text (e.g., "Social interaction label: Mutual gaze (A→B and B→A)"), normalize it to one of: "Mutual", "Single", "Joint attention", "Non-communicative". Set to null if no explicit label is provided in the text.
+
+Reply with JSON only, following the schema exactly."""
 
 
 def extract_gaze_info_with_gpt(
