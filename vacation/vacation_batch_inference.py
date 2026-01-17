@@ -423,10 +423,6 @@ def main():
         ~selected_frames.apply(lambda r: (r["video_id"], r["frame_id"]) in processed_keys, axis=1)
     ]
     
-    if args.limit:
-        print(f"Limiting to {args.limit} frames...")
-        selected_frames = selected_frames.head(args.limit)
-    
     # Randomize queue if requested
     if args.randomize:
         if args.seed is not None:
@@ -435,6 +431,11 @@ def main():
         else:
             print("Randomizing queue (no seed, non-reproducible)...")
         selected_frames = selected_frames.sample(frac=1).reset_index(drop=True)
+    
+    # Apply limit if specified
+    if args.limit:
+        print(f"Limiting to {args.limit} frames...")
+        selected_frames = selected_frames.head(args.limit)
         
     print(f"Remaining frames to process: {len(selected_frames)}")
     
@@ -469,7 +470,10 @@ def main():
             "response": response,
             "annotations": get_frame_annotations(all_annotations, video_id, frame_id),
         }
-        
+        # Print response snippet
+        print(f"\nProcessed video_id={video_id}, frame_id={frame_id}")
+        print(f"Response: {response}")
+
         # Run GPT extraction if enabled
         if openai_client is not None:
             extracted = extract_gaze_info_with_gpt(openai_client, response, args.gpt_model)

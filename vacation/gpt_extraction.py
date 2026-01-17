@@ -31,7 +31,7 @@ GPT_EXTRACTION_SCHEMA = {
                 },
                 "social_interaction_label": {
                     "type": ["string", "null"],
-                    "enum": ["Mutual", "Single", "Joint attention", "Non-communicative", null]
+                    "enum": ["Mutual", "Single", "Joint attention", "Non-communicative", "null"]
                 }
             },
             "required": ["persons", "social_interaction_label"],
