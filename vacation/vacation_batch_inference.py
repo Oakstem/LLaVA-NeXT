@@ -16,7 +16,7 @@ import json
 import random
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -50,18 +50,30 @@ DEFAULT_ANNOTATIONS = "datasets/Vacation/test_annotations.csv"
 DEFAULT_FRAMES_DIR = "datasets/Vacation/frames"
 
 # DEFAULT_PROMPT = "For each person in the image, describe who they are, what they are looking at, and then classify the interaction as non-communicative gaze, mutual gaze, or joint attention toward a shared object."
-DEFAULT_PROMPT = """For each person in the image:
-Briefly describe who they are (role/appearance) and what they are looking at (another person, an object, or off e.g. “off-screen left”).
-Then choose exactly one social interaction label using the rules below in this priority order:
-Priority order (apply top to bottom):
-Mutual gaze: at least two people are looking at each other (A→B and B→A).
-If this is true, the label must be Mutual gaze, even if you think they share attention.
-Single: one person looks at another (A→B) while the other looks elsewhere (B→≠A).
-Joint attention: two or more people are looking at the same external target (same object/location), and that target is not any person.
-Non-communicative gaze: none of the above apply; no clear gaze-based interaction.
-Important constraint:
-Joint attention never applies when the shared target is a person. If people are looking at each other, that is Mutual gaze, not Joint attention."""
+# DEFAULT_PROMPT = """For each person in the image:
+# Briefly describe who they are (role/appearance) and what they are looking at (another person, an object, or off e.g. “off-screen left”).
+# Then choose exactly one social interaction label using the rules below in this priority order:
+# Priority order (apply top to bottom):
+# Mutual gaze: at least two people are looking at each other (A→B and B→A).
+# If this is true, the label must be Mutual gaze, even if you think they share attention.
+# Single: one person looks at another (A→B) while the other looks elsewhere (B→≠A).
+# Joint attention: two or more people are looking at the same external target (same object/location), and that target is not any person.
+# Non-communicative gaze: none of the above apply; no clear gaze-based interaction.
+# Important constraint:
+# Joint attention never applies when the shared target is a person. If people are looking at each other, that is Mutual gaze, not Joint attention."""
 
+DEFAULT_PROMPT = """Describe each person briefly and say what they are looking at (person, object, or off-screen).
+
+Then choose exactly one social interaction label:
+MutualGaze: at least two people are looking at each other (A looks at B and B looks at A).
+SharedObjectAttention: at least two people are looking at the same external object or place (not a person), including one person following another person's reference to that external target.
+OneSidedGaze: one person looks at another person but the other looks away or elsewhere (not reciprocated).
+NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze.
+
+Rules:
+Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
+SharedObjectAttention never applies when the shared target is a person.
+Return the label explicitly on its own line as: Social interaction label: <Label>."""
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -259,7 +271,7 @@ def select_frames_with_skipping(df: pd.DataFrame, skip_step: int) -> pd.DataFram
 
 
 def get_frame_annotations(df: pd.DataFrame, video_id: int, frame_id: int) -> List[dict]:
-    """Get bbox, bbx_label, attention_focus for all persons in a frame."""
+    """Get bbox, bbx_label, attention_focus, atomic_attribute for all persons in a frame."""
     frame_rows = df[(df["video_id"] == video_id) & (df["frame_id"] == frame_id)]
     
     annotations = []
@@ -269,9 +281,39 @@ def get_frame_annotations(df: pd.DataFrame, video_id: int, frame_id: int) -> Lis
             "bbox": [int(row["xmin"]), int(row["ymin"]), int(row["xmax"]), int(row["ymax"])],
             "bbx_label": row["bbx_label"],
             "attention_focus": row["attention_focus"],
+            "atomic_attribute": row["atomic_attribute"],
         })
     
     return annotations
+
+
+def classify_atomic_attribute_combo(atomic_attributes: List[str]) -> Optional[str]:
+    if not atomic_attributes:
+        return None
+    attrs = [str(a).strip().lower() for a in atomic_attributes if str(a).strip()]
+    if not attrs:
+        return None
+    if all(a == "single" for a in attrs):
+        return "NonCommmunicative"
+
+    rules = [
+        (("follow", "single"), "OneSidedGaze"),
+        (("share", "share"), "SharedObjectAttention"),
+        (("single", "avert"), "OneSidedGaze"),
+        (("single", "refer"), "OneSidedGaze"),
+        (("mutual", "mutual"), "MutualGaze"),
+        (("avert", "avert"), "NonCommmunicative"),
+        (("follow", "refer"), "SharedObjectAttention"),
+    ]
+
+    for (a, b), label in rules:
+        if a == b:
+            if sum(1 for v in attrs if v == a) >= 2:
+                return label
+        else:
+            if a in attrs and b in attrs:
+                return label
+    return None
 
 
 def run_inference_on_frame(
@@ -335,13 +377,108 @@ def run_inference_on_frame(
     return response
 
 
-def save_checkpoint(output_path: Path, config: dict, results: list):
+def _normalize_social_label(label: str | None) -> str | None:
+    if label is None:
+        return None
+    if not isinstance(label, str):
+        label = str(label)
+    cleaned = label.strip().lower()
+    if cleaned in {"", "null", "none"}:
+        return None
+    cleaned = cleaned.replace("-", " ").replace("_", " ")
+    cleaned = " ".join(cleaned.split())
+    if cleaned in {"mutualgaze", "mutual gaze", "mutual"}:
+        return "MutualGaze"
+    if cleaned in {"sharedobjectattention", "shared object attention", "shared attention", "joint attention", "joint att", "jointatt"}:
+        return "SharedObjectAttention"
+    if cleaned in {"onesidedgaze", "one sided gaze", "one sided", "single", "single gaze"}:
+        return "OneSidedGaze"
+    if cleaned in {"noncommmunicative", "noncommunicative", "non communicative", "non communicative gaze", "unclear"}:
+        return "NonCommmunicative"
+    return None
+
+
+def _normalize_event_attribute(event_attribute: str | None) -> str | None:
+    if event_attribute is None:
+        return None
+    cleaned = str(event_attribute).strip().lower()
+    if not cleaned:
+        return None
+    if cleaned == "mutualgaze":
+        return "mutual"
+    if cleaned == "singlegaze":
+        return "single"
+    if cleaned == "jointatt":
+        return "shared_object_attention"
+    if cleaned == "avertgaze":
+        return "single"
+    if cleaned == "gazefollow":
+        return "single"
+    return None
+
+
+def compute_extraction_metrics(results: list) -> dict:
+    total_results = len(results)
+    extracted_entries = [
+        r for r in results if isinstance(r.get("extracted_gaze_info"), dict)
+    ]
+    total_extractions = len(extracted_entries)
+    valid_labels = 0
+    null_labels = 0
+
+    for entry in extracted_entries:
+        label = entry["extracted_gaze_info"].get("social_interaction_label")
+        if _normalize_social_label(label) is None:
+            null_labels += 1
+        else:
+            valid_labels += 1
+
+    valid_percent = (valid_labels / total_extractions) if total_extractions else 0.0
+
+    evaluated = 0
+    correct = 0
+    skipped_missing_gt = 0
+    skipped_missing_pred = 0
+    for entry in extracted_entries:
+        pred_norm = _normalize_social_label(
+            entry["extracted_gaze_info"].get("social_interaction_label")
+        )
+        gt_norm = _normalize_social_label(entry.get("atomic_attribute_combo"))
+        if pred_norm is None:
+            skipped_missing_pred += 1
+            continue
+        if gt_norm is None:
+            skipped_missing_gt += 1
+            continue
+        evaluated += 1
+        if pred_norm == gt_norm:
+            correct += 1
+
+    accuracy = (correct / evaluated) if evaluated else 0.0
+
+    return {
+        "total_results": total_results,
+        "total_extractions": total_extractions,
+        "valid_social_interaction_labels": valid_labels,
+        "null_social_interaction_labels": null_labels,
+        "valid_social_interaction_label_percent": valid_percent,
+        "accuracy_vs_atomic_attribute_combo": accuracy,
+        "accuracy_evaluated_frames": evaluated,
+        "accuracy_correct_nb": correct,
+        "accuracy_skipped_missing_gt": skipped_missing_gt,
+        "accuracy_skipped_missing_pred": skipped_missing_pred,
+    }
+
+
+def save_checkpoint(output_path: Path, config: dict, results: list, metrics: Optional[dict]):
     """Save current results to JSON."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "config": config,
         "results": results,
     }
+    if metrics is not None:
+        payload["metrics"] = metrics
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -441,9 +578,23 @@ def main():
     
     if len(selected_frames) == 0:
         print("All frames already processed!")
+        if results:
+            metrics = None
+            if any(isinstance(r.get("extracted_gaze_info"), dict) for r in results):
+                metrics = compute_extraction_metrics(results)
+            save_checkpoint(output_path, config, results, metrics)
+            if metrics is not None:
+                print(
+                    "Metrics: valid_social_interaction_label_percent="
+                    f"{metrics['valid_social_interaction_label_percent']:.4f}, "
+                    "accuracy_vs_atomic_attribute_combo="
+                    f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
+                    f"(evaluated={metrics['accuracy_evaluated_frames']})"
+                )
         return
     
     # Process frames
+    print(f"Using prompt:\n{args.prompt}\n")
     print("Starting inference...")
     for idx, (_, row) in enumerate(tqdm(selected_frames.iterrows(), total=len(selected_frames))):
         video_id = int(row["video_id"])
@@ -462,13 +613,23 @@ def main():
         )
         
         # Build result entry
+        annotations = get_frame_annotations(all_annotations, video_id, frame_id)
+        atomic_attributes = [
+            ann.get("atomic_attribute")
+            for ann in annotations
+            if ann.get("atomic_attribute") not in (None, "")
+        ]
+        atomic_attribute_combo = classify_atomic_attribute_combo(atomic_attributes)
+
         result_entry = {
             "video_id": video_id,
             "frame_id": frame_id,
             "event_attribute": event_attribute,
             "image_path": str(frame_path),
             "response": response,
-            "annotations": get_frame_annotations(all_annotations, video_id, frame_id),
+            "annotations": annotations,
+            "atomic_attributes": atomic_attributes,
+            "atomic_attribute_combo": atomic_attribute_combo,
         }
         # Print response snippet
         print(f"\nProcessed video_id={video_id}, frame_id={frame_id}")
@@ -484,11 +645,25 @@ def main():
         # Checkpoint
         if (idx + 1) % args.checkpoint_interval == 0:
             print(f"\nSaving checkpoint at {idx + 1} frames...")
-            save_checkpoint(output_path, config, results)
+            metrics = None
+            if any(isinstance(r.get("extracted_gaze_info"), dict) for r in results):
+                metrics = compute_extraction_metrics(results)
+            save_checkpoint(output_path, config, results, metrics)
     
     # Final save
     print(f"\nSaving final results to {output_path}...")
-    save_checkpoint(output_path, config, results)
+    metrics = None
+    if any(isinstance(r.get("extracted_gaze_info"), dict) for r in results):
+        metrics = compute_extraction_metrics(results)
+    save_checkpoint(output_path, config, results, metrics)
+    if metrics is not None:
+        print(
+            "Metrics: valid_social_interaction_label_percent="
+            f"{metrics['valid_social_interaction_label_percent']:.4f}, "
+            "accuracy_vs_atomic_attribute_combo="
+            f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
+            f"(evaluated={metrics['accuracy_evaluated_frames']})"
+        )
     print(f"Done! Processed {len(results)} frames total.")
 
 

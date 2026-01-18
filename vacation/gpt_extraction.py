@@ -31,7 +31,7 @@ GPT_EXTRACTION_SCHEMA = {
                 },
                 "social_interaction_label": {
                     "type": ["string", "null"],
-                    "enum": ["Mutual", "Single", "Joint attention", "Non-communicative", "null"]
+                    "enum": ["MutualGaze", "OneSidedGaze", "SharedObjectAttention", "NonCommmunicative", "null"]
                 }
             },
             "required": ["persons", "social_interaction_label"],
@@ -49,7 +49,7 @@ Given a description of people in an image and their gaze behavior, extract:
    - attention_focus: What they are explicitly described as looking at. Set to null if no explicit looking direction/target is mentioned for this person.
    - person_id: Only include a numeric ID if the text explicitly identifies WHO this person is (e.g., "Person 1", "the first person") or provides clear distinguishing characteristics that could serve as an identifier. Do not include the person is not explicitly identified or distinguished.
 
-2. social_interaction_label: If an EXPLICIT social interaction label is provided in the text (e.g., "Social interaction label: Mutual gaze (A→B and B→A)"), normalize it to one of: "Mutual", "Single", "Joint attention", "Non-communicative". Set to null if no explicit label is provided in the text.
+2. social_interaction_label: If an EXPLICIT social interaction label is provided in the text (e.g., "Social interaction label: MutualGaze"), normalize it to one of: "MutualGaze", "OneSidedGaze", "SharedObjectAttention", "NonCommmunicative". Set to null if no explicit label is provided in the text.
 
 Reply with JSON only, following the schema exactly."""
 
