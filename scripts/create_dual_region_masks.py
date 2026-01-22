@@ -1,3 +1,4 @@
+import sys
 import argparse
 import json
 from datetime import datetime
@@ -8,7 +9,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import RectangleSelector
 import platform
-
+# Add project root to sys.path
+try:
+    project_root = Path(__file__).resolve().parent.parent
+except NameError:
+    project_root = Path.cwd().parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 from gazefollow.generation_utils import fix_wsl_paths, load_image
 
 DEFAULT_IMAGE_PATH = r"D:\Projects\data\gazefollow\train\00000093\00093143.jpg"
