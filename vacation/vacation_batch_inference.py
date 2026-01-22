@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
+import numpy as np
 import torch
 from tqdm import tqdm
 from datetime import datetime
@@ -43,6 +44,7 @@ from llava.conversation import conv_templates
 from llava.mm_utils import tokenizer_image_token
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from vacation.gpt_extraction import extract_gaze_info_with_gpt
+from vacation.extraction_metrics_utils import compute_extraction_metrics
 from openai import OpenAI
 
 
@@ -72,8 +74,7 @@ NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when p
 
 Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
-SharedObjectAttention never applies when the shared target is a person.
-Return the label explicitly on its own line as: Social interaction label: <Label>."""
+If only one person is described as looking at another, it is NonCommmunicative."""
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -377,27 +378,6 @@ def run_inference_on_frame(
     return response
 
 
-def _normalize_social_label(label: str | None) -> str | None:
-    if label is None:
-        return None
-    if not isinstance(label, str):
-        label = str(label)
-    cleaned = label.strip().lower()
-    if cleaned in {"", "null", "none"}:
-        return None
-    cleaned = cleaned.replace("-", " ").replace("_", " ")
-    cleaned = " ".join(cleaned.split())
-    if cleaned in {"mutualgaze", "mutual gaze", "mutual"}:
-        return "MutualGaze"
-    if cleaned in {"sharedobjectattention", "shared object attention", "shared attention", "joint attention", "joint att", "jointatt"}:
-        return "SharedObjectAttention"
-    if cleaned in {"onesidedgaze", "one sided gaze", "one sided", "single", "single gaze"}:
-        return "OneSidedGaze"
-    if cleaned in {"noncommmunicative", "noncommunicative", "non communicative", "non communicative gaze", "unclear"}:
-        return "NonCommmunicative"
-    return None
-
-
 def _normalize_event_attribute(event_attribute: str | None) -> str | None:
     if event_attribute is None:
         return None
@@ -415,59 +395,6 @@ def _normalize_event_attribute(event_attribute: str | None) -> str | None:
     if cleaned == "gazefollow":
         return "single"
     return None
-
-
-def compute_extraction_metrics(results: list) -> dict:
-    total_results = len(results)
-    extracted_entries = [
-        r for r in results if isinstance(r.get("extracted_gaze_info"), dict)
-    ]
-    total_extractions = len(extracted_entries)
-    valid_labels = 0
-    null_labels = 0
-
-    for entry in extracted_entries:
-        label = entry["extracted_gaze_info"].get("social_interaction_label")
-        if _normalize_social_label(label) is None:
-            null_labels += 1
-        else:
-            valid_labels += 1
-
-    valid_percent = (valid_labels / total_extractions) if total_extractions else 0.0
-
-    evaluated = 0
-    correct = 0
-    skipped_missing_gt = 0
-    skipped_missing_pred = 0
-    for entry in extracted_entries:
-        pred_norm = _normalize_social_label(
-            entry["extracted_gaze_info"].get("social_interaction_label")
-        )
-        gt_norm = _normalize_social_label(entry.get("atomic_attribute_combo"))
-        if pred_norm is None:
-            skipped_missing_pred += 1
-            continue
-        if gt_norm is None:
-            skipped_missing_gt += 1
-            continue
-        evaluated += 1
-        if pred_norm == gt_norm:
-            correct += 1
-
-    accuracy = (correct / evaluated) if evaluated else 0.0
-
-    return {
-        "total_results": total_results,
-        "total_extractions": total_extractions,
-        "valid_social_interaction_labels": valid_labels,
-        "null_social_interaction_labels": null_labels,
-        "valid_social_interaction_label_percent": valid_percent,
-        "accuracy_vs_atomic_attribute_combo": accuracy,
-        "accuracy_evaluated_frames": evaluated,
-        "accuracy_correct_nb": correct,
-        "accuracy_skipped_missing_gt": skipped_missing_gt,
-        "accuracy_skipped_missing_pred": skipped_missing_pred,
-    }
 
 
 def save_checkpoint(output_path: Path, config: dict, results: list, metrics: Optional[dict]):
@@ -564,10 +491,15 @@ def main():
     if args.randomize:
         if args.seed is not None:
             random.seed(args.seed)
+            np.random.seed(args.seed)
+            torch.manual_seed(args.seed)
             print(f"Randomizing queue with seed={args.seed}...")
         else:
             print("Randomizing queue (no seed, non-reproducible)...")
-        selected_frames = selected_frames.sample(frac=1).reset_index(drop=True)
+        selected_frames = selected_frames.sample(
+            frac=1,
+            random_state=args.seed,
+        ).reset_index(drop=True)
     
     # Apply limit if specified
     if args.limit:
@@ -624,12 +556,11 @@ def main():
         result_entry = {
             "video_id": video_id,
             "frame_id": frame_id,
-            "event_attribute": event_attribute,
             "image_path": str(frame_path),
+            "atomic_attribute_combo_GT": atomic_attribute_combo,
             "response": response,
             "annotations": annotations,
             "atomic_attributes": atomic_attributes,
-            "atomic_attribute_combo": atomic_attribute_combo,
         }
         # Print response snippet
         print(f"\nProcessed video_id={video_id}, frame_id={frame_id}")

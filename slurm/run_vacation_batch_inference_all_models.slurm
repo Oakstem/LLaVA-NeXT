@@ -1,0 +1,95 @@
+#!/bin/bash
+#SBATCH --job-name=vacation_batch_all
+#SBATCH --output=logs/vacation_batch_all_%A_%a.out
+#SBATCH --error=logs/vacation_batch_all_%A_%a.err
+#SBATCH --time=02:00:00
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=20G
+#SBATCH --nodes=1
+#SBATCH --array=0-6
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/galitylab/students/alonmardi/projects/LLaVA-NeXT}"
+TRAINING_OUTPUTS_ROOT="${TRAINING_OUTPUTS_ROOT:-$REPO_ROOT/training_outputs}"
+RUN_NAME_PATTERN="${RUN_NAME_PATTERN:-llava-20260122*}"
+CHECKPOINT_STEP="${CHECKPOINT_STEP:-5000}"
+JOB_SCRIPT="${JOB_SCRIPT:-$REPO_ROOT/slurm/run_vacation_batch_inference.slurm}"
+
+RUN_TAG="${RUN_TAG:-${SLURM_ARRAY_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/vacation_results/vacation_batch_ckpt-${CHECKPOINT_STEP}_${RUN_TAG}}"
+RUN_LIST_FILE="${RUN_LIST_FILE:-$OUTPUT_DIR/checkpoint_paths.txt}"
+
+mkdir -p logs "$OUTPUT_DIR"
+
+collect_checkpoints() {
+    local run
+    local tmp_file
+    tmp_file="$(mktemp "${RUN_LIST_FILE}.tmp.XXXXXX")"
+    mapfile -t runs < <(
+        find "$TRAINING_OUTPUTS_ROOT" -maxdepth 1 -mindepth 1 -type d -name "$RUN_NAME_PATTERN" -printf '%f\n' | sort
+    )
+    for run in "${runs[@]}"; do
+        local ckpt_path="$TRAINING_OUTPUTS_ROOT/$run/checkpoint-$CHECKPOINT_STEP"
+        if [ -d "$ckpt_path" ]; then
+            echo "$ckpt_path" >> "$tmp_file"
+        fi
+    done
+    sort -u "$tmp_file" > "$RUN_LIST_FILE"
+    rm -f "$tmp_file"
+}
+
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    collect_checkpoints
+    task_count=$(wc -l < "$RUN_LIST_FILE" | tr -d ' ')
+    if [ "$task_count" -eq 0 ]; then
+        echo "No checkpoints found for checkpoint-$CHECKPOINT_STEP under $TRAINING_OUTPUTS_ROOT" >&2
+        exit 1
+    fi
+    array_spec=$((task_count - 1))
+    echo "Submitting SLURM array 0-$array_spec"
+    exec sbatch --array="0-${array_spec}" --export=ALL,OUTPUT_DIR="$OUTPUT_DIR",RUN_LIST_FILE="$RUN_LIST_FILE",CHECKPOINT_STEP="$CHECKPOINT_STEP",TRAINING_OUTPUTS_ROOT="$TRAINING_OUTPUTS_ROOT" "$0"
+fi
+
+if [ ! -s "$RUN_LIST_FILE" ]; then
+    if [ "${SLURM_ARRAY_TASK_ID:-}" = "0" ]; then
+        collect_checkpoints
+    else
+        for _ in $(seq 1 60); do
+            if [ -s "$RUN_LIST_FILE" ]; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+fi
+if [ ! -s "$RUN_LIST_FILE" ]; then
+    echo "Run list file is missing or empty: $RUN_LIST_FILE" >&2
+    exit 1
+fi
+
+mapfile -t CHECKPOINT_PATHS < "$RUN_LIST_FILE"
+INDEX="${SLURM_ARRAY_TASK_ID:-0}"
+if [ "$INDEX" -ge "${#CHECKPOINT_PATHS[@]}" ]; then
+    echo "No checkpoint for array index $INDEX (found ${#CHECKPOINT_PATHS[@]} checkpoints)"
+    exit 0
+fi
+
+ADAPTER_PATH="${CHECKPOINT_PATHS[$INDEX]}"
+RUN_NAME="$(basename "$(dirname "$ADAPTER_PATH")")"
+OUTPUT_JSON="$OUTPUT_DIR/${RUN_NAME}_checkpoint-${CHECKPOINT_STEP}.json"
+
+export ADAPTER_PATH
+export OUTPUT_JSON
+
+echo "=========================================="
+echo "Vacation batch inference array task"
+echo "Job ID: ${SLURM_JOB_ID:-N/A}"
+echo "Task ID: ${SLURM_ARRAY_TASK_ID:-N/A}"
+echo "Checkpoint: $ADAPTER_PATH"
+echo "Output JSON: $OUTPUT_JSON"
+echo "=========================================="
+
+bash "$JOB_SCRIPT"
