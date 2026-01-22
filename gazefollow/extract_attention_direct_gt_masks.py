@@ -23,7 +23,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor
 from gazefollow.extract_cls_token_image_similarity import draw_topk_similarity_overlay
-from generation_utils import (
+from gazefollow.generation_utils import (
     enable_inference_optimizations,
     load_model_and_setup,
     fix_wsl_paths,

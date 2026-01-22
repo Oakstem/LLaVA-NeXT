@@ -115,21 +115,21 @@ def _print_mask_info(mask_path: Path, metadata: Optional[Dict[str, Any]], mask: 
 
 
 DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
-a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans sitting on a worn wooden bench.  
-a chic woman in a beige coat → a woman in a beige coat and ankle boots holding a phone.  
-a techy man in a leather jacket → a man in a black leather jacket and glasses.  
-a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans carrying a tan shoulder bag.
-
-The sentence: a _ → """
-DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
-a scruffy guy in a tee → a guy with messy hair wearing a faded graphic t-shirt and loose jeans.
-a stylish woman in red → a woman with sleek hair wearing a bright red blazer and matching heels.
-a bulky backpack → a large black backpack with thick straps and a padded mesh back.
-a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
-a nerdy man with glasses → a man with round glasses, a plaid button-up, and tucked-in chinos.
-a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
+a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans.
+a chic woman in a beige coat → a woman in a beige coat and ankle boots.
+a techy man in a leather jacket → a man in a black leather jacket and glasses.
+a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans.
 
 The sentence: a _ →"""
+# DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
+# a scruffy guy in a tee → a guy with messy hair wearing a faded graphic t-shirt and loose jeans.
+# a stylish woman in red → a woman with sleek hair wearing a bright red blazer and matching heels.
+# a bulky backpack → a large black backpack with thick straps and a padded mesh back.
+# a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
+# a nerdy man with glasses → a man with round glasses, a plaid button-up, and tucked-in chinos.
+# a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
+
+# The sentence: a _ →"""
 
 def _resolve_image_path(
     explicit_path: Optional[str],
