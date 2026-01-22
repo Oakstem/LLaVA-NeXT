@@ -82,17 +82,22 @@ CKPT_PATH="lmms-lab/llava-onevision-qwen2-7b-ov-chat"
 
 # ===== TRAINING PARAMETERS =====
 # Data configuration
-DATA_PATH="training_datasets/20251205_174741_sgl_conversation_data_20251206_191724/train.json"
+DATA_PATH="training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/train.json"
+# DATA_PATH="training_datasets/20251102/train_dataset_localization_results_normalized_filtered_conversations.json"
+# DATA_PATH="training_datasets/20251205_174741_sgl_conversation_data_20251206_191724/train.json"
+# DATA_PATH="training_datasets/train_filtered_20251224_203622_69k.json"
 IMAGE_FOLDER="/galitylab/students/alonmardi/gazefollow"
 OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs"
 # DEEPSPEED_CONFIG="scripts/zero3.json"
 DEEPSPEED_CONFIG="scripts/zero1.json"
 
-# Model architecture parameters
-MM_TUNABLE_PARTS="mm_projector,model.layers[-8:].self_attn.{q_proj,v_proj,o_proj},model.layers[-8:].mlp,"
-# MM_TUNABLE_PARTS+="model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
+# Model architecture parameters, NO SPACES ALLOWED!
+# MM_TUNABLE_PARTS="mm_projector,model.layers[-8:].self_attn.{q_proj,v_proj,o_proj},model.layers[-8:].mlp,"
+# MM_TUNABLE_PARTS="mm_projector,model.layers[-20:].self_attn.{q_proj,v_proj},model.layers[-20:].mlp"
+MM_TUNABLE_PARTS="mm_projector,lm_head"
+# MM_TUNABLE_PARTS="mm_projector,model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].mlp"
 #"mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},vision_tower.vision_model.encoder.layers[-4:].mlp"
-MM_VISION_TOWER_LR="1e-5"
+MM_VISION_TOWER_LR="1e-6"
 MM_PROJECTOR_TYPE="mlp2x_gelu"
 MM_VISION_SELECT_LAYER="-2"
 MM_USE_IM_START_END="False"
@@ -100,22 +105,22 @@ MM_USE_IM_PATCH_TOKEN="True"
 GROUP_BY_MODALITY_LENGTH="True"
 IMAGE_ASPECT_RATIO="anyres_max_4" #"anyres_max_9"
 IMAGE_GRID_PINPOINTS="(1x1),...,(2x2)"
-#IMAGE_GRID_PINPOINTS="(1x1),...,(6x6)"
+# IMAGE_GRID_PINPOINTS="(1x1),...,(6x6)"
 MM_PATCH_MERGE_TYPE="spatial_unpad"
 
 # LoRA parameters
 LORA_ENABLE="True"
-LORA_R="16"
-LORA_ALPHA="16"
+LORA_R="4"
+LORA_ALPHA="32"
 MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
-NUM_TRAIN_EPOCHS="3"
+NUM_TRAIN_EPOCHS="2"
 PER_DEVICE_TRAIN_BATCH_SIZE="1"  # Reduced from 2 to 1
 PER_DEVICE_EVAL_BATCH_SIZE="2"  # Reduced from 4 to 2
 GRADIENT_ACCUMULATION_STEPS="8"  # Increased to maintain effective batch size
 GRADIENT_CHECKPOINTING="False"
-LEARNING_RATE="5e-6"
+LEARNING_RATE="2e-6"
 WEIGHT_DECAY="0.01"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
@@ -146,6 +151,7 @@ cd /galitylab/students/alonmardi/projects/LLaVA-NeXT
 # Set WANDB environment variables
 export WANDB_NAME=$MID_RUN_NAME
 export WANDB_PROJECT=$PROJECT_NAME
+export WANDB_JOB_ID="${SLURM_JOB_ID}"
 
 
 # Print all training parameters before starting
@@ -263,6 +269,7 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --dataloader_pin_memory True \
     --persistent_workers=True \
     --mm_projector_full_finetune ${MM_PROJECTOR_FULL_FINETUNE} \
+    --report_to wandb \
     # --deepspeed ${DEEPSPEED_CONFIG} \
     # --attn_implementation flash_attention_2 \
     # --dataloader_num_workers 10 \

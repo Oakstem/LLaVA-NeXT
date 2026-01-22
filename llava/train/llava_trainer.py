@@ -1062,6 +1062,8 @@ class LLaVATrainer(Trainer):
                                 max_new_tokens=256,
                                 use_cache=True
                             )
+                        if isinstance(output_ids, tuple):
+                            output_ids = output_ids[0]
                         if was_training:
                             self.model.train()
 

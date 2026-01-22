@@ -16,6 +16,7 @@
 
 import ast
 import copy
+import os
 from dataclasses import dataclass, field
 import json
 import logging
@@ -31,6 +32,7 @@ import yaml
 import math
 import re
 import torch
+import wandb
 
 import transformers
 import tokenizers
@@ -49,19 +51,27 @@ from llava.model.builder import load_pretrained_model
 from typing import Dict, Optional, Sequence, List, Any
 
 
-def safe_wandb_log(training_args, metrics_dict, step=None):
+def wandb_log(training_args, metrics_dict, step=None):
     """Safely log metrics to wandb if available and initialized."""
     if not (training_args.report_to and "wandb" in training_args.report_to):
         return
     
-    try:
-        import wandb
-        if wandb.run is not None:
-            if step is not None:
-                metrics_dict["step"] = step
-            wandb.log(metrics_dict)
-    except Exception as e:
-        rank0_print(f"Warning: Could not log to wandb: {e}")
+    if wandb.run is not None:
+        if step is not None:
+            metrics_dict["step"] = step
+        wandb.log(metrics_dict)
+
+
+def wandb_summary(training_args, summary_dict):
+    """Safely update wandb summary if available and initialized."""
+    if not (training_args.report_to and "wandb" in training_args.report_to):
+        return
+
+    if training_args.local_rank not in (0, -1):
+        return
+
+    if wandb.run is not None:
+        wandb.run.summary.update(summary_dict)
 
 
 # Import custom evaluation functions
@@ -1995,7 +2005,7 @@ def train(attn_implementation=None):
     rank0_print(f"Model loading completed in {model_load_time:.2f} seconds")
     
     # Log to wandb if available and initialized
-    safe_wandb_log(training_args, {"timing/model_load_seconds": model_load_time})
+    wandb_log(training_args, {"timing/model_load_seconds": model_load_time})
     
     # Store the image processor from the pretrained model
     if image_processor is not None:
@@ -2119,7 +2129,7 @@ def train(attn_implementation=None):
     rank0_print(f"Vision initialization completed in {vision_init_time:.2f} seconds")
     
     # Log to wandb if available and initialized
-    safe_wandb_log(training_args, {"timing/vision_init_seconds": vision_init_time})
+    wandb_log(training_args, {"timing/vision_init_seconds": vision_init_time})
     
     # Ensure vision tower is moved to the correct device and dtype
     # vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
@@ -2349,7 +2359,7 @@ def train(attn_implementation=None):
     rank0_print(f"Data module creation completed in {data_module_time:.2f} seconds")
     
     # Log to wandb if available and initialized
-    safe_wandb_log(training_args, {"timing/data_module_creation_seconds": data_module_time})
+    wandb_log(training_args, {"timing/data_module_creation_seconds": data_module_time})
     
     # Determine conversation template for evaluation
     conv_template = "qwen_1_5"
@@ -2385,9 +2395,12 @@ def train(attn_implementation=None):
     rank0_print(f"Total setup time: {setup_time:.2f} seconds")
     
     # Log to wandb if available and initialized
-    safe_wandb_log(training_args, {
+    wandb_log(training_args, {
         "timing/trainer_creation_seconds": trainer_creation_time,
         "timing/total_setup_seconds": setup_time
+    })
+    wandb_summary(training_args, {
+        "slurm_job_id": os.getenv("SLURM_JOB_ID", "unknown")
     })
 
     # Time actual training
@@ -2422,7 +2435,7 @@ def train(attn_implementation=None):
     rank0_print(f"Total execution time: {total_time:.2f} seconds")
     
     # Log to wandb if available and initialized
-    safe_wandb_log(training_args, {
+    wandb_log(training_args, {
         "timing/total_training_seconds": training_time,
         "timing/total_execution_seconds": total_time
     })
