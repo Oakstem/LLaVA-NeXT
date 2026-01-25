@@ -29,7 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from generate_vanilla_inference import (
+from gazefollow.generate_vanilla_inference import (
     prepare_image_tensor,
     build_generation_kwargs,
     determine_template,
@@ -317,6 +317,101 @@ def classify_atomic_attribute_combo(atomic_attributes: List[str]) -> Optional[st
     return None
 
 
+def _normalize_attention_focus(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    if pd.isna(value):
+        return None
+    cleaned = str(value).strip()
+    if not cleaned or cleaned.lower() == "nan":
+        return None
+    return cleaned
+
+
+def _person_id_from_label(label: object) -> Optional[str]:
+    if label is None:
+        return None
+    cleaned = str(label).strip()
+    if not cleaned:
+        return None
+    if cleaned.lower().startswith("person"):
+        digits = "".join(ch for ch in cleaned if ch.isdigit())
+        if digits:
+            return f"P{digits}"
+    if cleaned[:1].upper() == "P" and cleaned[1:].isdigit():
+        return cleaned.upper()
+    digits = "".join(ch for ch in cleaned if ch.isdigit())
+    if digits:
+        return f"P{digits}"
+    return None
+
+
+def _is_person_focus(value: str) -> bool:
+    return value[:1].upper() == "P" and value[1:].isdigit()
+
+
+def _is_object_focus(value: str) -> bool:
+    return value[:1].upper() == "O" and value[1:].isdigit()
+
+
+def classify_attention_focus_labels(
+    annotations: List[dict],
+    base_label: Optional[str],
+) -> Tuple[Optional[str], List[str]]:
+    person_ids = set()
+    focus_pairs = []
+    nan_count = 0
+
+    for ann in annotations:
+        pid = _person_id_from_label(ann.get("bbx_label"))
+        if pid:
+            person_ids.add(pid)
+        focus = _normalize_attention_focus(ann.get("attention_focus"))
+        if focus is None:
+            nan_count += 1
+            continue
+        focus = focus.upper()
+        if pid and _is_person_focus(focus):
+            focus_pairs.append((pid, focus))
+        elif _is_object_focus(focus):
+            pass
+
+    mutual = False
+    one_sided = False
+    focus_pairs_set = set(focus_pairs)
+    for src, tgt in focus_pairs:
+        if tgt in person_ids:
+            one_sided = True
+            if (tgt, src) in focus_pairs_set:
+                mutual = True
+                break
+
+    primary_label = base_label
+    labels = []
+    if mutual:
+        primary_label = "MutualGaze"
+        labels.append("MutualGaze")
+    elif one_sided:
+        primary_label = "OneSidedGaze"
+        labels.append("OneSidedGaze")
+    elif base_label:
+        labels.append(base_label)
+
+    if nan_count >= 2:
+        if primary_label is None:
+            primary_label = "NonCommmunicative"
+        labels.append("NonCommmunicative")
+
+    seen = set()
+    ordered = []
+    for label in labels:
+        if label and label not in seen:
+            seen.add(label)
+            ordered.append(label)
+
+    return primary_label, ordered
+
+
 def run_inference_on_frame(
     model,
     tokenizer,
@@ -552,12 +647,16 @@ def main():
             if ann.get("atomic_attribute") not in (None, "")
         ]
         atomic_attribute_combo = classify_atomic_attribute_combo(atomic_attributes)
+        gt_label, gt_labels_multi = classify_attention_focus_labels(
+            annotations, atomic_attribute_combo
+        )
 
         result_entry = {
             "video_id": video_id,
             "frame_id": frame_id,
             "image_path": str(frame_path),
-            "atomic_attribute_combo_GT": atomic_attribute_combo,
+            "atomic_attribute_combo_GT": gt_label,
+            "atomic_attribute_combo_GT_multi": gt_labels_multi,
             "response": response,
             "annotations": annotations,
             "atomic_attributes": atomic_attributes,
