@@ -704,12 +704,12 @@ def generate_turn(
         sequences_tensor: Optional[torch.Tensor] = None
     else:
         with torch.inference_mode():
-            generation_output = model.generate(**gen_kwargs)
+            generation_output, _ = model.generate(**gen_kwargs)
         output_ids = _extract_sequences_from_generate_output(generation_output)
         # generated_tokens = output_ids.tolist()
         response = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
         sequences_tensor = output_ids
-        if 'scores' in generation_output:
+        if not isinstance(generation_output, torch.Tensor) and 'scores' not in generation_output:
             # generation_output.scores is typically a tuple/list of per-step logits tensors
             # Stack them into a single tensor of shape (batch_size, seq_len, vocab_size)
             scores = getattr(generation_output, "scores", None)
