@@ -128,6 +128,7 @@ class _InteractiveBBoxSelector:
             minspanx=2,
             minspany=2,
             interactive=True,
+            props=dict(alpha=0.5),
         )
         self._cid_key = self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
         self._cid_close = self.fig.canvas.mpl_connect("close_event", self._on_close)

@@ -13,7 +13,7 @@ from generation_utils import (
     load_image,
     load_model_and_setup,
 )
-from json_utils import make_json_safe
+from gazefollow.json_utils import make_json_safe
 
 
 # DEFAULT_PROMPT = """Complete the sentence:

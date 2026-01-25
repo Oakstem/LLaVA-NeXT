@@ -13,7 +13,7 @@ from generation_utils import (
     load_model_and_setup,
     load_image,
 )
-from json_utils import make_json_safe
+from gazefollow.json_utils import make_json_safe
 
 
 def _prepare_generation_config(args: argparse.Namespace) -> Dict[str, Any]:
