@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import generate_vanilla_inference as gvi
+import gazefollow.generate_vanilla_inference as gvi
 
 from generation_utils import (
     enable_inference_optimizations,

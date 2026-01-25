@@ -76,6 +76,17 @@ Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
 If only one person is described as looking at another, it is NonCommmunicative."""
 
+PROMPT_A = """Describe each person briefly and say what they are looking at (person, object, or off-screen)."""
+PROMPT_B = """Based on the provided gaze information, choose exactly one social interaction label:
+MutualGaze: at least two people are looking at each other (A looks at B and B looks at A).
+SharedObjectAttention: at least two people are looking at the same external object or place (not a person), including one person following another person's reference to that external target.
+OneSidedGaze: one person looks at another person but the other looks away or elsewhere (not reciprocated).
+NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze.
+
+Rules:
+Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
+If only one person is described as looking at another, it is NonCommmunicative."""
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run batch LLaVA inference on Vacation dataset frames."
@@ -105,6 +116,31 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_PROMPT,
         help="Inference prompt to use for all frames",
+    )
+    parser.add_argument(
+        "--two-step-inference",
+        action="store_true",
+        help="Enable two-step inference (prompt A then prompt B).",
+    )
+    parser.add_argument(
+        "--prompt-a",
+        dest="prompt_a",
+        type=str,
+        default=PROMPT_A,
+        help="First prompt used for two-step inference.",
+    )
+    parser.add_argument(
+        "--prompt-b",
+        dest="prompt_b",
+        type=str,
+        default=PROMPT_B,
+        help="Second prompt appended after the first response for two-step inference.",
+    )
+    parser.add_argument(
+        "--second-separator",
+        type=str,
+        default=" \n",
+        help="Separator placed between response A and prompt B in two-step inference.",
     )
     
     # Frame selection arguments
@@ -473,6 +509,54 @@ def run_inference_on_frame(
     return response
 
 
+def run_two_step_inference_on_frame(
+    model,
+    tokenizer,
+    image_processor,
+    frame_path: Path,
+    prompt_a: str,
+    prompt_b: str,
+    args: argparse.Namespace,
+    conv_name: str,
+) -> Tuple[str, str, str]:
+    response_a = run_inference_on_frame(
+        model,
+        tokenizer,
+        image_processor,
+        frame_path,
+        prompt_a,
+        args,
+        conv_name,
+    )
+    if response_a.strip() and not response_a.strip().endswith("."):
+        response_a = response_a.strip() + "."
+    combined_prompt = f"{response_a}{args.second_separator}{prompt_b}".strip()
+
+    if hasattr(model, "disable_adapter") and args.adapter_path:
+        with model.disable_adapter():
+            response_b = run_inference_on_frame(
+                model,
+                tokenizer,
+                image_processor,
+                frame_path,
+                combined_prompt,
+                args,
+                conv_name,
+            )
+    else:
+        response_b = run_inference_on_frame(
+            model,
+            tokenizer,
+            image_processor,
+            frame_path,
+            combined_prompt,
+            args,
+            conv_name,
+        )
+
+    return response_a, response_b, combined_prompt
+
+
 def _normalize_event_attribute(event_attribute: str | None) -> str | None:
     if event_attribute is None:
         return None
@@ -556,6 +640,10 @@ def main():
     # Build config for output
     config = {
         "prompt": args.prompt,
+        "two_step_inference": args.two_step_inference,
+        "prompt_a": args.prompt_a if args.two_step_inference else None,
+        "prompt_b": args.prompt_b if args.two_step_inference else None,
+        "second_separator": args.second_separator if args.two_step_inference else None,
         "model_path": args.model_path,
         "frames_dir": str(frames_dir),
         "annotations_file": str(annotations_path),
@@ -621,7 +709,12 @@ def main():
         return
     
     # Process frames
-    print(f"Using prompt:\n{args.prompt}\n")
+    if args.two_step_inference:
+        print("Using two-step prompts:")
+        print(f"Prompt A:\n{args.prompt_a}\n")
+        print(f"Prompt B:\n{args.prompt_b}\n")
+    else:
+        print(f"Using prompt:\n{args.prompt}\n")
     print("Starting inference...")
     for idx, (_, row) in enumerate(tqdm(selected_frames.iterrows(), total=len(selected_frames))):
         video_id = int(row["video_id"])
@@ -634,10 +727,28 @@ def main():
             print(f"\nWarning: Frame not found: {frame_path}, skipping...")
             continue
         
-        response = run_inference_on_frame(
-            model, tokenizer, image_processor,
-            frame_path, args.prompt, args, conv_name
-        )
+        if args.two_step_inference:
+            response_a, response_b, combined_prompt = run_two_step_inference_on_frame(
+                model,
+                tokenizer,
+                image_processor,
+                frame_path,
+                args.prompt_a,
+                args.prompt_b,
+                args,
+                conv_name,
+            )
+            response = response_b
+        else:
+            response = run_inference_on_frame(
+                model,
+                tokenizer,
+                image_processor,
+                frame_path,
+                args.prompt,
+                args,
+                conv_name,
+            )
         
         # Build result entry
         annotations = get_frame_annotations(all_annotations, video_id, frame_id)
@@ -658,6 +769,8 @@ def main():
             "atomic_attribute_combo_GT": gt_label,
             "atomic_attribute_combo_GT_multi": gt_labels_multi,
             "response": response,
+            "response_step1": response_a if args.two_step_inference else None,
+            "combined_prompt": combined_prompt if args.two_step_inference else None,
             "annotations": annotations,
             "atomic_attributes": atomic_attributes,
         }
