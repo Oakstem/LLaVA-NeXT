@@ -76,16 +76,43 @@ Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
 If only one person is described as looking at another, it is NonCommmunicative."""
 
-PROMPT_A = """Describe each person briefly and say what they are looking at (person, object, or off-screen)."""
+# PROMPT_A = """Describe each person briefly and say what they are looking at (person, object, or off-screen)."""
+PROMPT_A = """You are an expert vision assistant.
+Step 1 - Caption
+• Provide one concise sentence that broadly describes the entire scene.
+• Begin the line with: Caption:
+Step 2 - Foreground people & gaze
+1. Detect every person whose height is at least 5% of the image (foreground).
+2. List them from left to right and number sequentially starting at 1.
+For each person output exactly one line in this format:
+Person {N}: {short description}, looking at {target | outside the frame | uncertain}
+Output format (no extra lines, no prose other than what is specified):
+-------------------------------------------------
+Caption: {your one-sentence scene description}
+Person 1: {short description}, looking at ...
+Person 2: {short description}, looking at ...
+...
+-------------------------------------------------
+Additional rules
+• Keep the phrase "looking at" unchanged.
+• {short description} must be 6 words or fewer (e.g., "man in red jacket").
+• If no foreground person is detected, write exactly: No foreground people detected.
+• If gaze cannot be determined, use "uncertain".
+• Do not output your reasoning or any extra text."""
+
 PROMPT_B = """Based on the provided gaze information, choose exactly one social interaction label:
 MutualGaze: at least two people are looking at each other (A looks at B and B looks at A).
 SharedObjectAttention: at least two people are looking at the same external object or place (not a person), including one person following another person's reference to that external target.
 OneSidedGaze: one person looks at another person but the other looks away or elsewhere (not reciprocated).
-NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze.
+NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze. for example, if people are looking at something or someone off-screen.
+None: if no gaze-looking information is provided.
 
 Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
-If only one person is described as looking at another, it is NonCommmunicative."""
+If only one person is described as looking at another, it is NonCommmunicative.
+If all people are looking at something or someone off-screen (or at the camera), label as NonCommmunicative.
+If no gaze information is given, label as None."""
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

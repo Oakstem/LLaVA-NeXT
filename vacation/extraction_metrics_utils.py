@@ -11,32 +11,43 @@ def _normalize_social_label(label: str | None) -> str | None:
         return None
     cleaned = cleaned.replace("-", " ").replace("_", " ")
     cleaned = " ".join(cleaned.split())
-    if cleaned in {"mutualgaze", "mutual gaze", "mutual"}:
+    if any(
+        option in cleaned for option in {"mutualgaze", "mutual gaze", "mutual"}
+    ):
         return "MutualGaze"
-    if cleaned in {
-        "sharedobjectattention",
-        "shared object attention",
-        "shared attention",
-        "joint attention",
-        "joint att",
-        "jointatt",
-    }:
+    if any(
+        option in cleaned
+        for option in {
+            "sharedobjectattention",
+            "shared object attention",
+            "shared attention",
+            "joint attention",
+            "joint att",
+            "jointatt",
+        }
+    ):
         return "SharedObjectAttention"
-    if cleaned in {
-        "onesidedgaze",
-        "one sided gaze",
-        "one sided",
-        "single",
-        "single gaze",
-    }:
+    if any(
+        option in cleaned
+        for option in {
+            "onesidedgaze",
+            "one sided gaze",
+            "one sided",
+            "single",
+            "single gaze",
+        }
+    ):
         return "OneSidedGaze"
-    if cleaned in {
-        "noncommmunicative",
-        "noncommunicative",
-        "non communicative",
-        "non communicative gaze",
-        "unclear",
-    }:
+    if any(
+        option in cleaned
+        for option in {
+            "noncommmunicative",
+            "noncommunicative",
+            "non communicative",
+            "non communicative gaze",
+            "unclear",
+        }
+    ):
         return "NonCommmunicative"
     return None
 

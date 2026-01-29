@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+from datetime import datetime
 
 
 def _normalize_social_label(label: str | None) -> str | None:
@@ -15,54 +16,77 @@ def _normalize_social_label(label: str | None) -> str | None:
         return None
     cleaned = cleaned.replace("-", " ").replace("_", " ")
     cleaned = " ".join(cleaned.split())
-    if cleaned in {"mutualgaze", "mutual gaze", "mutual"}:
+    if any(
+        option in cleaned for option in {"mutualgaze", "mutual gaze", "mutual"}
+    ):
         return "MutualGaze"
-    if cleaned in {
-        "sharedobjectattention",
-        "shared object attention",
-        "shared attention",
-        "joint attention",
-        "joint att",
-        "jointatt",
-    }:
+    if any(
+        option in cleaned
+        for option in {
+            "sharedobjectattention",
+            "shared object attention",
+            "shared attention",
+            "joint attention",
+            "joint att",
+            "jointatt",
+        }
+    ):
         return "SharedObjectAttention"
-    if cleaned in {
-        "onesidedgaze",
-        "one sided gaze",
-        "one sided",
-        "single",
-        "single gaze",
-    }:
+    if any(
+        option in cleaned
+        for option in {
+            "onesidedgaze",
+            "one sided gaze",
+            "one sided",
+            "single",
+            "single gaze",
+        }
+    ):
         return "OneSidedGaze"
-    if cleaned in {
-        "noncommmunicative",
-        "noncommunicative",
-        "non communicative",
-        "non communicative gaze",
-        "unclear",
-    }:
+    if any(
+        option in cleaned
+        for option in {
+            "noncommmunicative",
+            "noncommunicative",
+            "non communicative",
+            "non communicative gaze",
+            "unclear",
+        }
+    ):
         return "NonCommmunicative"
     return None
 
 
-def _get_gt_label(entry: dict) -> str | None:
+def _get_gt_labels(entry: dict) -> list[str]:
+    if "atomic_attribute_combo_GT_multi" in entry:
+        multi = entry.get("atomic_attribute_combo_GT_multi")
+        if isinstance(multi, list):
+            return [str(label) for label in multi]
+        if multi is not None:
+            return [str(multi)]
+        return []
     if "atomic_attribute_combo_GT" in entry:
-        return entry.get("atomic_attribute_combo_GT")
-    return entry.get("atomic_attribute_combo")
+        label = entry.get("atomic_attribute_combo_GT")
+        return [str(label)] if label is not None else []
+    label = entry.get("atomic_attribute_combo")
+    return [str(label)] if label is not None else []
 
 
 def compute_metrics(results: list[dict]) -> dict:
     total_results = len(results)
-    extracted_entries = [
-        r for r in results if isinstance(r.get("extracted_gaze_info"), dict)
-    ]
+    extracted_entries = []
+    valid_labels = 0
+    for r in results:
+        if isinstance(r.get("extracted_gaze_info"), dict):
+            pred_label = r.get("extracted_gaze_info").get("social_interaction_label")
+        else:
+            pred_label = r.get("response")
+        extracted_entries.append(pred_label)
+        if _normalize_social_label(pred_label) is not None:
+            valid_labels += 1
+
     total_extractions = len(extracted_entries)
 
-    valid_labels = 0
-    for entry in extracted_entries:
-        pred = entry["extracted_gaze_info"].get("social_interaction_label")
-        if _normalize_social_label(pred) is not None:
-            valid_labels += 1
 
     valid_percent = (valid_labels / total_extractions) if total_extractions else 0.0
 
@@ -70,19 +94,25 @@ def compute_metrics(results: list[dict]) -> dict:
     correct = 0
     skipped_missing_gt = 0
     skipped_missing_pred = 0
-    for entry in extracted_entries:
-        pred_norm = _normalize_social_label(
-            entry["extracted_gaze_info"].get("social_interaction_label")
-        )
-        gt_norm = _normalize_social_label(_get_gt_label(entry))
+    for entry in results:
+        if isinstance(entry.get("extracted_gaze_info"), dict):
+            pred_raw = entry.get("extracted_gaze_info").get("social_interaction_label")
+        else:
+            pred_raw = entry.get("response")
+        pred_norm = _normalize_social_label(pred_raw)
+        gt_norms = [
+            normalized
+            for label in _get_gt_labels(entry)
+            if (normalized := _normalize_social_label(label)) is not None
+        ]
         if pred_norm is None:
             skipped_missing_pred += 1
             continue
-        if gt_norm is None:
+        if not gt_norms:
             skipped_missing_gt += 1
             continue
         evaluated += 1
-        if pred_norm == gt_norm:
+        if pred_norm in gt_norms:
             correct += 1
 
     accuracy = (correct / evaluated) if evaluated else 0.0
@@ -156,7 +186,9 @@ def main() -> None:
     args = parser.parse_args()
 
     results_dir = args.results_dir
-    output_csv = args.output_csv or (results_dir / "combined_metrics.csv")
+    output_csv = args.output_csv or (
+        results_dir / f"combined_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    )
 
     rows = []
     aggregate = {
