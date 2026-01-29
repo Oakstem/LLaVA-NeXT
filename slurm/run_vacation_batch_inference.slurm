@@ -12,7 +12,7 @@
 # Configuration variables - modify these as needed
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-ADAPTER_PATH="${ADAPTER_PATH:-training_outputs/llava-20260116_112719/checkpoint-7000}"
+ADAPTER_PATH="${ADAPTER_PATH:-}"
 #ADAPTER_PATH="${ADAPTER_PATH:-}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 
@@ -29,10 +29,10 @@ QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 # Batch inference parameters
 ANNOTATIONS_FILE="${ANNOTATIONS_FILE:-datasets/Vacation/test_annotations.csv}"
 FRAMES_DIR="${FRAMES_DIR:-datasets/Vacation/frames}"
-OUTPUT_JSON="${OUTPUT_JSON:-vacation_results/llava_vacation_general_results_20260114_101635_checkpoint-3000_$(date +%Y%m%d_%H%M%S).json}"
+OUTPUT_JSON="${OUTPUT_JSON:-vacation_results/llava_vacation_general_results_20260114_101635_checkpoint-5000_$(date +%Y%m%d_%H%M%S).json}"
 PROMPT="${PROMPT:-}"
 SKIP_STEP="${SKIP_STEP:-10}"
-LIMIT="${LIMIT:-10}"
+LIMIT="${LIMIT:-100}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
 RESUME="${RESUME:-false}"
 RANDOMIZE="${RANDOMIZE:-true}"
@@ -43,9 +43,10 @@ CONV_TEMPLATE="${CONV_TEMPLATE:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
+TWO_STEP_INFERENCE="${TWO_STEP_INFERENCE:-true}"
 
 # GPT extraction parameters
-ENABLE_GPT_EXTRACTION="${ENABLE_GPT_EXTRACTION:-true}"
+ENABLE_GPT_EXTRACTION="${ENABLE_GPT_EXTRACTION:-false}"
 GPT_MODEL="${GPT_MODEL:-gpt-5-nano}"
 
 # Create logs directory if it doesn't exist
@@ -78,6 +79,7 @@ echo "Prompt: $PROMPT"
 echo "Max New Tokens: $MAX_NEW_TOKENS"
 echo "Temperature: $TEMPERATURE"
 echo "Disable Optimizations: $DISABLE_OPTIMIZATIONS"
+echo "Two-Step Inference: $TWO_STEP_INFERENCE"
 echo "Enable GPT Extraction: $ENABLE_GPT_EXTRACTION"
 echo "GPT Model: $GPT_MODEL"
 echo "=========================================="
@@ -165,6 +167,11 @@ fi
 # Add optimization option
 if [ "$DISABLE_OPTIMIZATIONS" = "true" ]; then
     ARGS+=("--disable-optimizations")
+fi
+
+# Add two-step inference option
+if [ "$TWO_STEP_INFERENCE" = "true" ]; then
+    ARGS+=("--two-step-inference")
 fi
 
 # Add GPT extraction options
