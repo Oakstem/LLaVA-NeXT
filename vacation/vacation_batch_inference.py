@@ -110,7 +110,7 @@ None: if no gaze-looking information is provided.
 Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
 If only one person is described as looking at another, it is NonCommmunicative.
-If all people are looking at something or someone off-screen (or at the camera), label as NonCommmunicative.
+If all people are looking at something or someone off-screen, or at the camera, label as NonCommmunicative.
 If no gaze information is given, label as None."""
 
 
