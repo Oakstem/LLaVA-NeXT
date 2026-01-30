@@ -96,6 +96,29 @@ except Exception:  # noqa: BLE001
     gdino_parse_person_descriptions = None
     gdino_detect_gaze_targets = None
 
+DEFAULT_PROMPT = """You are an expert vision assistant.
+Step 1 - Caption
+• Provide one concise sentence that broadly describes the entire scene.
+• Begin the line with: Caption:
+Step 2 - Foreground people & gaze
+1. Detect every person whose height is at least 5% of the image (foreground).
+2. List them from left to right and number sequentially starting at 1.
+For each person output exactly one line in this format:
+Person {N}: {short description}, looking at {target | outside the frame | uncertain}
+Output format (no extra lines, no prose other than what is specified):
+-------------------------------------------------
+Caption: {your one-sentence scene description}
+Person 1: {short description}, looking at ...
+Person 2: {short description}, looking at ...
+...
+-------------------------------------------------
+Additional rules
+• Keep the phrase "looking at" unchanged.
+• {short description} must be 6 words or fewer (e.g., "man in red jacket").
+• If no foreground person is detected, write exactly: No foreground people detected.
+• If gaze cannot be determined, use "uncertain".
+• Do not output your reasoning or any extra text."""
+
 # Ensure project root is importable (needed when running from subdirectories)
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -201,8 +224,6 @@ def ensure_image_config(
     model,
     fallback_aspect_ratio: Optional[str],
     fallback_grid_pinpoints: Optional[Any],
-    override_aspect_ratio: bool = False,
-    override_grid_pinpoints: bool = False,
 ) -> None:
     config = getattr(model, "config", None)
     if config is None:
@@ -210,30 +231,17 @@ def ensure_image_config(
 
     aspect_ratio = getattr(config, "image_aspect_ratio", None)
     print(f"INFO: Current image_aspect_ratio in checkpoint: {aspect_ratio}")
-    if override_aspect_ratio and fallback_aspect_ratio:
-        if aspect_ratio and aspect_ratio != fallback_aspect_ratio:
-            print(f"Overriding image_aspect_ratio from '{aspect_ratio}' to '{fallback_aspect_ratio}'.")
-        elif not aspect_ratio:
-            print(f"Setting image_aspect_ratio to '{fallback_aspect_ratio}'.")
+    if fallback_aspect_ratio:
+        print(f"Setting image_aspect_ratio to '{fallback_aspect_ratio}'.")
         config.image_aspect_ratio = fallback_aspect_ratio
         aspect_ratio = fallback_aspect_ratio
-    elif not aspect_ratio and fallback_aspect_ratio:
-        config.image_aspect_ratio = fallback_aspect_ratio
-        print(f"image_aspect_ratio missing in checkpoint; using fallback '{fallback_aspect_ratio}'.")
 
     base_resolution = determine_base_image_resolution(model)
 
     current_grid = getattr(config, "image_grid_pinpoints", None)
     resolved_grid: Optional[List[List[int]]] = None
-    if not override_grid_pinpoints and current_grid not in (None, "", []):
-        try:
-            resolved_grid = resolve_image_grid_pinpoints(current_grid, base_resolution)
-            config.image_grid_pinpoints = deepcopy(resolved_grid)
-        except ValueError:
-            resolved_grid = None
-
     should_apply_fallback_grid = fallback_grid_pinpoints not in (None, "", [])
-    if should_apply_fallback_grid and (override_grid_pinpoints or resolved_grid is None):
+    if should_apply_fallback_grid:
         try:
             resolved_grid = resolve_image_grid_pinpoints(fallback_grid_pinpoints, base_resolution)
         except ValueError as exc:
@@ -241,10 +249,13 @@ def ensure_image_config(
                 f"Failed to parse image_grid_pinpoints fallback '{fallback_grid_pinpoints}': {exc}"
             ) from exc
         config.image_grid_pinpoints = deepcopy(resolved_grid)
-        if override_grid_pinpoints:
-            print("image_grid_pinpoints overridden via arguments.")
-        else:
-            print("image_grid_pinpoints missing in checkpoint; using fallback from arguments.")
+        print(f"Setting image_grid_pinpoints to {fallback_grid_pinpoints} (resolved to {resolved_grid}).")
+    elif current_grid not in (None, "", []):
+        try:
+            resolved_grid = resolve_image_grid_pinpoints(current_grid, base_resolution)
+            config.image_grid_pinpoints = deepcopy(resolved_grid)
+        except ValueError:
+            resolved_grid = None
 
     vision_config = getattr(config, "vision_config", None)
     if vision_config is None:
@@ -272,7 +283,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-grid-pinpoints", default=DEFAULT_IMAGE_GRID_PINPOINTS_EXPR, help="Fallback image_grid_pinpoints used when absent in the checkpoint. Accepts formats like '(1x1),...,(2x2)' or a JSON array of [width, height] pairs.")
     
     # prompt_group = parser.add_mutually_exclusive_group(required=True)
-    parser.add_argument("--prompt", default="describe every person and where is he looking at?", help="User prompt to pair with the image.")
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="User prompt to pair with the image.")
     # prompt_group.add_argument("--prompt-file", help="Path to a text file containing the prompt.")
     
     parser.add_argument("--conv-template", default=None, help="Conversation template key (defaults to qwen_1_5 for Qwen-style models).")
@@ -658,8 +669,6 @@ def generate_turn(
     """
 
     prompt_text = prompt_text.strip()
-    if not prompt_text:
-        raise ValueError("Prompt text must be non-empty for generation.")
 
     if include_image_token and DEFAULT_IMAGE_TOKEN not in prompt_text:
         user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt_text}"
@@ -751,8 +760,6 @@ def main() -> None:
         model,
         args.image_aspect_ratio,
         args.image_grid_pinpoints,
-        override_aspect_ratio=args.image_aspect_ratio != DEFAULT_IMAGE_ASPECT_RATIO,
-        override_grid_pinpoints=args.image_grid_pinpoints != DEFAULT_IMAGE_GRID_PINPOINTS_EXPR,
     )
 
     prompt_text = read_prompt(args.prompt)
@@ -795,9 +802,6 @@ def main() -> None:
         except (EOFError, KeyboardInterrupt):
             print("\nExiting without running inference.")
             return
-
-    if not prompt_text:
-        raise ValueError("A non-empty prompt is required to start the conversation.")
 
     def stream_printer(chunk: str) -> None:
         print(chunk, end="", flush=True)

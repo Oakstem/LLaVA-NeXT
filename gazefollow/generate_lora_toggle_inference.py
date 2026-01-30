@@ -160,8 +160,6 @@ def main() -> None:
         model,
         args.image_aspect_ratio,
         args.image_grid_pinpoints,
-        override_aspect_ratio=args.image_aspect_ratio != gvi.DEFAULT_IMAGE_ASPECT_RATIO,
-        override_grid_pinpoints=args.image_grid_pinpoints != gvi.DEFAULT_IMAGE_GRID_PINPOINTS_EXPR,
     )
 
     image_path = fix_wsl_paths(args.image_path)

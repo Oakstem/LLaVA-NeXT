@@ -33,6 +33,7 @@ from gazefollow.generate_vanilla_inference import (
     prepare_image_tensor,
     build_generation_kwargs,
     determine_template,
+    ensure_image_config,
 )
 from gazefollow.generation_utils import (
     enable_inference_optimizations,
@@ -262,6 +263,18 @@ def parse_args() -> argparse.Namespace:
         "--disable-optimizations",
         action="store_true",
         help="Skip enabling CUDA inference optimizations",
+    )
+    parser.add_argument(
+        "--image-aspect-ratio",
+        type=str,
+        default="anyres_max_4",
+        help="Override image aspect ratio (ANYRES)",
+    )
+    parser.add_argument(
+        "--image-grid-pinpoints",
+        type=str,
+        default="(1x1),...,(2x2)",
+        help="Image grid pinpoints",
     )
     
     # GPT extraction arguments
@@ -642,6 +655,13 @@ def main():
         load_8bit=args.load_8bit,
         model_base=args.model_base,
         adapter_path=fix_wsl_paths(args.adapter_path) if args.adapter_path else None,
+    )
+    aspect_ratio = getattr(getattr(model, "config", None), "image_aspect_ratio", None)
+    print(f"INFO: image_aspect_ratio in checkpoint: {aspect_ratio}")
+    ensure_image_config(
+        model,
+        args.image_aspect_ratio,
+        args.image_grid_pinpoints,
     )
     
     # Determine conversation template
