@@ -585,49 +585,97 @@ def process_image_task(
     if not description_text:
         description_text = args.query_fallback_description
 
+    def _normalize_query(value: str) -> str:
+        cleaned = (value or "").strip()
+        return cleaned if cleaned else args.query_fallback_description
+
     query_description = description_text
     arrow_index = query_description.rfind("→")
-    if arrow_index != -1:
-        query_description = query_description[arrow_index + 1 :].strip()
-    if not query_description:
-        query_description = args.query_fallback_description
-    truncation_index = min(
-        (i for i in (query_description.find(","), query_description.find(".")) if i != -1),
-        default=None,
-    )
-    if truncation_index is not None:
-        query_description = query_description[:truncation_index].strip()
-        if not query_description:
-            query_description = args.query_fallback_description
+    target_mode = bool(args.use_target_insert_for_source)
+    query_candidates: List[Tuple[str, str]] = []
+    if target_mode and arrow_index != -1:
+        before_arrow = _normalize_query(query_description[:arrow_index])
+        after_arrow = _normalize_query(query_description[arrow_index + 1 :])
+        query_candidates = [("before_arrow", before_arrow), ("after_arrow", after_arrow)]
+    else:
+        if arrow_index != -1:
+            query_description = query_description[arrow_index + 1 :]
+        query_candidates = [("full", _normalize_query(query_description))]
 
-    grounding_query = qwen_query_template.format(description=query_description)
-    detections, raw_response = run_qwen3vl_grounding(
-        image_path=str(task.image_path),
-        query=grounding_query,
-        model_id=args.qwen_model_id,
-        max_new_tokens=args.qwen_max_new_tokens,
-        processor=qwen_processor,
-        model=qwen_model,
-        device_map=args.qwen_device_map,
-        temperature=args.qwen_temperature,
-    )
-
+    grounding_entries: List[Dict[str, Any]] = []
     overlay_path: Optional[Path] = None
-    overlay_output_in_llava_dir = image_output_dir / "grounding_visualization.png"
-    if args.save_visualization:
-        overlay_path = draw_grounding_overlay(task.image_path, detections, overlay_output_in_llava_dir)
-        if overlay_path and visualization_dir:
-            viz_copy_path = visualization_dir / f"{task.image_id}.png"
-            viz_copy_path.parent.mkdir(parents=True, exist_ok=True)
-            if viz_copy_path != overlay_path:
-                shutil.copy2(overlay_path, viz_copy_path)
+    for idx, (segment, candidate_description) in enumerate(query_candidates, start=1):
+        grounding_query = qwen_query_template.format(description=candidate_description)
+        detections, raw_response = run_qwen3vl_grounding(
+            image_path=str(task.image_path),
+            query=grounding_query,
+            model_id=args.qwen_model_id,
+            max_new_tokens=args.qwen_max_new_tokens,
+            processor=qwen_processor,
+            model=qwen_model,
+            device_map=args.qwen_device_map,
+            temperature=args.qwen_temperature,
+        )
 
-    metrics_summary = annotate_grounding_metrics(
-        detections=detections,
-        image_path=task.image_path,
-        mask_path=task.mask_path,
-        person_mask_bbox=description_results.get("person_mask_bbox"),
-    )
+        overlay_output_in_llava_dir = image_output_dir / (
+            "grounding_visualization.png"
+            if len(query_candidates) == 1
+            else f"grounding_visualization_{segment}_{idx}.png"
+        )
+        entry_overlay_path: Optional[Path] = None
+        if args.save_visualization:
+            entry_overlay_path = draw_grounding_overlay(task.image_path, detections, overlay_output_in_llava_dir)
+            if entry_overlay_path and visualization_dir:
+                viz_suffix = f"{task.image_id}.png" if len(query_candidates) == 1 else f"{task.image_id}_{segment}.png"
+                viz_copy_path = visualization_dir / viz_suffix
+                viz_copy_path.parent.mkdir(parents=True, exist_ok=True)
+                if viz_copy_path != entry_overlay_path:
+                    shutil.copy2(entry_overlay_path, viz_copy_path)
+
+        metrics_summary = annotate_grounding_metrics(
+            detections=detections,
+            image_path=task.image_path,
+            mask_path=task.mask_path,
+            person_mask_bbox=description_results.get("person_mask_bbox"),
+        )
+
+        grounding_entries.append(
+            {
+                "segment": segment,
+                "query": candidate_description,
+                "detections": detections,
+                "raw_response": raw_response,
+                "metrics_summary": metrics_summary,
+                "visualization_path": str(entry_overlay_path) if entry_overlay_path else None,
+            }
+        )
+
+    preferred_entry = None
+    if len(grounding_entries) == 1:
+        preferred_entry = grounding_entries[0]
+    else:
+        for entry in grounding_entries:
+            if entry.get("segment") == "after_arrow":
+                preferred_entry = entry
+                break
+        if preferred_entry is None:
+            preferred_entry = grounding_entries[0]
+
+    if preferred_entry:
+        overlay_path = (
+            Path(preferred_entry["visualization_path"])
+            if preferred_entry.get("visualization_path")
+            else None
+        )
+        query_description = preferred_entry["query"]
+        detections = preferred_entry["detections"]
+        raw_response = preferred_entry["raw_response"]
+        metrics_summary = preferred_entry["metrics_summary"]
+    else:
+        query_description = args.query_fallback_description
+        detections = []
+        raw_response = ""
+        metrics_summary = None
 
     description_summary = {
         "text": description_text,
@@ -651,6 +699,8 @@ def process_image_task(
             "detections": detections,
             "raw_response": raw_response,
             "metrics_summary": metrics_summary,
+            "entries": grounding_entries,
+            "mode": "target" if target_mode else "source",
         },
         "artifacts": {
             "llava_output_dir": str(image_output_dir),
@@ -662,19 +712,25 @@ def process_image_task(
 
 def summarize_best_detection(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, Any]]]:
     """Return the lowest normalized L2 error detection, if present."""
-    detections: List[Dict[str, Any]] = payload.get("grounding", {}).get("detections", []) or []
+    grounding = payload.get("grounding", {}) or {}
+    entries = grounding.get("entries") or []
+    if entries:
+        detection_groups = [entry.get("detections", []) or [] for entry in entries]
+    else:
+        detection_groups = [grounding.get("detections", []) or []]
     best_error: Optional[float] = None
     best_iou: Optional[float] = None
     best_detection: Optional[Dict[str, Any]] = None
-    for detection in detections:
-        metrics = detection.get("metrics") or {}
-        error = metrics.get("gaze_normalized_l2_error")
-        if error is None:
-            continue
-        if best_error is None or error < best_error:
-            best_error = error
-            best_iou = metrics.get("bbox_iou_vs_person")
-            best_detection = detection
+    for detections in detection_groups:
+        for detection in detections:
+            metrics = detection.get("metrics") or {}
+            error = metrics.get("gaze_normalized_l2_error")
+            if error is None:
+                continue
+            if best_error is None or error < best_error:
+                best_error = error
+                best_iou = metrics.get("bbox_iou_vs_person")
+                best_detection = detection
     return best_error, best_iou, best_detection
 
 
@@ -791,7 +847,7 @@ def parse_args() -> argparse.Namespace:
         description="Extract person descriptions with LLaVA-NeXT attention and ground them with Qwen3-VL."
     )
     parser.add_argument("--mode", choices=["single", "list"], default="single")
-    parser.add_argument("--image-path", default=r"D:\Projects\data\gazefollow\train\00000000\00000046.jpg", help="Path to a single image to process.")
+    parser.add_argument("--image-path", default=r"D:\Projects\data\gazefollow\train\00000000\00000119.jpg", help="Path to a single image to process.")
     parser.add_argument("--mask-path", help="Optional explicit mask path for the single image.")
     parser.add_argument("--image-id", help="Override identifier for the single image.")
     parser.add_argument("--image-list", help="Path to a JSON/JSONL/txt list of images for list mode.")
