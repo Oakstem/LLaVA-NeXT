@@ -371,7 +371,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 if kwargs.get("use_target_insert_indices_for_source"):
                     self._maybe_share_target_insert_positions(self.tokens_indexing)
             except Exception as exc:
-                print(f"Warning: failed to build tokens_indexing from prompt tokens: {exc}")
+                pass
         if not mask_logic_applied and kwargs.get("target_mask_embedding", None) is not None:
             mask_logic_applied = self._apply_mask_embedding_logic(
                 inputs_embeds=inputs_embeds,
