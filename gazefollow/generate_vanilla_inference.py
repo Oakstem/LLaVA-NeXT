@@ -27,7 +27,7 @@ if hasattr(torch, 'utils') and hasattr(torch.utils, '_pytree'):
             return _pytree._register_pytree_node(*args, **kwargs)
         _pytree.register_pytree_node = _compat_register_pytree_node
 
-from transformers import TextIteratorStreamer
+from transformers import TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
 from transformers import modeling_utils as _transformers_modeling_utils
 
 if not hasattr(_transformers_modeling_utils, "apply_chunking_to_forward"):
@@ -120,7 +120,7 @@ Additional rules
 • Do not output your reasoning or any extra text."""
 
 # Ensure project root is importable (needed when running from subdirectories)
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -287,7 +287,7 @@ def parse_args() -> argparse.Namespace:
     # prompt_group.add_argument("--prompt-file", help="Path to a text file containing the prompt.")
     
     parser.add_argument("--conv-template", default=None, help="Conversation template key (defaults to qwen_1_5 for Qwen-style models).")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum number of tokens to generate.")
+    parser.add_argument("--max-new-tokens", type=int, default=300, help="Maximum number of tokens to generate.")
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature (ignored if --do-sample is False).")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus sampling value.")
     parser.add_argument("--num-beams", type=int, default=1, help="Number of beams for beam search decoding.")
@@ -303,6 +303,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gdino-box-threshold", type=float, default=0.3, help="Box confidence threshold for GroundingDINO detections.")
     parser.add_argument("--gdino-text-threshold", type=float, default=0.25, help="Text matching threshold for GroundingDINO detections.")
     parser.add_argument("--gdino-device", default="cuda", help="Device string for GroundingDINO (default: cuda).")
+    parser.add_argument("--disable-repetition-stop", action="store_true", help="Disable early stopping when repetitive token loops are detected.")
+    parser.add_argument("--repetition-stop-window", type=int, default=100, help="Token window size used to detect repeated n-gram loops.")
+    parser.add_argument("--repetition-stop-ngram-max", type=int, default=20, help="Maximum n-gram size to check for repetition.")
+    parser.add_argument("--repetition-stop-repeats", type=int, default=2, help="How many consecutive repeated n-grams trigger early stopping.")
+    parser.add_argument("--repetition-stop-min-tokens", type=int, default=10, help="Minimum generated tokens before repetition checks start.")
     return parser.parse_args()
 
 def prompt_for_adapter_path(training_outputs_dir: str = "training_outputs") -> Optional[str]:
@@ -476,6 +481,74 @@ def build_generation_kwargs(args: argparse.Namespace, tokenizer, image_tensor: t
     return kwargs
 
 
+class RepetitionStoppingCriteria(StoppingCriteria):
+    def __init__(
+        self,
+        tokenizer,
+        prompt_length: int,
+        window_size: int,
+        max_ngram: int,
+        repeat_threshold: int,
+        min_generated_tokens: int,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.prompt_length = max(prompt_length, 0)
+        self.window_size = max(window_size, 1)
+        self.max_ngram = max(max_ngram, 1)
+        self.repeat_threshold = max(repeat_threshold, 2)
+        self.min_generated_tokens = max(min_generated_tokens, 1)
+        self._triggered = False
+
+    def _generated_tokens(self, input_ids: torch.Tensor) -> list[int]:
+        tokens = input_ids[0].tolist()
+        return tokens
+
+    def _has_repeated_ngram(self, tokens: list[int]) -> bool:
+        window = tokens[-self.window_size :] if len(tokens) > self.window_size else tokens
+        for n in range(1, self.max_ngram + 1):
+            required = n * self.repeat_threshold
+            if len(window) < required:
+                continue
+            ngram = window[-n:]
+            matches = True
+            for k in range(2, self.repeat_threshold + 1):
+                if window[-k * n : -(k - 1) * n] != ngram:
+                    matches = False
+                    break
+            if matches:
+                return True
+        return False
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs: Any) -> bool:
+        tokens = self._generated_tokens(input_ids)
+        if len(tokens) < self.min_generated_tokens:
+            return False
+        if self._has_repeated_ngram(tokens):
+            if not self._triggered:
+                print("Early stop: repeated n-gram loop detected.", flush=True)
+                self._triggered = True
+            return True
+        return False
+
+
+def build_repetition_stopping_criteria(
+    args: argparse.Namespace,
+    tokenizer,
+    prompt_length: int,
+) -> Optional[StoppingCriteriaList]:
+    if args.disable_repetition_stop:
+        return None
+    criteria = RepetitionStoppingCriteria(
+        tokenizer=tokenizer,
+        prompt_length=prompt_length,
+        window_size=args.repetition_stop_window,
+        max_ngram=args.repetition_stop_ngram_max,
+        repeat_threshold=args.repetition_stop_repeats,
+        min_generated_tokens=args.repetition_stop_min_tokens,
+    )
+    return StoppingCriteriaList([criteria])
+
+
 def _extract_sequences_from_generate_output(output: Any) -> torch.Tensor:
     """Normalize different generate outputs to a sequences tensor."""
     if hasattr(output, "sequences"):
@@ -523,7 +596,7 @@ def collect_topk_token_probabilities(
         return None
 
     if logits is None:
-        print("INFO: Model output did not include logits; skipping top-k logging.")
+        # print("INFO: Model output did not include logits; skipping top-k logging.")
         return None
 
     # if logits.size(1) < generated_length:
@@ -658,6 +731,7 @@ def generate_turn(
     image_tensor: torch.Tensor,
     image_size: Tuple[int, int],
     base_gen_kwargs: dict,
+    args: argparse.Namespace,
     include_image_token: bool,
     stream_printer: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, Optional[torch.Tensor], int]:
@@ -691,6 +765,9 @@ def generate_turn(
     gen_kwargs["output_scores"] = True
 
     prompt_token_length = input_ids.shape[1]
+    stopping_criteria = build_repetition_stopping_criteria(args, tokenizer, prompt_token_length)
+    if stopping_criteria is not None:
+        gen_kwargs["stopping_criteria"] = stopping_criteria
 
     if stream_printer:
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
@@ -871,6 +948,7 @@ def main() -> None:
             image_tensor,
             image_size,
             base_gen_kwargs,
+            args,
             include_image_token=True,
             stream_printer=stream_printer,
         )
@@ -884,6 +962,7 @@ def main() -> None:
             image_tensor,
             image_size,
             base_gen_kwargs,
+            args,
             include_image_token=True,
         )
         print(response)
@@ -916,6 +995,7 @@ def main() -> None:
                     image_tensor,
                     image_size,
                     base_gen_kwargs,
+                    args,
                     include_image_token=False,
                     stream_printer=stream_printer,
                 )
@@ -929,6 +1009,7 @@ def main() -> None:
                     image_tensor,
                     image_size,
                     base_gen_kwargs,
+                    args,
                     include_image_token=False,
                 )
                 print("\nAssistant>")
