@@ -2,9 +2,9 @@ import json
 import uuid
 import os
 import hashlib # Added for SHA256 hashing
+import argparse
 from pathlib import Path
 import pandas as pd
-import os
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
@@ -20,14 +20,14 @@ from gazefollow.generation_utils import fix_wsl_paths
 # Data base: /mnt/d/Projects/data/gazefollow/
 
 
-COMBINED_CSV_PATH = r"gazefollow/data/test2_combined_description_results.csv"
+COMBINED_CSV_PATH = r"gazefollow/data/combined_source_extract_patchscope_valid_20260204.csv"
 # COMBINED_CSV_PATH = r"/mnt/d/Projects/data/gazefollow/results/valid_runs/combined_ppl_desc_results.csv"
 COMBINED_CSV_PATH = fix_wsl_paths(COMBINED_CSV_PATH)
 OUTSIDE_FRAME_TARGET_DESCRIPTION = "something or someone outside the frame"
-MIN_IOU_THRESHOLD_SOURCE = 0.2
-MAX_L2_THRESHOLD_SOURCE = 0.16
-MIN_IOU_THRESHOLD_TARGET = 0.0
-MAX_L2_THRESHOLD_TARGET = 0.12
+DEFAULT_MIN_IOU_THRESHOLD_SOURCE = 0.2
+DEFAULT_MAX_L2_THRESHOLD_SOURCE = 0.16
+DEFAULT_MIN_IOU_THRESHOLD_TARGET = 0.0
+DEFAULT_MAX_L2_THRESHOLD_TARGET = 0.12
 
 test_set = 'test' in COMBINED_CSV_PATH.lower()
 # Create output directory with timestamp
@@ -42,6 +42,324 @@ IMAGE_BASE_PREFIX = "train/" if not test_set else "test2/"  # Using escaped back
 # Configuration for periodic saving
 SAVE_INTERVAL = 30000  # Save every N processed items
 TEMP_SAVE_PREFIX = "sgl_conversation_data_temp"
+
+def _build_error_frame(df, l2_col, iou_col, mask=None):
+    errors = df[[l2_col, iou_col]].copy()
+    if mask is not None:
+        errors = errors[mask]
+    errors = errors.dropna()
+    errors = errors[np.isfinite(errors[l2_col]) & np.isfinite(errors[iou_col])]
+    return errors
+
+
+def _source_error_filter_mask_patchscope(df):
+    mask = pd.Series([0] * len(df), index=df.index, dtype=bool)
+    if "source_description" in df.columns and "steered_source_description" in df.columns:
+        mask |= df["source_description"] == df["steered_source_description"]
+    if "patchscope_source_description" in df.columns:
+        mask |= df["patchscope_source_description"].apply(lambda x: isinstance(x, str))
+    return mask
+
+
+def _source_error_filter_mask(df, eligibility="metrics"):
+    if eligibility == "patchscope":
+        return _source_error_filter_mask_patchscope(df)
+    has_metrics = all(
+        col in df.columns
+        for col in (
+            "source_grounding_normalized_l2_error",
+            "source_grounding_bbox_iou",
+        )
+    )
+    if not has_metrics:
+        return _source_error_filter_mask_patchscope(df)
+    l2 = df["source_grounding_normalized_l2_error"]
+    iou = df["source_grounding_bbox_iou"]
+    mask = l2.notna() & iou.notna()
+    mask &= np.isfinite(l2) & np.isfinite(iou)
+    return mask
+
+
+def _compute_histogram(values, bins):
+    counts, edges = np.histogram(values, bins=bins)
+    return counts, edges
+
+
+def _print_histogram(name, values, bins):
+    counts, edges = _compute_histogram(values, bins)
+    print(f"\n{name} histogram (n={len(values)}, bins={bins}):")
+    for idx, count in enumerate(counts):
+        left = edges[idx]
+        right = edges[idx + 1]
+        print(f"  {left:.4f} - {right:.4f}: {count}")
+
+
+def _percentile_threshold(values, tail_percentile, upper_tail=True):
+    q = 1.0 - tail_percentile / 100.0 if upper_tail else tail_percentile / 100.0
+    return float(np.quantile(values, q))
+
+
+def _knee_threshold(values, prefer_upper=True):
+    if len(values) < 3:
+        if not len(values):
+            return float("nan")
+        return float(np.max(values) if prefer_upper else np.min(values))
+    sorted_vals = np.sort(values)
+    min_val = float(sorted_vals[0])
+    max_val = float(sorted_vals[-1])
+    if max_val - min_val == 0:
+        return max_val
+    x = np.linspace(0.0, 1.0, len(sorted_vals))
+    y = (sorted_vals - min_val) / (max_val - min_val)
+    diff = y - x
+    idx_max = int(np.argmax(diff))
+    idx_min = int(np.argmin(diff))
+    if prefer_upper:
+        knee_idx = idx_max if sorted_vals[idx_max] >= sorted_vals[idx_min] else idx_min
+    else:
+        knee_idx = idx_max if sorted_vals[idx_max] <= sorted_vals[idx_min] else idx_min
+    return float(sorted_vals[knee_idx])
+
+
+def _summarize_threshold_impact(label, errors, l2_col, iou_col, l2_threshold, iou_threshold):
+    total = len(errors)
+    if total == 0:
+        print(f"{label}: no valid samples for threshold preview.")
+        return
+    kept_mask = (errors[l2_col] <= l2_threshold) & (errors[iou_col] >= iou_threshold)
+    kept = errors[kept_mask]
+    dropped = total - len(kept)
+    dropped_pct = 100.0 * dropped / total
+    kept_l2_mean = kept[l2_col].mean() if len(kept) else float("nan")
+    kept_iou_mean = kept[iou_col].mean() if len(kept) else float("nan")
+    print(
+        f"{label}: total={total}, dropped={dropped} ({dropped_pct:.2f}%), "
+        f"kept_mean_l2={kept_l2_mean:.4f}, kept_mean_iou={kept_iou_mean:.4f}"
+    )
+
+
+def _prompt_tail_percentile(default_tail_percentile):
+    while True:
+        value = input(
+            f"Enter tail percentile cutoff (0-50, current {default_tail_percentile}%): "
+        ).strip()
+        if not value:
+            return default_tail_percentile
+        try:
+            parsed = float(value)
+        except ValueError:
+            print("Please enter a numeric percentile.")
+            continue
+        if 0.0 < parsed < 50.0:
+            return parsed
+        print("Percentile must be between 0 and 50.")
+
+
+def _select_thresholds_interactively(
+    combined_df,
+    tail_percentile,
+    histogram_bins,
+    threshold_method="percentile",
+    source_eligibility="metrics",
+):
+    has_source_metrics = all(
+        col in combined_df.columns
+        for col in (
+            "source_grounding_normalized_l2_error",
+            "source_grounding_bbox_iou",
+        )
+    )
+    if not has_source_metrics:
+        print("Source grounding metrics not found; using default thresholds.")
+        return (
+            DEFAULT_MIN_IOU_THRESHOLD_SOURCE,
+            DEFAULT_MAX_L2_THRESHOLD_SOURCE,
+            DEFAULT_MIN_IOU_THRESHOLD_TARGET,
+            DEFAULT_MAX_L2_THRESHOLD_TARGET,
+        )
+    fallback_mask = pd.Series([1] * len(combined_df), index=combined_df.index)
+    source_mask = _source_error_filter_mask(combined_df, source_eligibility)
+    source_errors = _build_error_frame(
+        combined_df,
+        "source_grounding_normalized_l2_error",
+        "source_grounding_bbox_iou",
+        mask=source_mask,
+    )
+    has_target_metrics = all(
+        col in combined_df.columns
+        for col in (
+            "target_grounding_normalized_l2_error",
+            "target_grounding_bbox_iou",
+        )
+    )
+    target_errors = None
+    if has_target_metrics:
+        target_mask = combined_df.get("in_or_out", fallback_mask) == 1
+        target_errors = _build_error_frame(
+            combined_df,
+            "target_grounding_normalized_l2_error",
+            "target_grounding_bbox_iou",
+            mask=target_mask,
+        )
+
+    if source_errors.empty or (has_target_metrics and target_errors is not None and target_errors.empty):
+        print("Not enough error samples to auto-select thresholds; using defaults.")
+        return (
+            DEFAULT_MIN_IOU_THRESHOLD_SOURCE,
+            DEFAULT_MAX_L2_THRESHOLD_SOURCE,
+            DEFAULT_MIN_IOU_THRESHOLD_TARGET,
+            DEFAULT_MAX_L2_THRESHOLD_TARGET,
+        )
+
+    _print_histogram(
+        "Source L2 error",
+        source_errors["source_grounding_normalized_l2_error"].values,
+        histogram_bins,
+    )
+    _print_histogram(
+        "Source IOU error",
+        source_errors["source_grounding_bbox_iou"].values,
+        histogram_bins,
+    )
+    if has_target_metrics and target_errors is not None:
+        _print_histogram(
+            "Target L2 error (in-frame)",
+            target_errors["target_grounding_normalized_l2_error"].values,
+            histogram_bins,
+        )
+        _print_histogram(
+            "Target IOU error (in-frame)",
+            target_errors["target_grounding_bbox_iou"].values,
+            histogram_bins,
+        )
+    else:
+        print("\nTarget grounding metrics not found; skipping target histograms.")
+
+    current_tail = tail_percentile
+    current_method = threshold_method
+    while True:
+        if current_method == "knee":
+            source_l2_threshold = _knee_threshold(
+                source_errors["source_grounding_normalized_l2_error"].values
+            )
+            source_iou_threshold = 1.0 - _knee_threshold(
+                1.0 - source_errors["source_grounding_bbox_iou"].values
+            )
+            if has_target_metrics and target_errors is not None:
+                target_l2_threshold = _knee_threshold(
+                    target_errors["target_grounding_normalized_l2_error"].values
+                )
+                target_iou_threshold = 1.0 - _knee_threshold(
+                    1.0 - target_errors["target_grounding_bbox_iou"].values
+                )
+            else:
+                target_l2_threshold = DEFAULT_MAX_L2_THRESHOLD_TARGET
+                target_iou_threshold = DEFAULT_MIN_IOU_THRESHOLD_TARGET
+        else:
+            source_l2_threshold = _percentile_threshold(
+                source_errors["source_grounding_normalized_l2_error"].values,
+                current_tail,
+                upper_tail=True,
+            )
+            source_iou_threshold = _percentile_threshold(
+                source_errors["source_grounding_bbox_iou"].values,
+                current_tail,
+                upper_tail=False,
+            )
+            if has_target_metrics and target_errors is not None:
+                target_l2_threshold = _percentile_threshold(
+                    target_errors["target_grounding_normalized_l2_error"].values,
+                    current_tail,
+                    upper_tail=True,
+                )
+                target_iou_threshold = _percentile_threshold(
+                    target_errors["target_grounding_bbox_iou"].values,
+                    current_tail,
+                    upper_tail=False,
+                )
+            else:
+                target_l2_threshold = DEFAULT_MAX_L2_THRESHOLD_TARGET
+                target_iou_threshold = DEFAULT_MIN_IOU_THRESHOLD_TARGET
+
+        print("\n--- Auto-threshold Preview ---")
+        if current_method == "knee":
+            print("Method: knee detection")
+        else:
+            print(f"Method: percentile (tail={current_tail}%)")
+        print(
+            f"Source thresholds: max_l2 <= {source_l2_threshold:.4f}, "
+            f"min_iou >= {source_iou_threshold:.4f}"
+        )
+        _summarize_threshold_impact(
+            "Source preview",
+            source_errors,
+            "source_grounding_normalized_l2_error",
+            "source_grounding_bbox_iou",
+            source_l2_threshold,
+            source_iou_threshold,
+        )
+        if has_target_metrics and target_errors is not None:
+            print(
+                f"Target thresholds: max_l2 <= {target_l2_threshold:.4f}, "
+                f"min_iou >= {target_iou_threshold:.4f}"
+            )
+            _summarize_threshold_impact(
+                "Target preview (in-frame)",
+                target_errors,
+                "target_grounding_normalized_l2_error",
+                "target_grounding_bbox_iou",
+                target_l2_threshold,
+                target_iou_threshold,
+            )
+        else:
+            print("Target thresholds: skipping preview (metrics unavailable).")
+
+        accept = input("Accept these thresholds? (y/n): ").strip().lower()
+        if accept == "y":
+            return (
+                source_iou_threshold,
+                source_l2_threshold,
+                target_iou_threshold,
+                target_l2_threshold,
+            )
+        current_tail = _prompt_tail_percentile(current_tail)
+        current_method = "percentile"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Create SGL conversations with optional auto-thresholding."
+    )
+    parser.add_argument(
+        "--auto-threshold",
+        action="store_true",
+        help="Auto-select L2/IOU thresholds from error histograms.",
+    )
+    parser.add_argument(
+        "--tail-percentile",
+        type=float,
+        default=2.0,
+        help="Tail percentile to drop for L2 (upper) and IOU (lower) errors.",
+    )
+    parser.add_argument(
+        "--threshold-method",
+        choices=("percentile", "knee"),
+        default="percentile",
+        help="Method to select thresholds when auto-thresholding.",
+    )
+    parser.add_argument(
+        "--source-eligibility",
+        choices=("metrics", "patchscope"),
+        default="metrics",
+        help="Which rows are eligible for source error filtering.",
+    )
+    parser.add_argument(
+        "--histogram-bins",
+        type=int,
+        default=40,
+        help="Number of bins to use for histograms when auto-thresholding.",
+    )
+    return parser.parse_args()
 
 def load_json_data(file_path):
     """Loads data from a JSON file."""
@@ -120,7 +438,17 @@ def find_latest_temp_save():
     
     return latest_file, latest_count
 
-def create_conversational_data():
+def create_conversational_data(
+    min_iou_threshold_source=DEFAULT_MIN_IOU_THRESHOLD_SOURCE,
+    max_l2_threshold_source=DEFAULT_MAX_L2_THRESHOLD_SOURCE,
+    min_iou_threshold_target=DEFAULT_MIN_IOU_THRESHOLD_TARGET,
+    max_l2_threshold_target=DEFAULT_MAX_L2_THRESHOLD_TARGET,
+    auto_threshold=False,
+    tail_percentile=2.0,
+    threshold_method="percentile",
+    source_eligibility="metrics",
+    histogram_bins=40,
+):
     """
     Generates conversational data from subject and target files
     and saves it to a single JSON file.
@@ -130,6 +458,55 @@ def create_conversational_data():
     if combined_df is None:
         print("Failed to load input data. Exiting.")
         return
+    has_target_metrics = all(
+        col in combined_df.columns
+        for col in (
+            "target_grounding_normalized_l2_error",
+            "target_grounding_bbox_iou",
+        )
+    )
+    has_source_metrics = all(
+        col in combined_df.columns
+        for col in (
+            "source_grounding_normalized_l2_error",
+            "source_grounding_bbox_iou",
+        )
+    )
+    if has_source_metrics:
+        source_filter_mask = _source_error_filter_mask(combined_df, source_eligibility)
+    else:
+        source_filter_mask = pd.Series(
+            [False] * len(combined_df), index=combined_df.index, dtype=bool
+        )
+    source_filter_eligible = int(source_filter_mask.sum())
+
+    if auto_threshold:
+        (
+            min_iou_threshold_source,
+            max_l2_threshold_source,
+            min_iou_threshold_target,
+            max_l2_threshold_target,
+        ) = _select_thresholds_interactively(
+            combined_df,
+            tail_percentile,
+            histogram_bins,
+            threshold_method,
+            source_eligibility,
+        )
+
+    print(
+        "Using thresholds: "
+        f"source_max_l2={max_l2_threshold_source:.4f}, "
+        f"source_min_iou={min_iou_threshold_source:.4f}, "
+        f"target_max_l2={max_l2_threshold_target:.4f}, "
+        f"target_min_iou={min_iou_threshold_target:.4f}"
+    )
+    print(f"Source eligibility mode: {source_eligibility}")
+    print(f"Source error filter eligible rows: {source_filter_eligible}")
+    if not has_source_metrics:
+        print("Source grounding metrics not found; source error filtering will be skipped.")
+    if not has_target_metrics:
+        print("Target grounding metrics not found; target error filtering will be skipped.")
 
     # Check for existing temp files to resume from
     latest_temp_file, resumed_count = find_latest_temp_save()
@@ -177,24 +554,20 @@ def create_conversational_data():
         # Skip items if resuming from a checkpoint
         if current_index <= items_to_skip:
             continue
-            
+        
+        eligible_for_source_filter = bool(source_filter_mask.iloc[current_index - 1])
         image_key = str(image_key).zfill(8)  # Ensure image_key is zero-padded to 8 digits
         # image_key is like "train/00000041/00041904.jpg"
-        if row['source_description'] == row['steered_source_description']:
-            # if both descriptions are the same, means this was injected by the newly modified patchscope method and we need to validate the l2 and iou
-            if row['source_grounding_bbox_iou'] < MIN_IOU_THRESHOLD_SOURCE or row['source_grounding_normalized_l2_error'] > MAX_L2_THRESHOLD_SOURCE:
+        if eligible_for_source_filter:
+            if row['source_grounding_bbox_iou'] < min_iou_threshold_source or row['source_grounding_normalized_l2_error'] > max_l2_threshold_source:
                 skipped_due_to_large_source_error += 1
                 continue
 
         # subject_entry is like {"caption": "hairdresser", ...}
         patchscope_subject_entry = row.get("patchscope_source_description", None)
         if patchscope_subject_entry is not None and isinstance(patchscope_subject_entry, str):
-            if row['source_grounding_normalized_l2_error'] < MAX_L2_THRESHOLD_SOURCE and row['source_grounding_bbox_iou'] > MIN_IOU_THRESHOLD_SOURCE:
             # use the patchscope extracted subject description if available
-                subject_entry = patchscope_subject_entry
-            else:
-                skipped_due_to_large_source_error += 1
-                continue
+            subject_entry = patchscope_subject_entry
         else:
             subject_entry = row["source_description"]       # prefer the person description extracted from the baseline run with no steering [more elaborate]
         # fallback to the steered description if the baseline one is missing or NaN
@@ -208,12 +581,15 @@ def create_conversational_data():
 
         patchscope_target_entry = row.get("patchscope_target_description", None)
         if patchscope_target_entry is not None and isinstance(patchscope_target_entry, str):
-            if row['target_grounding_normalized_l2_error'] < MAX_L2_THRESHOLD_TARGET and row['target_grounding_bbox_iou'] > MIN_IOU_THRESHOLD_TARGET:
-                # use the patchscope extracted target description if available
+            if has_target_metrics:
+                if row['target_grounding_normalized_l2_error'] < max_l2_threshold_target and row['target_grounding_bbox_iou'] > min_iou_threshold_target:
+                    # use the patchscope extracted target description if available
+                    target_entry = patchscope_target_entry
+                elif row['in_or_out'] == 1:
+                    skipped_due_to_large_target_error += 1
+                    continue
+            else:
                 target_entry = patchscope_target_entry
-            elif row['in_or_out'] == 1:
-                skipped_due_to_large_target_error += 1
-                continue
         else:
             target_entry = row["steered_target_description"]    # prefer the steered target description
         # fallback to the original target description if the steered one is missing or NaN
@@ -349,6 +725,7 @@ def create_conversational_data():
     print(f"Skipped (target value was simple string or unexpected format): {skipped_due_to_target_format}")
     print(f"Skipped (large source grounding error): {skipped_due_to_large_source_error}")
     print(f"Skipped (large target grounding error): {skipped_due_to_large_target_error}")
+    print(f"Source error filter eligible rows: {source_filter_eligible}")
 
     # Final save
     if save_progress(output_data, processed_image_paths, is_final=True):
@@ -357,4 +734,11 @@ def create_conversational_data():
 
 
 if __name__ == "__main__":
-    create_conversational_data() 
+    args = parse_args()
+    create_conversational_data(
+        auto_threshold=args.auto_threshold,
+        tail_percentile=args.tail_percentile,
+        threshold_method=args.threshold_method,
+        source_eligibility=args.source_eligibility,
+        histogram_bins=args.histogram_bins,
+    )
