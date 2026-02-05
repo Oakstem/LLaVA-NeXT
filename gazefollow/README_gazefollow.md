@@ -48,10 +48,15 @@ We're using 2 metrics to define the error:
 
 %% Conversation dataset preparing
 1. `build_json_ds.py` - combines both the 'baseline' llava run with full descriptions (using only people description here) and the steered attention llava results, saves the result to `combined_description_results.csv`  
-2. `create_sgl_conversations.py` - builds a conversation json dataset from the results, prefers original llava person descriptions and adds the generated target descriptions
+2. `create_sgl_conversations.py` - builds a conversation json dataset from the results, prefers original llava person descriptions and adds the generated target descriptions. the script also has a functionality to auto set the threshold based on percentiles / knee - elbow of histogram. 
 3. `fix_duplicated_words.py` - fixing and filtering the resulted json by removing duplicate words, ('the the'), 'man1/man2' words etc. Also filtering images with less than set threshold of people.
 4. `split_dataset.py` - split the resulted json to train and val. 
 
 
 ## Running the train script
 `cd /mnt/d/Projects/LLaVA-NeXT && export PYTHONPATH="${PYTHONPATH}:/mnt/d/Projects/LLaVA-NeXT" && ~/llava/bin/python llava/train/train.py   --model_name_or_path "lmms-lab/llava-onevision-qwen2-7b-ov-chat"   --data_path "/mnt/d/Projects/data/gazefollow/results/valid_runs/sgl_conversation_data.json"   --output_dir "/mnt/d/Projects/LLaVA-NeXT/training_outputs"   --lora_enable True   --lora_r 4   --lora_alpha 16   --lora_target_modules "lm_head"   --num_train_epochs 1   --per_device_train_batch_size 1   --save_steps 100   --logging_steps 10 --image_folder "/mnt/d/Projects/data/gazefollow"`
+
+## NEW DATA PROCESSING PIPELINE 3.02.26
+1. execute `process_inject_and_ground_queue.py` (run_process_inject_and_ground_queue.slurm) for person(source) / object(target) separately. 
+2. run `gazefollow/data_prep/create_sgl_conversations.py` to generate conversational files, this script also filters descriptions with too large distance from GT
+3. `gazefollow/data_proc/convert_localization_results_to_conversations.py`
