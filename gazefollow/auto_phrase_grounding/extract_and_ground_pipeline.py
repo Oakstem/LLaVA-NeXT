@@ -71,7 +71,7 @@ DEFAULT_QUERY_TEMPLATE = (
 @dataclass(frozen=True)
 class ImageTask:
     image_path: Path
-    mask_path: Path
+    mask_path: Optional[Path]
     image_id: str
 
 
@@ -139,7 +139,8 @@ def _resolve_mask_path(
     mask_dir: Optional[Path],
     mask_template: str,
     fallback_template: Optional[str],
-) -> Path:
+    require_mask: bool,
+) -> Optional[Path]:
     if explicit_mask:
         resolved = _normalize_path(explicit_mask)
         if resolved and resolved.exists():
@@ -147,7 +148,10 @@ def _resolve_mask_path(
         raise FileNotFoundError(f"Mask path not found: {explicit_mask}")
 
     if mask_dir is None:
-        raise ValueError("Mask directory is required when mask_path is not provided.")
+        if require_mask:
+            raise ValueError("Mask directory is required when mask_path is not provided.")
+        print(f"  Warning: no mask_dir available for {image_path.name}; continuing without mask.")
+        return None
 
     candidates: List[Tuple[str, Path]] = []
     mask_dir = mask_dir.expanduser()
@@ -161,10 +165,14 @@ def _resolve_mask_path(
         if candidate.exists():
             return candidate
 
-    raise FileNotFoundError(
+    message = (
         f"Could not locate mask for {image_path.name} using templates "
         f"{', '.join(template for template, _ in candidates)} in {mask_dir}"
     )
+    if require_mask:
+        raise FileNotFoundError(message)
+    print(f"  Warning: {message}; continuing without mask.")
+    return None
 
 
 def load_image_tasks(
@@ -178,6 +186,7 @@ def load_image_tasks(
     fallback_mask_template: Optional[str],
     limit: Optional[int],
     image_id: Optional[str],
+    require_mask: bool,
 ) -> List[ImageTask]:
     tasks: List[ImageTask] = []
     mask_base = mask_dir or DEFAULT_MASK_DIR
@@ -194,6 +203,7 @@ def load_image_tasks(
             mask_base,
             mask_template,
             fallback_mask_template,
+            require_mask,
         )
         derived_id = image_id or img_path.stem
         tasks.append(ImageTask(img_path, resolved_mask, derived_id))
@@ -221,6 +231,7 @@ def load_image_tasks(
             mask_base,
             mask_template,
             fallback_mask_template,
+            require_mask,
         )
         tasks.append(ImageTask(img_path, resolved_mask, entry_id or img_path.stem))
         if limit and len(tasks) >= limit:
@@ -247,8 +258,10 @@ def _bbox_from_binary_mask(mask_array: Optional[np.ndarray]) -> Optional[List[fl
     return [float(x_min), float(y_min), float(x_max + 1), float(y_max + 1)]
 
 
-def load_person_bbox_from_masks(mask_path: Path, image_size: Tuple[int, int]) -> Optional[List[float]]:
+def load_person_bbox_from_masks(mask_path: Optional[Path], image_size: Tuple[int, int]) -> Optional[List[float]]:
     candidates: List[Path] = []
+    if mask_path is None:
+        return None
     mask_path = Path(mask_path)
     person_name = mask_path.name.replace("gaze__", "person__")
     if person_name != mask_path.name:
@@ -290,12 +303,14 @@ def compute_bbox_iou(box_a: Optional[Sequence[float]], box_b: Optional[Sequence[
 def annotate_grounding_metrics(
     detections: List[Dict[str, Any]],
     image_path: Path,
-    mask_path: Path,
+    mask_path: Optional[Path],
     person_mask_bbox: Optional[Sequence[float]],
 ) -> Optional[Dict[str, Any]]:
     """
     Attach gaze error metrics (L2/IoU) to each detection using the person mask bounding box.
     """
+    if mask_path is None and not person_mask_bbox:
+        return None
     with Image.open(image_path) as img:
         width, height = img.size
 
@@ -471,6 +486,8 @@ def capture_initial_repr_state(
     image_output_dir: Path,
     attention_mask_viz_dir: Optional[Union[str, Path, bool]],
     person_bbox_scale: float,
+    use_gaze_guidance: bool,
+    use_gt_gaze_csv: bool,
 ) -> Optional[Any]:
     """
     Run a short initial pass to cache the representation tensors that will be injected in the real pass.
@@ -486,7 +503,7 @@ def capture_initial_repr_state(
     print(f"  Capturing representation tokens for {task.image_id} prior to main generation run...")
     cache_results = run_generation_with_attention(
         image_path=str(task.image_path),
-        mask_path=str(task.mask_path),
+        mask_path=task.mask_path,
         prompt="",
         output_dir=str(cache_output_dir),
         model=model,
@@ -497,10 +514,10 @@ def capture_initial_repr_state(
         bias_strength=cache_generation_config.get("bias_strength", 0.0),
         prev_run_last_hidden_state=None,
         break_after_first_step=True,
-        use_gaze_guidance=args.use_gaze_guidance,
+        use_gaze_guidance=use_gaze_guidance,
         guidance_config=guidance_config,
         save_debug_files=args.save_debug_files,
-        use_gt_gaze_csv=args.use_gt_gaze_csv,
+        use_gt_gaze_csv=use_gt_gaze_csv,
         gt_gaze_csv_path=args.gt_gaze_csv_path,
         gt_gaze_mask_radius=args.gt_gaze_mask_radius,
         gt_gaze_mask_radius_ratio=args.gt_gaze_mask_radius_ratio,
@@ -538,6 +555,8 @@ def process_image_task(
 ) -> Dict[str, Any]:
     image_output_dir = llava_output_dir / task.image_id
     image_output_dir.mkdir(parents=True, exist_ok=True)
+    use_gaze_guidance = args.use_gaze_guidance
+    use_gt_gaze_csv = True if task.mask_path is None else args.use_gt_gaze_csv
     effective_person_bbox_scale = float(
         person_bbox_scale if person_bbox_scale is not None else getattr(args, "person_bbox_scale", 1.0) or 1.0
     )
@@ -553,10 +572,12 @@ def process_image_task(
         image_output_dir=image_output_dir,
         attention_mask_viz_dir=attention_mask_viz_dir,
         person_bbox_scale=effective_person_bbox_scale,
+        use_gaze_guidance=use_gaze_guidance,
+        use_gt_gaze_csv=use_gt_gaze_csv,
     )
     description_results = run_generation_with_attention(
         image_path=str(task.image_path),
-        mask_path=str(task.mask_path),
+        mask_path=task.mask_path,
         prompt=args.prompt,
         output_dir=str(image_output_dir),
         model=model,
@@ -566,10 +587,10 @@ def process_image_task(
         attention_config=attention_config,
         bias_strength=generation_config.get("bias_strength", 0.0),
         prev_run_last_hidden_state=prev_hidden_state,
-        use_gaze_guidance=args.use_gaze_guidance,
+        use_gaze_guidance=use_gaze_guidance,
         guidance_config=guidance_config,
         save_debug_files=args.save_debug_files,
-        use_gt_gaze_csv=args.use_gt_gaze_csv,
+        use_gt_gaze_csv=use_gt_gaze_csv,
         gt_gaze_csv_path=args.gt_gaze_csv_path,
         gt_gaze_mask_radius=args.gt_gaze_mask_radius,
         gt_gaze_mask_radius_ratio=args.gt_gaze_mask_radius_ratio,
@@ -692,7 +713,7 @@ def process_image_task(
     result_payload = {
         "image_id": task.image_id,
         "image_path": str(task.image_path),
-        "mask_path": str(task.mask_path),
+        "mask_path": str(task.mask_path) if task.mask_path else None,
         "person_description": description_summary,
         "grounding": {
             "query": query_description,
@@ -852,6 +873,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-id", help="Override identifier for the single image.")
     parser.add_argument("--image-list", help="Path to a JSON/JSONL/txt list of images for list mode.")
     parser.add_argument("--list-limit", type=int, default=None, help="Optional cap on entries from --image-list.")
+    parser.add_argument(
+        "--require-mask",
+        action="store_true",
+        help="Fail if a mask cannot be resolved for an image.",
+    )
 
     parser.add_argument(
         "--mask-dir",
@@ -994,6 +1020,7 @@ def main() -> None:
         fallback_mask_template=args.mask_fallback_template,
         limit=args.list_limit,
         image_id=args.image_id,
+        require_mask=args.require_mask,
     )
 
     if args.use_target_insert_for_source:

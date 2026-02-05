@@ -190,7 +190,7 @@ def create_person_mask_similarity_overlay(
 # Main Generation Function with Attention Extraction
 def run_generation_with_attention(
     image_path: Union[str, Path],
-    mask_path: Union[str, Path],
+    mask_path: Optional[Union[str, Path]],
     prompt: str,
     output_dir: Union[str, Path],
     model: "PreTrainedModel",
@@ -253,7 +253,7 @@ def run_generation_with_attention(
     """
     # Prepare configurations and paths
     gen_config, attn_config = _prepare_configs(generation_config, attention_config)
-    mask_path = fix_wsl_paths(str(mask_path))
+    mask_path = fix_wsl_paths(str(mask_path)) if mask_path is not None else None
     image_path = fix_wsl_paths(str(image_path))
 
     print(f"Processing image: {image_path}")

@@ -1211,17 +1211,19 @@ def token_indices_to_image_coordinates(
     return results
 
 def get_attention_indices_from_mask(
-    mask: np.ndarray, 
-    image_size: Tuple[int, int], 
+    mask: Optional[np.ndarray],
+    image_size: Tuple[int, int],
     model_config: Any,
     original_img_shape: Tuple[int, int],
     patched_final_dim: Tuple[int, int],
     patch_boxes: List[List[int]],
     patched_resized_before_pad_dim: Tuple[int, int],
     vision_tower: Any,
-    apply_for_anyres_patches: bool = True
-) -> Tuple[List[int], np.ndarray]:
+    apply_for_anyres_patches: bool = True,
+) -> Tuple[List[int], Optional[np.ndarray]]:
     """Convert mask pixels to token indices."""
+    if mask is None:
+        return [], None
     if len(mask.shape)>1 and mask.shape[1] == 2:
         # new mask format, we get the coordinates directly, the <x, y> pairs
         mask_coords = mask.reshape(-1, 2)
@@ -1655,7 +1657,7 @@ def _setup_output_directories(output_dir: Union[str, Path]) -> Tuple[Path, Path,
     return output_dir, vis_output_dir_raw, vis_output_dir_processed, tensor_output_dir, collage_output_dir, similarity_output_dir
 
 def _find_gt_annotation_entry(
-    mask_path: Union[str, Path],
+    mask_path: Optional[Union[str, Path]],
     image_path: Union[str, Path],
     csv_path: Optional[Path],
     use_body_bbox: bool = False,
@@ -1691,7 +1693,7 @@ def _find_gt_annotation_entry(
 
 def _prepare_inputs(
     image_path: Union[str, Path],
-    mask_path: Union[str, Path],
+    mask_path: Optional[Union[str, Path]],
     prompt: str,
     image_processor: SigLipImageProcessor,
     tokenizer: PreTrainedTokenizer,
@@ -1718,7 +1720,7 @@ def _prepare_inputs(
     if use_gt_gaze_csv:
         csv_path = Path(gt_gaze_csv_path) if gt_gaze_csv_path else DEFAULT_GT_GAZE_CSV
 
-    should_apply_gt_overrides = bool(csv_path and "gaze__" in Path(str(mask_path)).name)
+    should_apply_gt_overrides = bool(csv_path)
 
     # Load image and mask
     image = load_image(image_path)
@@ -1750,15 +1752,17 @@ def _prepare_inputs(
         print(f"Using GT gaze mask from CSV (key='{lookup_key}') at pixel {pixel_coord}")
 
     if should_apply_gt_overrides and not gt_mask_used:
+        if mask_path is None:
+            raise ValueError(f"GT gaze entry not found for {image_path} and no mask_path was provided.")
         print(f"⚠️ Warning: GT gaze entry not found for {image_path}; falling back to mask file {mask_path}")
 
-    if not gt_mask_used:
+    if not gt_mask_used and mask_path is not None:
         mask = load_mask_from_file(mask_path)
 
     if mask is not None:
         target_mask_raw = np.copy(mask)
 
-    person_mask_path = str(mask_path).replace("gaze__", "person__")
+    person_mask_path = str(mask_path).replace("gaze__", "person__") if mask_path is not None else None
     person_mask_from_gt = False
     person_mask_raw: Optional[np.ndarray] = None
     if gt_annotation_entry:
@@ -1795,9 +1799,12 @@ def _prepare_inputs(
             lookup_key = matched_lookup_key or "unknown"
             print(f"Using GT person mask from CSV (key='{lookup_key}', source='{bbox_source}') with bbox {bbox}")
     elif should_apply_gt_overrides:
-        print(f"⚠️ Warning: GT person entry not found for {image_path}; falling back to mask file {person_mask_path}")
+        if person_mask_path:
+            print(f"⚠️ Warning: GT person entry not found for {image_path}; falling back to mask file {person_mask_path}")
+        else:
+            print(f"⚠️ Warning: GT person entry not found for {image_path}; no mask_path available for fallback.")
 
-    if not person_mask_from_gt and Path(person_mask_path).exists():
+    if not person_mask_from_gt and person_mask_path and Path(person_mask_path).exists():
         person_mask = load_mask_from_file(person_mask_path)
 
     if same_mask_for_person:
