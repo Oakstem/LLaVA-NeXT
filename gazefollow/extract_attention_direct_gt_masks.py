@@ -13,6 +13,10 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
+if not hasattr(torch.utils._pytree, "register_pytree_node") and hasattr(
+    torch.utils._pytree, "_register_pytree_node"
+):
+    torch.utils._pytree.register_pytree_node = torch.utils._pytree._register_pytree_node
 from transformers import PreTrainedModel, PreTrainedTokenizer
 # Add project root to sys.path
 try:
