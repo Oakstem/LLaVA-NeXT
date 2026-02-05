@@ -16,7 +16,11 @@ from PIL import Image
 if not hasattr(torch.utils._pytree, "register_pytree_node") and hasattr(
     torch.utils._pytree, "_register_pytree_node"
 ):
-    torch.utils._pytree.register_pytree_node = torch.utils._pytree._register_pytree_node
+    def _compat_register_pytree_node(*args, **kwargs):
+        kwargs.pop("serialized_type_name", None)
+        return torch.utils._pytree._register_pytree_node(*args, **kwargs)
+
+    torch.utils._pytree.register_pytree_node = _compat_register_pytree_node
 from transformers import PreTrainedModel, PreTrainedTokenizer
 # Add project root to sys.path
 try:
