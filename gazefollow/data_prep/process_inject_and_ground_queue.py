@@ -27,7 +27,6 @@ DEFAULT_DATA_ROOT = Path(r"D:\Projects\data\gazefollow")
 DEFAULT_OUTPUT_ROOT = Path("results/steered_generation")
 DEFAULT_THRESHOLD = 0.16
 TARGET_DESCRIPTION = False
-PATCHSCOPE_DESCRIPTION_COLUMN = "patchscope_target_description" if TARGET_DESCRIPTION else "patchscope_source_description"
 DEFAULT_ANNOTATION_FILE = 'gazefollow/data/test_annotations_release.csv'
 
 
@@ -97,7 +96,7 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip rows that already have source grounding metrics populated.",
+        help="Skip rows that already have the selected grounding metrics populated.",
     )
     parser.add_argument(
         "--use-body-bbox",
@@ -109,7 +108,7 @@ def parse_cli_args() -> argparse.Namespace:
         "--use-target-insert-for-source",
         action=argparse.BooleanOptionalAction,
         default=TARGET_DESCRIPTION,
-        help="Use target description insertion for source grounding.",
+        help="Write outputs to target_* columns instead of source_* columns.",
     )
     return parser.parse_args()
 
@@ -271,6 +270,15 @@ def _has_valid_metric(value: Any) -> bool:
     return not pd.isna(value)
 
 
+def _get_insert_columns(use_target_insert_for_source: bool) -> Dict[str, str]:
+    prefix = "target" if use_target_insert_for_source else "source"
+    return {
+        "error": f"{prefix}_grounding_normalized_l2_error",
+        "iou": f"{prefix}_grounding_bbox_iou",
+        "description": f"patchscope_{prefix}_description",
+    }
+
+
 def main() -> None:
     cli_args = parse_cli_args()
     queue_csv = Path(fix_wsl_paths(cli_args.queue_csv)).expanduser() if cli_args.queue_csv is not None else None
@@ -352,6 +360,7 @@ def main() -> None:
 
     output_csv = Path(fix_wsl_paths(cli_args.output_csv)).expanduser() if cli_args.output_csv else queue_csv
     results: List[Dict[str, Any]] = []
+    insert_columns = _get_insert_columns(cli_args.use_target_insert_for_source)
 
     for idx, row in df.iterrows():
         if idx < start_index:
@@ -359,8 +368,8 @@ def main() -> None:
         if idx >= stop_index:
             break
         progress_prefix = f"[{idx - start_index + 1}/{rows_to_process}]"
-        has_iou = _has_valid_metric(row.get("source_grounding_bbox_iou"))
-        has_error = _has_valid_metric(row.get("source_grounding_normalized_l2_error"))
+        has_iou = _has_valid_metric(row.get(insert_columns["iou"]))
+        has_error = _has_valid_metric(row.get(insert_columns["error"]))
         if cli_args.skip_existing and has_iou and has_error:
             skipped_count += 1
             logger.info("%s Row %d already has grounding metrics. Skipping.", progress_prefix, idx)
@@ -441,8 +450,8 @@ def main() -> None:
             skipped_count += 1
             logger.info("%s %s returned no detections. Skipping update.", progress_prefix, task.image_id)
             continue
-        df.at[idx, "source_grounding_normalized_l2_error"] = best_error
-        df.at[idx, "source_grounding_bbox_iou"] = best_iou
+        df.at[idx, insert_columns["error"]] = best_error
+        df.at[idx, insert_columns["iou"]] = best_iou
         grounding_data = payload.get("grounding") or {}
         query_value = grounding_data.get("query")
         if isinstance(query_value, str):
@@ -451,7 +460,7 @@ def main() -> None:
             query_text = ""
         else:
             query_text = str(query_value).strip()
-        df.at[idx, PATCHSCOPE_DESCRIPTION_COLUMN] = query_text
+        df.at[idx, insert_columns["description"]] = query_text
 
         if best_error <= cli_args.threshold:
             # Clear any previous error reason if it mentioned 'person'
