@@ -11,7 +11,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -817,6 +817,133 @@ def summarize_best_detection(payload: Dict[str, Any]) -> Tuple[Optional[float], 
     return best_error, best_iou, best_detection
 
 
+def _error_trigger(error_value: Optional[float], retry_threshold: Optional[float]) -> bool:
+    return retry_threshold is not None and (error_value is None or error_value >= retry_threshold)
+
+
+def _run_step1_initial(
+    *,
+    run_fn: Callable[[argparse.Namespace, Path, Optional[Path], float], Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]]]],
+    args: argparse.Namespace,
+    llava_output_dir: Path,
+    visualization_dir: Optional[Path],
+    base_person_bbox_scale: float,
+) -> Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]], argparse.Namespace, float]:
+    payload, best_error, best_iou, best_detection = run_fn(
+        args,
+        llava_output_dir,
+        visualization_dir,
+        base_person_bbox_scale,
+    )
+    return payload, best_error, best_iou, best_detection, args, base_person_bbox_scale
+
+
+def _run_step2_retry_without_body_bbox(
+    *,
+    run_fn: Callable[[argparse.Namespace, Path, Optional[Path], float], Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]]]],
+    payload: Dict[str, Any],
+    best_error: Optional[float],
+    best_iou: Optional[float],
+    best_detection: Optional[Dict[str, Any]],
+    target_mode: bool,
+    args: argparse.Namespace,
+    llava_output_dir: Path,
+    visualization_dir: Optional[Path],
+    retry_threshold: Optional[float],
+    retry_iou_threshold: Optional[float],
+    retry_use_body_bbox: bool,
+    retry_run_subdir: str,
+    retry_person_bbox_scale: Optional[float],
+    base_person_bbox_scale: float,
+) -> Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]], bool, argparse.Namespace, float]:
+    error_trigger = _error_trigger(best_error, retry_threshold)
+    iou_trigger = retry_iou_threshold is not None and (best_iou is None or best_iou < retry_iou_threshold)
+    should_retry_without_body_bbox = (
+        (not target_mode) and args.use_body_bbox != retry_use_body_bbox and (error_trigger or iou_trigger)
+    )
+    if not should_retry_without_body_bbox:
+        return payload, best_error, best_iou, best_detection, False, args, base_person_bbox_scale
+
+    retry_args = copy.deepcopy(args)
+    retry_args.use_body_bbox = retry_use_body_bbox
+    retry_llava_dir = llava_output_dir / retry_run_subdir if retry_run_subdir else llava_output_dir
+    retry_visualization_dir = (
+        (visualization_dir / retry_run_subdir) if (visualization_dir and retry_run_subdir) else visualization_dir
+    )
+    active_retry_scale = retry_person_bbox_scale if retry_person_bbox_scale is not None else base_person_bbox_scale
+    payload, best_error, best_iou, best_detection = run_fn(
+        retry_args,
+        retry_llava_dir,
+        retry_visualization_dir,
+        active_retry_scale,
+    )
+    return payload, best_error, best_iou, best_detection, True, retry_args, active_retry_scale
+
+
+def _run_step3_scaled_retry(
+    *,
+    run_fn: Callable[[argparse.Namespace, Path, Optional[Path], float], Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]]]],
+    payload: Dict[str, Any],
+    best_error: Optional[float],
+    best_iou: Optional[float],
+    best_detection: Optional[Dict[str, Any]],
+    target_mode: bool,
+    used_retry: bool,
+    active_args: argparse.Namespace,
+    active_person_bbox_scale: float,
+    llava_output_dir: Path,
+    visualization_dir: Optional[Path],
+    retry_threshold: Optional[float],
+    final_retry_person_bbox_scale: Optional[float],
+    final_retry_run_subdir: str,
+    target_retry_radius_ratio_scales: Sequence[float],
+    target_retry_run_subdir: str,
+) -> Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]], bool]:
+    used_scaled_retry = False
+    if target_mode and _error_trigger(best_error, retry_threshold):
+        base_radius_ratio = float(getattr(active_args, "gt_gaze_mask_radius_ratio", 0.05) or 0.05)
+        valid_scales = [float(scale) for scale in target_retry_radius_ratio_scales if 0.0 < float(scale) < 1.0]
+        for scale in valid_scales:
+            scaled_ratio = base_radius_ratio * scale
+            target_retry_args = copy.deepcopy(active_args)
+            target_retry_args.gt_gaze_mask_radius_ratio = scaled_ratio
+            ratio_token = f"{scaled_ratio:.4f}".rstrip("0").rstrip(".").replace(".", "p")
+            run_subdir = f"{target_retry_run_subdir}_{ratio_token}" if target_retry_run_subdir else ""
+            target_llava_dir = llava_output_dir / run_subdir if run_subdir else llava_output_dir
+            target_visualization_dir = (
+                (visualization_dir / run_subdir) if (visualization_dir and run_subdir) else visualization_dir
+            )
+            payload, best_error, best_iou, best_detection = run_fn(
+                target_retry_args,
+                target_llava_dir,
+                target_visualization_dir,
+                active_person_bbox_scale,
+            )
+            used_scaled_retry = True
+            if not _error_trigger(best_error, retry_threshold):
+                break
+        return payload, best_error, best_iou, best_detection, used_scaled_retry
+
+    if not (used_retry and final_retry_person_bbox_scale is not None and _error_trigger(best_error, retry_threshold)):
+        return payload, best_error, best_iou, best_detection, used_scaled_retry
+
+    final_llava_dir = (
+        llava_output_dir / final_retry_run_subdir if final_retry_run_subdir else llava_output_dir
+    )
+    final_visualization_dir = (
+        (visualization_dir / final_retry_run_subdir)
+        if (visualization_dir and final_retry_run_subdir)
+        else visualization_dir
+    )
+    payload, best_error, best_iou, best_detection = run_fn(
+        active_args,
+        final_llava_dir,
+        final_visualization_dir,
+        float(final_retry_person_bbox_scale),
+    )
+    return payload, best_error, best_iou, best_detection, True
+
+
 def process_image_task_with_body_bbox_retry(
     task: ImageTask,
     *,
@@ -840,8 +967,26 @@ def process_image_task_with_body_bbox_retry(
     retry_person_bbox_scale: Optional[float] = None,
     final_retry_person_bbox_scale: Optional[float] = 0.5,
     final_retry_run_subdir: str = "retry_person_bbox_half",
+    target_retry_radius_ratio_scales: Sequence[float] = (0.5, 0.25),
+    target_retry_run_subdir: str = "retry_target_gaze_radius_ratio",
 ) -> Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]], bool, bool]:
-    """Run the task and optionally retry with a different ``use_body_bbox`` setting."""
+    """
+    Run phrase grounding with a three-step retry flow and return the best attempt.
+
+    Step 1:
+        Run once with the original args.
+
+    Step 2 (source mode only):
+        If quality is below thresholds, retry with ``use_body_bbox=retry_use_body_bbox``.
+
+    Step 3:
+        If still below threshold, apply a final scale fallback:
+        - target mode: retry with smaller ``gt_gaze_mask_radius_ratio`` values
+        - source mode: retry with ``final_retry_person_bbox_scale``
+
+    Returns:
+        (payload, best_error, best_iou, best_detection, used_retry, used_scaled_retry)
+    """
 
     def _run(
         current_args: argparse.Namespace,
@@ -867,60 +1012,65 @@ def process_image_task_with_body_bbox_retry(
             attention_mask_viz_dir=attention_mask_viz_dir,
             person_bbox_scale=person_bbox_scale,
         )
-        payload.setdefault("artifacts", {})["use_body_bbox"] = bool(current_args.use_body_bbox)
+        artifacts = payload.setdefault("artifacts", {})
+        artifacts["use_body_bbox"] = bool(current_args.use_body_bbox)
+        artifacts["gt_gaze_mask_radius_ratio"] = float(
+            getattr(current_args, "gt_gaze_mask_radius_ratio", 0.05) or 0.05
+        )
+        artifacts["person_bbox_scale"] = float(person_bbox_scale)
         best_error, best_iou, best_detection = summarize_best_detection(payload)
         return payload, best_error, best_iou, best_detection
 
     base_person_bbox_scale = float(getattr(args, "person_bbox_scale", 1.0) or 1.0)
-    payload, best_error, best_iou, best_detection = _run(
-        args,
-        llava_output_dir,
-        visualization_dir,
-        person_bbox_scale=base_person_bbox_scale,
-    )
-    used_retry = False
-    used_scaled_retry = False
+    target_mode = bool(getattr(args, "use_target_insert_for_source", False))
 
-    error_trigger = retry_threshold is not None and (best_error is None or best_error >= retry_threshold)
-    iou_trigger = retry_iou_threshold is not None and (best_iou is None or best_iou < retry_iou_threshold)
-    should_retry = args.use_body_bbox != retry_use_body_bbox and (error_trigger or iou_trigger)
-    if should_retry:
-        retry_args = copy.deepcopy(args)
-        retry_args.use_body_bbox = retry_use_body_bbox
-        retry_llava_dir = llava_output_dir / retry_run_subdir if retry_run_subdir else llava_output_dir
-        retry_visualization_dir = (
-            (visualization_dir / retry_run_subdir) if (visualization_dir and retry_run_subdir) else visualization_dir
+    # Step 1: baseline run with the original args.
+    payload, best_error, best_iou, best_detection, active_args, active_person_bbox_scale = _run_step1_initial(
+        run_fn=_run,
+        args=args,
+        llava_output_dir=llava_output_dir,
+        visualization_dir=visualization_dir,
+        base_person_bbox_scale=base_person_bbox_scale
+    )
+    # Step 2: source mode only - retry with body bbox disabled when thresholds fail.
+    payload, best_error, best_iou, best_detection, used_retry, active_args, active_person_bbox_scale = (
+        _run_step2_retry_without_body_bbox(
+            run_fn=_run,
+            payload=payload,
+            best_error=best_error,
+            best_iou=best_iou,
+            best_detection=best_detection,
+            target_mode=target_mode,
+            args=args,
+            llava_output_dir=llava_output_dir,
+            visualization_dir=visualization_dir,
+            retry_threshold=retry_threshold,
+            retry_iou_threshold=retry_iou_threshold,
+            retry_use_body_bbox=retry_use_body_bbox,
+            retry_run_subdir=retry_run_subdir,
+            retry_person_bbox_scale=retry_person_bbox_scale,
+            base_person_bbox_scale=base_person_bbox_scale,
         )
-        active_retry_scale = retry_person_bbox_scale if retry_person_bbox_scale is not None else base_person_bbox_scale
-        payload, best_error, best_iou, best_detection = _run(
-            retry_args,
-            retry_llava_dir,
-            retry_visualization_dir,
-            person_bbox_scale=active_retry_scale,
-        )
-        used_retry = True
-        needs_scaled_retry = (
-            used_retry
-            and final_retry_person_bbox_scale is not None
-            and retry_threshold is not None
-            and (best_error is None or best_error >= retry_threshold)
-        )
-        if needs_scaled_retry:
-            final_llava_dir = (
-                llava_output_dir / final_retry_run_subdir if final_retry_run_subdir else llava_output_dir
-            )
-            final_visualization_dir = (
-                (visualization_dir / final_retry_run_subdir)
-                if (visualization_dir and final_retry_run_subdir)
-                else visualization_dir
-            )
-            payload, best_error, best_iou, best_detection = _run(
-                retry_args,
-                final_llava_dir,
-                final_visualization_dir,
-                person_bbox_scale=float(final_retry_person_bbox_scale),
-            )
-            used_scaled_retry = True
+    )
+    # Step 3: final fallback - target mode shrinks gt gaze radius ratio, source mode shrinks person bbox scale.
+    payload, best_error, best_iou, best_detection, used_scaled_retry = _run_step3_scaled_retry(
+        run_fn=_run,
+        payload=payload,
+        best_error=best_error,
+        best_iou=best_iou,
+        best_detection=best_detection,
+        target_mode=target_mode,
+        used_retry=used_retry,
+        active_args=active_args,
+        active_person_bbox_scale=active_person_bbox_scale,
+        llava_output_dir=llava_output_dir,
+        visualization_dir=visualization_dir,
+        retry_threshold=retry_threshold,
+        final_retry_person_bbox_scale=final_retry_person_bbox_scale,
+        final_retry_run_subdir=final_retry_run_subdir,
+        target_retry_radius_ratio_scales=target_retry_radius_ratio_scales,
+        target_retry_run_subdir=target_retry_run_subdir,
+    )
 
     return payload, best_error, best_iou, best_detection, used_retry, used_scaled_retry
 

@@ -470,17 +470,27 @@ def main() -> None:
                 cli_args.threshold,
             )
         if used_scaled_retry:
-            logger.info(
-                "%s Applied scaled person mask retry (scale=0.5) for %s after repeated threshold failures",
-                progress_prefix,
-                task.image_id,
-            )
+            if cli_args.use_target_insert_for_source:
+                final_radius_ratio = (payload.get("artifacts") or {}).get("gt_gaze_mask_radius_ratio")
+                logger.info(
+                    "%s Applied target gaze-radius retries for %s after repeated threshold failures (final ratio=%s)",
+                    progress_prefix,
+                    task.image_id,
+                    final_radius_ratio,
+                )
+            else:
+                logger.info(
+                    "%s Applied scaled person mask retry (scale=0.5) for %s after repeated threshold failures",
+                    progress_prefix,
+                    task.image_id,
+                )
         per_image_json = output_dir / f"{task.image_id}.json"
         pipeline.save_json(payload, per_image_json)
         artifacts = payload.setdefault("artifacts", {})
         artifacts["result_json"] = str(per_image_json)
         artifacts["body_bbox_retry_used"] = used_retry
         artifacts["scaled_person_mask_retry_used"] = used_scaled_retry
+        artifacts["scaled_target_radius_retry_used"] = bool(used_scaled_retry and cli_args.use_target_insert_for_source)
         results.append(payload)
 
         if best_error is None:
