@@ -20,7 +20,9 @@ from gazefollow.generation_utils import fix_wsl_paths
 # Data base: /mnt/d/Projects/data/gazefollow/
 
 
-COMBINED_CSV_PATH = r"gazefollow/data/combined_source_extract_patchscope_valid_20260204.csv"
+# COMBINED_CSV_PATH = r"gazefollow/data/combined_source_extract_patchscope_valid_20260204.csv"
+# COMBINED_CSV_PATH = r"gazefollow/data/test2_combined_description_results.csv"
+COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/test2_combined_description_results_run_20260206.csv"
 # COMBINED_CSV_PATH = r"/mnt/d/Projects/data/gazefollow/results/valid_runs/combined_ppl_desc_results.csv"
 COMBINED_CSV_PATH = fix_wsl_paths(COMBINED_CSV_PATH)
 OUTSIDE_FRAME_TARGET_DESCRIPTION = "something or someone outside the frame"
@@ -42,14 +44,62 @@ IMAGE_BASE_PREFIX = "train/" if not test_set else "test2/"  # Using escaped back
 # Configuration for periodic saving
 SAVE_INTERVAL = 30000  # Save every N processed items
 TEMP_SAVE_PREFIX = "sgl_conversation_data_temp"
+PREFIXES_TO_AVOID_ADDING_THE_BEFORE = (
+    "the ", "a ", "an ",
+    "my ", "your ", "his ", "her ", "its ", "our ", "their ",
+)
+
+
+def _prepend_the_if_needed(text):
+    cleaned = text.strip()
+    if cleaned.lower().startswith(PREFIXES_TO_AVOID_ADDING_THE_BEFORE):
+        return cleaned
+    return f"the {cleaned}"
+
+
+def _finalize_sentence(text):
+    cleaned = text.rstrip()
+    if cleaned.endswith((".", "!", "?")):
+        return cleaned
+    return f"{cleaned}."
 
 def _build_error_frame(df, l2_col, iou_col, mask=None):
+    label = "source" if "source" in l2_col else "target"
+    total_rows = len(df)
     errors = df[[l2_col, iou_col]].copy()
+    masked_out_count = 0
     if mask is not None:
+        mask = mask.astype(bool)
+        masked_out_count = int((~mask).sum())
         errors = errors[mask]
+    before_dropna = len(errors)
     errors = errors.dropna()
-    errors = errors[np.isfinite(errors[l2_col]) & np.isfinite(errors[iou_col])]
-    return errors
+    dropped_nan_count = before_dropna - len(errors)
+    finite_mask = np.isfinite(errors[l2_col]) & np.isfinite(errors[iou_col])
+    dropped_nonfinite_count = int((~finite_mask).sum())
+    errors = errors[finite_mask]
+
+    stats = {
+        "label": label,
+        "input_rows": total_rows,
+        "dropped_by_mask": masked_out_count,
+        "dropped_nan_rows": dropped_nan_count,
+        "dropped_non_finite_rows": dropped_nonfinite_count,
+        "kept_rows": len(errors),
+    }
+    return errors, stats
+
+
+def _print_error_frame_stats(stats):
+    print(f"[{stats['label']}] _build_error_frame:")
+    print(f"  input rows: {stats['input_rows']}")
+    if stats["dropped_by_mask"] > 0:
+        print(f"  dropped by mask: {stats['dropped_by_mask']}")
+    if stats["dropped_nan_rows"] > 0:
+        print(f"  dropped NaN rows: {stats['dropped_nan_rows']}")
+    if stats["dropped_non_finite_rows"] > 0:
+        print(f"  dropped non-finite rows: {stats['dropped_non_finite_rows']}")
+    print(f"  kept rows: {stats['kept_rows']}")
 
 
 def _source_error_filter_mask_patchscope(df):
@@ -138,6 +188,94 @@ def _summarize_threshold_impact(label, errors, l2_col, iou_col, l2_threshold, io
     )
 
 
+def _print_cumulative_filter_counts(
+    combined_df,
+    source_filter_mask,
+    has_source_metrics,
+    has_target_metrics,
+    min_iou_threshold_source,
+    max_l2_threshold_source,
+    min_iou_threshold_target,
+    max_l2_threshold_target,
+):
+    total_count = len(combined_df)
+    cumulative_keep_mask = pd.Series([True] * total_count, index=combined_df.index, dtype=bool)
+
+    if has_source_metrics:
+        source_keep_mask = pd.Series([True] * total_count, index=combined_df.index, dtype=bool)
+        source_keep_mask.loc[source_filter_mask] = (
+            combined_df.loc[source_filter_mask, "source_grounding_bbox_iou"] >= min_iou_threshold_source
+        ) & (
+            combined_df.loc[source_filter_mask, "source_grounding_normalized_l2_error"] <= max_l2_threshold_source
+        )
+        cumulative_keep_mask &= source_keep_mask
+
+    after_source_count = int(cumulative_keep_mask.sum())
+
+    if has_target_metrics:
+        patchscope_target_mask = pd.Series([False] * total_count, index=combined_df.index, dtype=bool)
+        if "patchscope_target_description" in combined_df.columns:
+            patchscope_target_mask = combined_df["patchscope_target_description"].apply(
+                lambda x: isinstance(x, str)
+            )
+        in_or_out = combined_df.get("in_or_out", pd.Series([0] * total_count, index=combined_df.index))
+        target_filter_mask = cumulative_keep_mask & patchscope_target_mask & (in_or_out == 1)
+        target_keep_mask = pd.Series([True] * total_count, index=combined_df.index, dtype=bool)
+        target_keep_mask.loc[target_filter_mask] = (
+            combined_df.loc[target_filter_mask, "target_grounding_normalized_l2_error"] < max_l2_threshold_target
+        ) & (
+            combined_df.loc[target_filter_mask, "target_grounding_bbox_iou"] > min_iou_threshold_target
+        )
+        cumulative_keep_mask &= target_keep_mask
+
+    after_target_count = int(cumulative_keep_mask.sum())
+
+    print("--- Cumulative Filter Counts ---")
+    print(f"Before filtering: {total_count}")
+    print(f"After source filtering: {after_source_count}")
+    print(f"After target filtering (cumulative): {after_target_count}")
+
+
+def _print_cumulative_filter_counts_for_thresholds(
+    combined_df,
+    source_eligibility,
+    min_iou_threshold_source,
+    max_l2_threshold_source,
+    min_iou_threshold_target,
+    max_l2_threshold_target,
+):
+    has_target_metrics = all(
+        col in combined_df.columns
+        for col in (
+            "target_grounding_normalized_l2_error",
+            "target_grounding_bbox_iou",
+        )
+    )
+    has_source_metrics = all(
+        col in combined_df.columns
+        for col in (
+            "source_grounding_normalized_l2_error",
+            "source_grounding_bbox_iou",
+        )
+    )
+    if has_source_metrics:
+        source_filter_mask = _source_error_filter_mask(combined_df, source_eligibility)
+    else:
+        source_filter_mask = pd.Series(
+            [False] * len(combined_df), index=combined_df.index, dtype=bool
+        )
+    _print_cumulative_filter_counts(
+        combined_df,
+        source_filter_mask,
+        has_source_metrics,
+        has_target_metrics,
+        min_iou_threshold_source,
+        max_l2_threshold_source,
+        min_iou_threshold_target,
+        max_l2_threshold_target,
+    )
+
+
 def _prompt_tail_percentile(default_tail_percentile):
     while True:
         value = input(
@@ -179,7 +317,7 @@ def _select_thresholds_interactively(
         )
     fallback_mask = pd.Series([1] * len(combined_df), index=combined_df.index)
     source_mask = _source_error_filter_mask(combined_df, source_eligibility)
-    source_errors = _build_error_frame(
+    source_errors, source_error_stats = _build_error_frame(
         combined_df,
         "source_grounding_normalized_l2_error",
         "source_grounding_bbox_iou",
@@ -193,9 +331,10 @@ def _select_thresholds_interactively(
         )
     )
     target_errors = None
+    target_error_stats = None
     if has_target_metrics:
         target_mask = combined_df.get("in_or_out", fallback_mask) == 1
-        target_errors = _build_error_frame(
+        target_errors, target_error_stats = _build_error_frame(
             combined_df,
             "target_grounding_normalized_l2_error",
             "target_grounding_bbox_iou",
@@ -282,6 +421,9 @@ def _select_thresholds_interactively(
                 target_iou_threshold = DEFAULT_MIN_IOU_THRESHOLD_TARGET
 
         print("\n--- Auto-threshold Preview ---")
+        _print_error_frame_stats(source_error_stats)
+        if target_error_stats is not None:
+            _print_error_frame_stats(target_error_stats)
         if current_method == "knee":
             print("Method: knee detection")
         else:
@@ -313,6 +455,14 @@ def _select_thresholds_interactively(
             )
         else:
             print("Target thresholds: skipping preview (metrics unavailable).")
+        _print_cumulative_filter_counts_for_thresholds(
+            combined_df,
+            source_eligibility,
+            source_iou_threshold,
+            source_l2_threshold,
+            target_iou_threshold,
+            target_l2_threshold,
+        )
 
         accept = input("Accept these thresholds? (y/n): ").strip().lower()
         if accept == "y":
@@ -332,6 +482,7 @@ def parse_args():
     )
     parser.add_argument(
         "--auto-threshold",
+        default=True,
         action="store_true",
         help="Auto-select L2/IOU thresholds from error histograms.",
     )
@@ -507,6 +658,16 @@ def create_conversational_data(
         print("Source grounding metrics not found; source error filtering will be skipped.")
     if not has_target_metrics:
         print("Target grounding metrics not found; target error filtering will be skipped.")
+    _print_cumulative_filter_counts(
+        combined_df,
+        source_filter_mask,
+        has_source_metrics,
+        has_target_metrics,
+        min_iou_threshold_source,
+        max_l2_threshold_source,
+        min_iou_threshold_target,
+        max_l2_threshold_target,
+    )
 
     # Check for existing temp files to resume from
     latest_temp_file, resumed_count = find_latest_temp_save()
@@ -628,26 +789,11 @@ def create_conversational_data(
             continue
         # --- End Data Extraction ---
 
-        # --- Process target_text (lowercase and add "the" if needed) ---
-        processed_target = target_text.lower()
-        
-        # Define prefixes that make adding "the " redundant or grammatically incorrect
-        # Common articles and possessive pronouns
-        prefixes_to_avoid_adding_the_before = (
-            "the ", "a ", "an ", 
-            "my ", "your ", "his ", "her ", "its ", "our ", "their "
-            # Consider adding other determiners if necessary e.g. "some ", "any ", "this ", "that ", etc.
-        )
-        
-        should_add_the_prefix = True
-        for prefix in prefixes_to_avoid_adding_the_before:
-            if processed_target.startswith(prefix):
-                should_add_the_prefix = False
-                break
-        
-        if should_add_the_prefix:
-            processed_target = "the " + processed_target
-        # --- End Process target_text ---
+        # --- Process subject/target text ---
+        processed_subject = _prepend_the_if_needed(subject_text)
+        processed_target = _prepend_the_if_needed(target_text.lower())
+        gpt_answer_text = _finalize_sentence(f"{processed_subject} is looking at {processed_target}")
+        # --- End Process subject/target text ---
 
         
         # Construct the image path for the output JSON (respecting user's change to forward slashes)
@@ -689,11 +835,11 @@ def create_conversational_data(
             "conversations": [
                 {
                     "from": "human",
-                    "value": f"<image>\nDescribe where the {subject_text} is looking at"
+                    "value": f"<image>\nDescribe where {processed_subject} is looking"
                 },
                 {
                     "from": "gpt",
-                    "value": f"the {subject_text} is looking at {processed_target} "
+                    "value": gpt_answer_text
                 }
             ]
         }
@@ -720,11 +866,16 @@ def create_conversational_data(
     print(f"--- Processing Summary ---")
     print(f"Total image keys in dataframe: {len(combined_df)}")
     print(f"Successfully processed items: {processed_image_paths}")
-    print(f"Skipped (target key not in target file): {skipped_due_to_missing_target}")
-    print(f"Skipped (missing caption/target description): {skipped_due_to_missing_data}")
-    print(f"Skipped (target value was simple string or unexpected format): {skipped_due_to_target_format}")
-    print(f"Skipped (large source grounding error): {skipped_due_to_large_source_error}")
-    print(f"Skipped (large target grounding error): {skipped_due_to_large_target_error}")
+    if skipped_due_to_missing_target > 0:
+        print(f"Skipped (target key not in target file): {skipped_due_to_missing_target}")
+    if skipped_due_to_missing_data > 0:
+        print(f"Skipped (missing caption/target description): {skipped_due_to_missing_data}")
+    if skipped_due_to_target_format > 0:
+        print(f"Skipped (target value was simple string or unexpected format): {skipped_due_to_target_format}")
+    if skipped_due_to_large_source_error > 0:
+        print(f"Skipped (large source grounding error): {skipped_due_to_large_source_error}")
+    if skipped_due_to_large_target_error > 0:
+        print(f"Skipped (large target grounding error): {skipped_due_to_large_target_error}")
     print(f"Source error filter eligible rows: {source_filter_eligible}")
 
     # Final save
