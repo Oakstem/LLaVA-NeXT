@@ -346,6 +346,77 @@ def annotate_grounding_metrics(
     }
 
 
+def entry_combined_score(entry: Dict[str, Any]) -> Optional[float]:
+    # Higher is better: maximize IoU while minimizing normalized L2 error.
+    best_score: Optional[float] = None
+    for detection in entry.get("detections", []) or []:
+        metrics = detection.get("metrics") or {}
+        l2_error = metrics.get("gaze_normalized_l2_error")
+        iou = metrics.get("bbox_iou_vs_person")
+        if l2_error is None and iou is None:
+            continue
+        score = float(iou or 0.0) - float(l2_error or 0.0)
+        if best_score is None or score > best_score:
+            best_score = score
+    return best_score
+
+
+def select_preferred_grounding_entry(grounding_entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _query_preview(entry: Dict[str, Any], limit: int = 120) -> str:
+        query = str(entry.get("query") or "").strip()
+        return query if len(query) <= limit else f"{query[: limit - 3]}..."
+
+    print(f"  Preferred-entry selection: evaluating {len(grounding_entries)} grounding option(s)")
+    preferred_entry: Optional[Dict[str, Any]] = None
+    best_combined_score: Optional[float] = None
+    for idx, entry in enumerate(grounding_entries, start=1):
+        score = entry_combined_score(entry)
+        segment = entry.get("segment") or "unknown"
+        query_preview = _query_preview(entry)
+        print(
+            f"    option {idx}: segment={segment}, score={score}, "
+            f"detections={len(entry.get('detections', []) or [])}, query='{query_preview}'"
+        )
+        if score is None:
+            continue
+        if best_combined_score is None or score > best_combined_score:
+            best_combined_score = score
+            preferred_entry = entry
+        elif (
+            score == best_combined_score
+            and preferred_entry is not None
+            and preferred_entry.get("segment") != "after_arrow"
+            and entry.get("segment") == "after_arrow"
+        ):
+            preferred_entry = entry
+
+    if preferred_entry is not None:
+        print(
+            "  Preferred-entry selection result: "
+            f"description='{_query_preview(preferred_entry)}', score={best_combined_score}"
+        )
+        return preferred_entry
+    if len(grounding_entries) == 1:
+        print(
+            "  Preferred-entry selection fallback: single option available, "
+            f"description='{_query_preview(grounding_entries[0])}'"
+        )
+        return grounding_entries[0]
+    for entry in grounding_entries:
+        if entry.get("segment") == "after_arrow":
+            print(
+                "  Preferred-entry selection fallback: chose description="
+                f"'{_query_preview(entry)}'"
+            )
+            return entry
+    if grounding_entries:
+        print(
+            "  Preferred-entry selection fallback: chose description="
+            f"'{_query_preview(grounding_entries[0])}'"
+        )
+    return grounding_entries[0] if grounding_entries else None
+
+
 def draw_grounding_overlay(
     image_path: Path,
     detections: Sequence[Dict[str, Any]],
@@ -671,16 +742,7 @@ def process_image_task(
             }
         )
 
-    preferred_entry = None
-    if len(grounding_entries) == 1:
-        preferred_entry = grounding_entries[0]
-    else:
-        for entry in grounding_entries:
-            if entry.get("segment") == "after_arrow":
-                preferred_entry = entry
-                break
-        if preferred_entry is None:
-            preferred_entry = grounding_entries[0]
+    preferred_entry = select_preferred_grounding_entry(grounding_entries)
 
     if preferred_entry:
         overlay_path = (

@@ -25,7 +25,7 @@ DEFAULT_QUEUE_PATH = Path("gazefollow/data/combined_source_extract_patchscope_va
 DEFAULT_QUEUE_PATH = None
 DEFAULT_DATA_ROOT = Path(r"D:\Projects\data\gazefollow")
 DEFAULT_OUTPUT_ROOT = Path("results/steered_generation")
-DEFAULT_THRESHOLD = 0.16
+DEFAULT_THRESHOLD = 0.2
 TARGET_DESCRIPTION = False
 DEFAULT_ANNOTATION_FILE = 'gazefollow/data/test_annotations_release.csv'
 
@@ -275,8 +275,45 @@ def _get_insert_columns(use_target_insert_for_source: bool) -> Dict[str, str]:
     return {
         "error": f"{prefix}_grounding_normalized_l2_error",
         "iou": f"{prefix}_grounding_bbox_iou",
+        "iou_over_source": f"{prefix}_grounding_bbox_iou_over_source",
+        "bbox": f"{prefix}_grounding_bbox",
         "description": f"patchscope_{prefix}_description",
     }
+
+
+def _format_bbox_list(bbox: Any) -> Optional[List[Any]]:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    normalized: List[Any] = []
+    for coord in bbox:
+        try:
+            value = float(coord)
+        except (TypeError, ValueError):
+            return None
+        normalized.append(int(value) if value.is_integer() else value)
+    return normalized
+
+
+def _source_bbox_from_body_row(row: pd.Series, image_size: Any) -> Optional[List[float]]:
+    if not isinstance(image_size, (list, tuple)) or len(image_size) != 2:
+        return None
+    try:
+        width = float(image_size[0])
+        height = float(image_size[1])
+        x = float(row.get("body_bbox_x"))
+        y = float(row.get("body_bbox_y"))
+        w = float(row.get("body_bbox_width"))
+        h = float(row.get("body_bbox_height"))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0 or w <= 0 or h <= 0:
+        return None
+
+    x1 = x * width
+    y1 = y * height
+    x2 = (x + w) * width
+    y2 = (y + h) * height
+    return [x1, y1, x2, y2]
 
 
 def main() -> None:
@@ -461,6 +498,14 @@ def main() -> None:
         else:
             query_text = str(query_value).strip()
         df.at[idx, insert_columns["description"]] = query_text
+        best_bbox = _format_bbox_list(best_detection.get("bbox") if best_detection else None)
+        df.at[idx, insert_columns["bbox"]] = best_bbox if best_bbox is not None else ""
+        if cli_args.use_target_insert_for_source:
+            source_gt_bbox = _source_bbox_from_body_row(
+                row,
+                (payload.get("grounding", {}) or {}).get("metrics_summary", {}).get("image_size"),
+            )
+            df.at[idx, insert_columns["iou_over_source"]] = pipeline.compute_bbox_iou(best_bbox, source_gt_bbox)
 
         if best_error <= cli_args.threshold:
             # Clear any previous error reason if it mentioned 'person'
