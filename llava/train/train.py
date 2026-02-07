@@ -1949,6 +1949,9 @@ def train(attn_implementation=None):
     rank0_print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     rank0_print("Starting training setup...")
     setup_start = time.time()
+    wandb_notes_env = os.getenv("WANDB_NOTES", "").strip()
+    if wandb_notes_env:
+        rank0_print(f"WANDB_NOTES: {wandb_notes_env}")
     
 
     if training_args.verbose_logging:
@@ -2400,7 +2403,8 @@ def train(attn_implementation=None):
         "timing/total_setup_seconds": setup_time
     })
     wandb_summary(training_args, {
-        "slurm_job_id": os.getenv("SLURM_JOB_ID", "unknown")
+        "slurm_job_id": os.getenv("SLURM_JOB_ID", "unknown"),
+        **({"wandb_notes": wandb_notes_env} if wandb_notes_env else {}),
     })
 
     # Time actual training
@@ -2427,6 +2431,16 @@ def train(attn_implementation=None):
     else:
         rank0_print("No checkpoints found, starting fresh training")
         trainer.train()
+
+    if (
+        wandb_notes_env
+        and training_args.report_to
+        and "wandb" in training_args.report_to
+        and training_args.local_rank in (0, -1)
+        and wandb.run is not None
+    ):
+        wandb.run.notes = wandb_notes_env
+        wandb_summary(training_args, {"wandb_notes": wandb_notes_env})
     
     training_time = time.time() - training_start
     total_time = time.time() - overall_start
