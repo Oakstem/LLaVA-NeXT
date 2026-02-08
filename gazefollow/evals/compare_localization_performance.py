@@ -28,8 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline-substring",
         type=str,
-        default="qwen3vl_grounding_run_test2_baseline_20251212_185428",
-        help="Substring to identify the baseline localization file (default: baseline_llava).",
+        default=None,
+        help="Optional substring to identify the baseline localization file. If omitted, baseline diff comparisons are skipped.",
     )
     parser.add_argument(
         "--top-k",
@@ -255,7 +255,7 @@ def format_float(value: Optional[float]) -> str:
 
 def select_top_by_intersection_error(
     datasets: Iterable[DatasetMetrics],
-    baseline: DatasetMetrics,
+    baseline: Optional[DatasetMetrics],
     top_n: int = 5,
 ) -> List[DatasetMetrics]:
     ranked = sorted(
@@ -263,7 +263,7 @@ def select_top_by_intersection_error(
         key=lambda ds: ds.intersection_mean_error,
     )
     selected = ranked[:top_n]
-    if baseline not in selected:
+    if baseline is not None and baseline not in selected:
         selected.append(baseline)
 
     unique_selected: List[DatasetMetrics] = []
@@ -283,7 +283,7 @@ def select_top_by_intersection_error(
     )
 
 
-def print_top_table(top_results: List[DatasetMetrics], baseline: DatasetMetrics) -> None:
+def print_top_table(top_results: List[DatasetMetrics], baseline: Optional[DatasetMetrics]) -> None:
     if not top_results:
         print("No datasets with intersection_mean_gaze_normalized_l2_error available for table.\n")
         return
@@ -299,7 +299,7 @@ def print_top_table(top_results: List[DatasetMetrics], baseline: DatasetMetrics)
     print(header)
     print("-" * len(header))
     for ds in top_results:
-        adapter_display = "baseline" if ds is baseline else (ds.adapter_path or str(ds.path))
+        adapter_display = "baseline" if baseline is not None and ds is baseline else (ds.adapter_path or str(ds.path))
         print(
             f"{adapter_display:40.40} "
             f"{format_float(ds.intersection_mean_error):>26} "
@@ -330,11 +330,13 @@ def select_baseline(
 
 
 def report_top_differences(
-    baseline: DatasetMetrics,
+    baseline: Optional[DatasetMetrics],
     datasets: Iterable[DatasetMetrics],
     top_k: int,
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
+    if baseline is None:
+        return results
     baseline_reference = format_dataset_reference(baseline)
 
     for ds in datasets:
@@ -429,7 +431,9 @@ def main() -> int:
     datasets = [load_dataset_metrics(path) for path in files]
     datasets = [ds for ds in datasets if ds.total_samples > 100]
     intersection = compute_intersection_metrics(datasets)
-    baseline = select_baseline(datasets, args.baseline_substring)
+    baseline = None
+    if args.baseline_substring:
+        baseline = select_baseline(datasets, args.baseline_substring)
 
     print(f"Evaluated {len(datasets)} localization file(s) under {args.root}")
     print(f"Intersection of valid gaze samples: {len(intersection)}\n")
@@ -484,13 +488,11 @@ def main() -> int:
         "root": str(args.root),
         "top_k": args.top_k,
         "intersection_size": len(intersection),
-        "baseline": {
-            "path": str(baseline.path),
-        },
+        "baseline": {"path": str(baseline.path)} if baseline is not None else None,
         "top_by_intersection_mean": [
             {
                 "path": str(ds.path),
-                "adapter_path": "baseline" if ds is baseline else ds.adapter_path,
+                "adapter_path": "baseline" if baseline is not None and ds is baseline else ds.adapter_path,
                 "intersection_normalized_l2": ds.intersection_mean_error,
                 "recall": ds.recall,
                 "precision": ds.precision,
