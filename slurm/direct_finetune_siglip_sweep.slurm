@@ -82,7 +82,6 @@ RUNSET_LLM_LAST8="${RUNSET_LLM_LAST8:-false}"
 RUNSET_LLM_LAST8_PLUS_MM_LMHEAD="${RUNSET_LLM_LAST8_PLUS_MM_LMHEAD:-false}"
 RUNSET_LLM_LAST8_PLUS_VISION_LAST8="${RUNSET_LLM_LAST8_PLUS_VISION_LAST8:-false}"
 RUNSET_LORA_DROPOUTS="${RUNSET_LORA_DROPOUTS:-false}"
-RUNSET_DATASETS="${RUNSET_DATASETS:-true}"
 # Flexible tunable-parts runsets:
 # - RUNSET_TUNABLE_PARTS_PRESETS: comma-separated preset keys
 #   (base_mm_lmhead, vision_only, vision_last8, vision_last16,
@@ -96,6 +95,7 @@ RUNSET_DATASETS="${RUNSET_DATASETS:-true}"
 #   RUNSET_CUSTOM_TUNABLE_PARTS="vt_last4=model.vision_tower.vision_tower.vision_model.encoder.layers[-4:];vt_last2_plus_mm=model.vision_tower.vision_tower.vision_model.encoder.layers[-2:],mm_projector,lm_head"
 RUNSET_TUNABLE_PARTS_PRESETS="${RUNSET_TUNABLE_PARTS_PRESETS:-}"
 RUNSET_CUSTOM_TUNABLE_PARTS="${RUNSET_CUSTOM_TUNABLE_PARTS:-}"
+RUNSET_DATASETS="${RUNSET_DATASETS:-false}"
 
 # Sweep values
 LORA_RANK_SWEEP=(16 32 64)

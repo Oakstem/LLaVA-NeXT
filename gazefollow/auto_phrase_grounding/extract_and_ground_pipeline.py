@@ -37,7 +37,8 @@ from gazefollow.gaze_metrics import compute_gaze_errors
 import traceback
 
 
-DEFAULT_MASK_DIR = Path(r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks")
+# DEFAULT_MASK_DIR = Path(r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks")
+DEFAULT_MASK_DIR = None
 # DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
 #     a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans sitting on a worn wooden bench.
 #     a chic woman in a beige coat → a woman in a beige coat and ankle boots holding a phone.

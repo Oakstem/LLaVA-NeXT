@@ -26,7 +26,7 @@ fi
 # Single-image configuration
 IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000000/00000046.jpg}"
 MASK_PATH="${MASK_PATH:-}"
-MASK_DIR="${MASK_DIR:-/galitylab/students/alonmardi/gazefollow/train_gaze_segmentations/small_masks/small_masks}"
+MASK_DIR="${MASK_DIR:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/results/steered_generation/single_test_${SLURM_JOB_ID}}"
 
 # Retry configuration
@@ -183,6 +183,7 @@ tasks = load_image_tasks(
     fallback_mask_template=args.mask_fallback_template,
     limit=args.list_limit,
     image_id=args.image_id,
+    require_mask=False,
 )
 
 output_dir = Path(_normalize_path(args.output_dir) or args.output_dir)

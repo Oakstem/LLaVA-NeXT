@@ -22,12 +22,13 @@ from gazefollow.data_prep import queue_bootstrap_utils as queue_utils
 
 LOGGER_NAME = "inject_and_ground_queue"
 DEFAULT_QUEUE_PATH = Path("gazefollow/data/combined_source_extract_patchscope_valid.csv")
-DEFAULT_QUEUE_PATH = None
+# DEFAULT_QUEUE_PATH = None
 DEFAULT_DATA_ROOT = Path(r"D:\Projects\data\gazefollow")
 DEFAULT_OUTPUT_ROOT = Path("results/steered_generation")
 DEFAULT_THRESHOLD = 0.2
 TARGET_DESCRIPTION = False
 DEFAULT_ANNOTATION_FILE = 'gazefollow/data/test_annotations_release.csv'
+# DEFAULT_ANNOTATION_FILE = 'gazefollow/data/train_annotations_release.csv'
 
 
 def parse_cli_args() -> argparse.Namespace:
