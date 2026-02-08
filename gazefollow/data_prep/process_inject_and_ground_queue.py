@@ -281,6 +281,20 @@ def _get_insert_columns(use_target_insert_for_source: bool) -> Dict[str, str]:
     }
 
 
+def _ensure_output_columns(df: pd.DataFrame, insert_columns: Dict[str, str], use_target_insert_for_source: bool) -> None:
+    required = [
+        insert_columns["error"],
+        insert_columns["iou"],
+        insert_columns["bbox"],
+        insert_columns["description"],
+    ]
+    if use_target_insert_for_source:
+        required.append(insert_columns["iou_over_source"])
+    for column in required:
+        if column not in df.columns:
+            df[column] = pd.NA
+
+
 def _format_bbox_list(bbox: Any) -> Optional[List[Any]]:
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
@@ -398,6 +412,7 @@ def main() -> None:
     output_csv = Path(fix_wsl_paths(cli_args.output_csv)).expanduser() if cli_args.output_csv else queue_csv
     results: List[Dict[str, Any]] = []
     insert_columns = _get_insert_columns(cli_args.use_target_insert_for_source)
+    _ensure_output_columns(df, insert_columns, cli_args.use_target_insert_for_source)
 
     for idx, row in df.iterrows():
         if idx < start_index:
