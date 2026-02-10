@@ -24,7 +24,7 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 # Single-image configuration
-IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000000/00000046.jpg}"
+IMAGE_PATH="${IMAGE_PATH:-/galitylab/students/alonmardi/gazefollow/train/00000000/00000119.jpg}"
 MASK_PATH="${MASK_PATH:-}"
 MASK_DIR="${MASK_DIR:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/results/steered_generation/single_test_${SLURM_JOB_ID}}"

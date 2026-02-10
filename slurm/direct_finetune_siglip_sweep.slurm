@@ -63,6 +63,8 @@ MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-6144}"
 
 BASE_DATA_PATH="${BASE_DATA_PATH:-training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/train.json}"
 BASE_MM_TUNABLE_PARTS="${BASE_MM_TUNABLE_PARTS:-mm_projector,lm_head}"
+BASE_MM_TUNABLE_PARTS+=",model.layers[-8:].self_attn.{q_proj,v_proj,o_proj},model.layers[-8:].mlp"
+BASE_MM_TUNABLE_PARTS+= ",model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj,o_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
 BASE_LORA_ENABLE="${BASE_LORA_ENABLE:-True}"
 BASE_LORA_R="${BASE_LORA_R:-4}"
 BASE_LORA_ALPHA="${BASE_LORA_ALPHA:-16}"
@@ -82,28 +84,15 @@ RUNSET_LLM_LAST8="${RUNSET_LLM_LAST8:-false}"
 RUNSET_LLM_LAST8_PLUS_MM_LMHEAD="${RUNSET_LLM_LAST8_PLUS_MM_LMHEAD:-false}"
 RUNSET_LLM_LAST8_PLUS_VISION_LAST8="${RUNSET_LLM_LAST8_PLUS_VISION_LAST8:-false}"
 RUNSET_LORA_DROPOUTS="${RUNSET_LORA_DROPOUTS:-false}"
-# Flexible tunable-parts runsets:
-# - RUNSET_TUNABLE_PARTS_PRESETS: comma-separated preset keys
-#   (base_mm_lmhead, vision_only, vision_last8, vision_last16,
-#    vision_last8_plus_mm_lmhead, vision_last16_plus_mm_lmhead,
-#    mm_lmhead_only, llm_full, llm_last8, llm_last8_plus_mm_lmhead,
-#    llm_last8_plus_vision_last8)
-# - RUNSET_CUSTOM_TUNABLE_PARTS: semicolon-separated entries of:
-#   variant_name=mm_tunable_parts_spec
-# Example:
-#   RUNSET_TUNABLE_PARTS_PRESETS="vision_last8,llm_last8"
-#   RUNSET_CUSTOM_TUNABLE_PARTS="vt_last4=model.vision_tower.vision_tower.vision_model.encoder.layers[-4:];vt_last2_plus_mm=model.vision_tower.vision_tower.vision_model.encoder.layers[-2:],mm_projector,lm_head"
-RUNSET_TUNABLE_PARTS_PRESETS="${RUNSET_TUNABLE_PARTS_PRESETS:-}"
-RUNSET_CUSTOM_TUNABLE_PARTS="${RUNSET_CUSTOM_TUNABLE_PARTS:-}"
-RUNSET_DATASETS="${RUNSET_DATASETS:-false}"
+RUNSET_DATASETS="${RUNSET_DATASETS:-true}"
 
 # Sweep values
 LORA_RANK_SWEEP=(16 32 64)
 LORA_DROPOUT_SWEEP=(0.05 0.1 0.2)
 DATASET_SWEEP_PATHS=(
     "training_datasets/20251007_165818_sgl_conversation_data_20251007_171523/train.json"
-    "training_datasets/20251205_174741_sgl_conversation_data_20251206_191724/train.json"
-    "training_datasets/20260204_223011_sgl_conversation_data_20260206_165842/train.json"
+    "training_datasets/train_filtered_20251224_203622_69k.json"
+    "training_datasets/20260207_184610_sgl_conversation_data_20260207_193554/train.json"
 )
 
 VT_LAST_8_SPEC="model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].self_attn.{q_proj,v_proj,o_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-8:].mlp"
@@ -116,7 +105,7 @@ RANK=0
 ADDR="localhost"
 
 # Array submission controls
-AUTO_SUBMIT_ARRAY="${AUTO_SUBMIT_ARRAY:-false}"
+AUTO_SUBMIT_ARRAY="${AUTO_SUBMIT_ARRAY:-true}"
 MAX_PARALLEL_ARRAY_JOBS="${MAX_PARALLEL_ARRAY_JOBS:-0}" # 0 means no % cap
 SWEEP_NAME="${SWEEP_NAME:-siglip_sweep_$(date +%Y%m%d_%H%M%S)}"
 
@@ -165,89 +154,7 @@ add_run() {
     RUN_MM_PROJECTOR_FULL+=("${8:-$BASE_MM_PROJECTOR_FULL_FINETUNE}")
 }
 
-trim_spaces() {
-    echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
-}
-
-resolve_tunable_parts_preset() {
-    case "$1" in
-        base_mm_lmhead) echo "$BASE_MM_TUNABLE_PARTS" ;;
-        vision_only) echo "mm_vision_tower" ;;
-        vision_last8) echo "$VT_LAST_8_SPEC" ;;
-        vision_last16) echo "$VT_LAST_16_SPEC" ;;
-        vision_last8_plus_mm_lmhead) echo "$VT_LAST_8_SPEC,mm_projector,lm_head" ;;
-        vision_last16_plus_mm_lmhead) echo "$VT_LAST_16_SPEC,mm_projector,lm_head" ;;
-        mm_lmhead_only) echo "mm_projector,lm_head" ;;
-        llm_full) echo "mm_language_model" ;;
-        llm_last8) echo "$LLM_LAST_8_SPEC" ;;
-        llm_last8_plus_mm_lmhead) echo "$LLM_LAST_8_SPEC,mm_projector,lm_head" ;;
-        llm_last8_plus_vision_last8) echo "$LLM_LAST_8_SPEC,$VT_LAST_8_SPEC,mm_projector,lm_head" ;;
-        *) return 1 ;;
-    esac
-}
-
-add_preset_tunable_parts_runs() {
-    local presets_csv="$1"
-    local old_ifs="$IFS"
-    IFS=','
-    read -r -a presets <<< "$presets_csv"
-    IFS="$old_ifs"
-
-    local preset_key
-    local parts
-    for preset_key in "${presets[@]}"; do
-        preset_key="$(trim_spaces "$preset_key")"
-        [ -z "$preset_key" ] && continue
-        if ! parts="$(resolve_tunable_parts_preset "$preset_key")"; then
-            echo "Unknown tunable-parts preset: '$preset_key'"
-            exit 1
-        fi
-        add_run "parts_preset" "$preset_key" "$parts" "$BASE_LORA_R" "$BASE_LORA_DROPOUT" "$BASE_DATA_PATH"
-    done
-}
-
-add_custom_tunable_parts_runs() {
-    local entries="$1"
-    local old_ifs="$IFS"
-    IFS=';'
-    read -r -a custom_entries <<< "$entries"
-    IFS="$old_ifs"
-
-    local entry
-    local variant
-    local parts
-    for entry in "${custom_entries[@]}"; do
-        entry="$(trim_spaces "$entry")"
-        [ -z "$entry" ] && continue
-
-        if [[ "$entry" != *"="* ]]; then
-            echo "Invalid RUNSET_CUSTOM_TUNABLE_PARTS entry '$entry' (expected variant=parts)"
-            exit 1
-        fi
-
-        variant="${entry%%=*}"
-        parts="${entry#*=}"
-        variant="$(trim_spaces "$variant")"
-        parts="$(trim_spaces "$parts")"
-
-        if [ -z "$variant" ] || [ -z "$parts" ]; then
-            echo "Invalid RUNSET_CUSTOM_TUNABLE_PARTS entry '$entry' (empty variant or parts)"
-            exit 1
-        fi
-
-        add_run "custom_parts" "$variant" "$parts" "$BASE_LORA_R" "$BASE_LORA_DROPOUT" "$BASE_DATA_PATH"
-    done
-}
-
 build_runs() {
-    if [ -n "$RUNSET_TUNABLE_PARTS_PRESETS" ]; then
-        add_preset_tunable_parts_runs "$RUNSET_TUNABLE_PARTS_PRESETS"
-    fi
-
-    if [ -n "$RUNSET_CUSTOM_TUNABLE_PARTS" ]; then
-        add_custom_tunable_parts_runs "$RUNSET_CUSTOM_TUNABLE_PARTS"
-    fi
-
     if [ "$RUNSET_LORA_RANKS" = "true" ]; then
         for rank in "${LORA_RANK_SWEEP[@]}"; do
             add_run "lora_rank" "r${rank}" "$BASE_MM_TUNABLE_PARTS" "$rank" "$BASE_LORA_DROPOUT" "$BASE_DATA_PATH"
@@ -371,7 +278,7 @@ fi
 source "$(dirname "$PYTHON_BIN")/activate"
 
 cd "$PROJECT_ROOT"
-export PYTHONPATH="${PROJECT_ROOT}:$PYTHONPATH"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3

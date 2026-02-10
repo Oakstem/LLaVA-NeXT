@@ -993,7 +993,6 @@ def process_image_task_with_body_bbox_retry(
         current_args: argparse.Namespace,
         current_llava_dir: Path,
         current_visualization_dir: Optional[Path],
-        *,
         person_bbox_scale: float,
     ) -> Tuple[Dict[str, Any], Optional[float], Optional[float], Optional[Dict[str, Any]]]:
         payload = process_image_task(

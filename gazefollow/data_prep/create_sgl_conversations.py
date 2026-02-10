@@ -22,7 +22,8 @@ from gazefollow.generation_utils import fix_wsl_paths
 
 # COMBINED_CSV_PATH = r"gazefollow/data/combined_source_extract_patchscope_valid_20260204.csv"
 # COMBINED_CSV_PATH = r"gazefollow/data/test2_combined_description_results.csv"
-COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/test2_combined_description_results_run_20260206.csv"
+COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/combined_source_extract_patchscope_valid_with_missing_merged_additionals.csv"
+COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/combined_source_extract_patchscope_valid_with_missing_merged_additionals_v11.csv"
 # COMBINED_CSV_PATH = r"/mnt/d/Projects/data/gazefollow/results/valid_runs/combined_ppl_desc_results.csv"
 COMBINED_CSV_PATH = fix_wsl_paths(COMBINED_CSV_PATH)
 OUTSIDE_FRAME_TARGET_DESCRIPTION = "something or someone outside the frame"

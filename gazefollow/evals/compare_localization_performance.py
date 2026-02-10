@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from dataclasses import dataclass, field
@@ -40,8 +41,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-json",
         type=Path,
-        default=Path("localization_top_diffs.json"),
-        help="Path to write JSON file with top difference details (default: localization_top_diffs.json).",
+        default=None,
+        help="Path to write JSON file with top difference details (default: <root>/localization_top_diffs.json).",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        help="Path to write CSV file with per-dataset total metrics (default: <root>/localization_total_metrics.csv).",
     )
     return parser.parse_args()
 
@@ -218,8 +225,14 @@ def load_dataset_metrics(path: Path) -> DatasetMetrics:
         dataset.mean_normalized_error = mean(dataset.normalized_errors.values())
 
     # Compute Recall Precision
-    dataset.recall = dataset.true_positives / (dataset.true_positives + dataset.false_negatives)              
-    dataset.precision = dataset.true_positives / (dataset.true_positives + dataset.false_positives)
+    recall_denominator = dataset.true_positives + dataset.false_negatives
+    precision_denominator = dataset.true_positives + dataset.false_positives
+    dataset.recall = (
+        dataset.true_positives / recall_denominator if recall_denominator else None
+    )
+    dataset.precision = (
+        dataset.true_positives / precision_denominator if precision_denominator else None
+    )
 
     return dataset
 
@@ -418,9 +431,51 @@ def write_top_diff_json(path: Path, summary: Dict[str, Any]) -> None:
     path.write_text(json.dumps(summary, indent=2))
 
 
+def write_metrics_csv(path: Path, datasets: Iterable[DatasetMetrics]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "path",
+        "adapter_path",
+        "total_samples",
+        "true_positives",
+        "true_negatives",
+        "false_positives",
+        "false_negatives",
+        "recall",
+        "precision",
+        "valid_gaze_samples",
+        "intersection_mean_gaze_normalized_l2_error",
+        "missing_intersection_errors",
+        "mean_gaze_normalized_l2_error",
+    ]
+    with path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for ds in datasets:
+            writer.writerow(
+                {
+                    "path": str(ds.path),
+                    "adapter_path": ds.adapter_path or "",
+                    "total_samples": ds.total_samples,
+                    "true_positives": ds.true_positives,
+                    "true_negatives": ds.true_negatives,
+                    "false_positives": ds.false_positives,
+                    "false_negatives": ds.false_negatives,
+                    "recall": ds.recall,
+                    "precision": ds.precision,
+                    "valid_gaze_samples": len(ds.valid_ids),
+                    "intersection_mean_gaze_normalized_l2_error": ds.intersection_mean_error,
+                    "missing_intersection_errors": ds.missing_intersection_errors,
+                    "mean_gaze_normalized_l2_error": ds.mean_normalized_error,
+                }
+            )
+
+
 def main() -> int:
     args = parse_args()
     files = find_localization_files(args.root)
+    output_json_path = args.output_json or (args.root / "localization_top_diffs.json")
+    output_csv_path = args.output_csv or (args.root / "localization_total_metrics.csv")
 
     print(f"Found {len(files)} localization result file(s) under {args.root}")
 
@@ -429,7 +484,7 @@ def main() -> int:
         return 1
 
     datasets = [load_dataset_metrics(path) for path in files]
-    datasets = [ds for ds in datasets if ds.total_samples > 100]
+    datasets = [ds for ds in datasets if ds.total_samples > 10]
     intersection = compute_intersection_metrics(datasets)
     baseline = None
     if args.baseline_substring:
@@ -502,8 +557,10 @@ def main() -> int:
         ],
         "datasets": combined_results,
     }
-    write_top_diff_json(args.output_json, summary)
-    print(f"Top difference details saved to {args.output_json}")
+    write_top_diff_json(output_json_path, summary)
+    write_metrics_csv(output_csv_path, datasets)
+    print(f"Top difference details saved to {output_json_path}")
+    print(f"Total metrics CSV saved to {output_csv_path}")
 
     return 0
 
