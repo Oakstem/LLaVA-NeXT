@@ -74,6 +74,37 @@ def wandb_summary(training_args, summary_dict):
         wandb.run.summary.update(summary_dict)
 
 
+def build_focus_phrase_token_ids(tokenizer, phrase: str) -> List[List[int]]:
+    """Generate candidate token id sequences for the target phrase."""
+    if not phrase:
+        return []
+
+    stripped = phrase.strip()
+    candidates = {phrase}
+    if stripped:
+        candidates.add(stripped)
+        candidates.add(stripped.lower())
+        candidates.add(stripped.capitalize())
+        candidates.add(f" {stripped}")
+        candidates.add(f" {stripped.lower()}")
+
+    token_sequences: List[List[int]] = []
+    seen: set = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        ids = tokenizer.encode(candidate, add_special_tokens=False)
+        if not ids:
+            continue
+        key = tuple(ids)
+        if key in seen:
+            continue
+        seen.add(key)
+        token_sequences.append(ids)
+
+    return token_sequences
+
+
 # Import custom evaluation functions
 try:
     from evaluate_model import (
@@ -231,6 +262,13 @@ class TrainingArguments(transformers.TrainingArguments):
     focus_loss_after_looking: bool = field(default=True, metadata={"help": "Focus loss on tokens after 'looking at' phrase"})
     focus_loss_phrase: str = field(default="looking at", metadata={"help": "Phrase to focus loss calculation"})
     focus_loss_threshold: float = field(default=5.0, metadata={"help": "Maximum loss when focus phrase not found"})
+    roi_contrastive_enable: bool = field(default=False, metadata={"help": "Enable ROI-text contrastive loss during training."})
+    roi_contrastive_weight: float = field(default=0.1, metadata={"help": "Base weight for ROI contrastive loss."})
+    roi_contrastive_temperature: float = field(default=0.07, metadata={"help": "Temperature for ROI contrastive InfoNCE."})
+    roi_contrastive_dim: int = field(default=512, metadata={"help": "Shared embedding dimension for ROI contrastive heads."})
+    roi_contrastive_phrase: str = field(default="looking at", metadata={"help": "Phrase used to locate the target span for ROI contrastive pooling."})
+    roi_contrastive_warmup_ratio: float = field(default=0.1, metadata={"help": "Warmup ratio for ROI contrastive loss weight based on max_steps."})
+    roi_contrastive_radius_ratio: float = field(default=0.08, metadata={"help": "ROI radius as a fraction of vision patch-grid width."})
 
 
 # @dataclass
@@ -1492,6 +1530,33 @@ class LazySupervisedDataset(Dataset):
             image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         return image, image_size, "image"
 
+    def _build_roi_gaze_metadata(self, sample_dict: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build normalized gaze point metadata for ROI contrastive loss."""
+        default_xy = torch.tensor([-1.0, -1.0], dtype=torch.float32)
+        gaze_x = sample_dict.get("gaze_gt_x")
+        gaze_y = sample_dict.get("gaze_gt_y")
+        gaze_w = sample_dict.get("gaze_gt_width")
+        gaze_h = sample_dict.get("gaze_gt_height")
+        in_out = sample_dict.get("in_out")
+
+        if gaze_x is None or gaze_y is None or gaze_w is None or gaze_h is None:
+            return default_xy, torch.tensor(False, dtype=torch.bool)
+
+        gaze_x = float(gaze_x)
+        gaze_y = float(gaze_y)
+        gaze_w = float(gaze_w)
+        gaze_h = float(gaze_h)
+        if not all(math.isfinite(v) for v in (gaze_x, gaze_y, gaze_w, gaze_h)):
+            return default_xy, torch.tensor(False, dtype=torch.bool)
+        if gaze_w <= 0 or gaze_h <= 0:
+            return default_xy, torch.tensor(False, dtype=torch.bool)
+        if in_out is not None and int(in_out) == 0:
+            return default_xy, torch.tensor(False, dtype=torch.bool)
+
+        x_norm = max(0.0, min(1.0, gaze_x / gaze_w))
+        y_norm = max(0.0, min(1.0, gaze_y / gaze_h))
+        return torch.tensor([x_norm, y_norm], dtype=torch.float32), torch.tensor(True, dtype=torch.bool)
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         # TODO: define number of retries somewhere else
         num_base_retries = 3
@@ -1629,6 +1694,9 @@ class LazySupervisedDataset(Dataset):
             data_dict["prompt"] = prompt
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
+        roi_gaze_xy, roi_gaze_valid = self._build_roi_gaze_metadata(self.list_data_dict[i])
+        data_dict["roi_gaze_xy"] = roi_gaze_xy
+        data_dict["roi_gaze_valid"] = roi_gaze_valid
 
         return data_dict
 
@@ -1676,6 +1744,9 @@ class DataCollatorForSupervisedDataset(object):
 
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
+        if "roi_gaze_xy" in instances[0]:
+            batch["roi_gaze_xy"] = torch.stack([instance["roi_gaze_xy"] for instance in instances], dim=0)
+            batch["roi_gaze_valid"] = torch.stack([instance["roi_gaze_valid"] for instance in instances], dim=0).bool()
 
         return batch
 
@@ -2109,6 +2180,28 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
+
+    roi_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, training_args.roi_contrastive_phrase)
+    warmup_steps = 0
+    if training_args.max_steps and training_args.max_steps > 0:
+        warmup_steps = int(training_args.max_steps * training_args.roi_contrastive_warmup_ratio)
+    model.config.roi_contrastive_enable = training_args.roi_contrastive_enable
+    model.config.roi_contrastive_weight = training_args.roi_contrastive_weight
+    model.config.roi_contrastive_temperature = training_args.roi_contrastive_temperature
+    model.config.roi_contrastive_dim = training_args.roi_contrastive_dim
+    model.config.roi_contrastive_phrase = training_args.roi_contrastive_phrase
+    model.config.roi_contrastive_phrase_token_ids = roi_phrase_token_ids
+    model.config.roi_contrastive_warmup_steps = warmup_steps
+    model.config.roi_contrastive_radius_ratio = training_args.roi_contrastive_radius_ratio
+    rank0_print(
+        "ROI contrastive config: "
+        f"enabled={training_args.roi_contrastive_enable}, "
+        f"weight={training_args.roi_contrastive_weight}, "
+        f"temp={training_args.roi_contrastive_temperature}, "
+        f"dim={training_args.roi_contrastive_dim}, "
+        f"warmup_steps={warmup_steps}, "
+        f"phrase_candidates={len(roi_phrase_token_ids)}"
+    )
     
     # Set vision tower parameter from model args if provided, otherwise use pretrained
     if model_args.vision_tower is None:
@@ -2316,6 +2409,16 @@ def train(attn_implementation=None):
             rank0_print(f"Custom module parameters set to require gradients ({len(custom_params)} parameters):")
             for param_name in sorted(custom_params):
                 rank0_print(f"  {param_name}")
+    if training_args.roi_contrastive_enable:
+        roi_head_params = []
+        for name, param in model.named_parameters():
+            if "roi_text_projector" in name or "roi_vision_projector" in name:
+                param.requires_grad_(True)
+                roi_head_params.append(name)
+        rank0_print(f"Enabled ROI contrastive head parameters ({len(roi_head_params)}):")
+        for param_name in sorted(roi_head_params):
+            rank0_print(f"  {param_name}")
+
     total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
     trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
     rank0_print(f"Total parameters: {total_params:,}")

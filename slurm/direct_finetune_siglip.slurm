@@ -124,6 +124,13 @@ LEARNING_RATE="2e-6"
 WEIGHT_DECAY="0.01"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
+ROI_CONTRASTIVE_ENABLE="False"
+ROI_CONTRASTIVE_WEIGHT="0.1"
+ROI_CONTRASTIVE_TEMPERATURE="0.07"
+ROI_CONTRASTIVE_DIM="512"
+ROI_CONTRASTIVE_PHRASE="looking at"
+ROI_CONTRASTIVE_WARMUP_RATIO="0.1"
+ROI_CONTRASTIVE_RADIUS_RATIO="0.08"
 
 # Evaluation and saving
 EVALUATION_STRATEGY="no"
@@ -195,6 +202,13 @@ echo "Learning Rate: ${LEARNING_RATE}"
 echo "Weight Decay: ${WEIGHT_DECAY}"
 echo "Warmup Ratio: ${WARMUP_RATIO}"
 echo "LR Scheduler: ${LR_SCHEDULER_TYPE}"
+echo "ROI Contrastive Enable: ${ROI_CONTRASTIVE_ENABLE}"
+echo "ROI Contrastive Weight: ${ROI_CONTRASTIVE_WEIGHT}"
+echo "ROI Contrastive Temperature: ${ROI_CONTRASTIVE_TEMPERATURE}"
+echo "ROI Contrastive Dim: ${ROI_CONTRASTIVE_DIM}"
+echo "ROI Contrastive Phrase: ${ROI_CONTRASTIVE_PHRASE}"
+echo "ROI Contrastive Warmup Ratio: ${ROI_CONTRASTIVE_WARMUP_RATIO}"
+echo "ROI Contrastive Radius Ratio: ${ROI_CONTRASTIVE_RADIUS_RATIO}"
 echo ""
 echo "=== EVALUATION & SAVING ==="
 echo "Evaluation Strategy: ${EVALUATION_STRATEGY}"
@@ -259,6 +273,13 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --weight_decay ${WEIGHT_DECAY} \
     --warmup_ratio ${WARMUP_RATIO} \
     --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
+    --roi_contrastive_enable ${ROI_CONTRASTIVE_ENABLE} \
+    --roi_contrastive_weight ${ROI_CONTRASTIVE_WEIGHT} \
+    --roi_contrastive_temperature ${ROI_CONTRASTIVE_TEMPERATURE} \
+    --roi_contrastive_dim ${ROI_CONTRASTIVE_DIM} \
+    --roi_contrastive_phrase "${ROI_CONTRASTIVE_PHRASE}" \
+    --roi_contrastive_warmup_ratio ${ROI_CONTRASTIVE_WARMUP_RATIO} \
+    --roi_contrastive_radius_ratio ${ROI_CONTRASTIVE_RADIUS_RATIO} \
     --logging_steps ${LOGGING_STEPS} \
     --tf32 ${TF32} \
     --model_max_length ${MODEL_MAX_LENGTH} \

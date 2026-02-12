@@ -316,6 +316,13 @@ class LLaVATrainer(Trainer):
         self.sequence_stats_max_length = 0
         self.sequence_stats_cap = 4096
         self.sequence_stats_window = 512
+        self.roi_contrastive_stats = {
+            "nce_loss": [],
+            "top1": [],
+            "pairs": [],
+            "lambda": [],
+        }
+        self.roi_contrastive_stats_cap = 2048
         self._sanity_table = None
         self._sanity_consecutive_failures = 0
         self._sanity_failure_limit = getattr(self.args, "sanity_check_failures_to_stop", 5)
@@ -637,6 +644,7 @@ class LLaVATrainer(Trainer):
             unwrapped_model = self.accelerator.unwrap_model(model)
         except Exception:
             unwrapped_model = model
+        self._collect_roi_contrastive_metrics(unwrapped_model)
 
         if not hasattr(unwrapped_model, "pop_sequence_length_stats"):
             return
@@ -681,6 +689,38 @@ class LLaVATrainer(Trainer):
         for key in ("total_tokens", "target_tokens", "truncations"):
             if len(self.sequence_stats[key]) > self.sequence_stats_cap:
                 self.sequence_stats[key] = self.sequence_stats[key][-self.sequence_stats_cap:]
+
+    def _collect_roi_contrastive_metrics(self, unwrapped_model):
+        if not hasattr(unwrapped_model, "pop_roi_contrastive_stats"):
+            return
+
+        stats = unwrapped_model.pop_roi_contrastive_stats()
+        if not stats:
+            return
+
+        nce_loss = stats.get("nce_loss")
+        top1 = stats.get("top1")
+        pair_count = stats.get("pairs")
+        lambda_val = stats.get("lambda")
+        if nce_loss is None or top1 is None or pair_count is None or lambda_val is None:
+            return
+
+        gathered_nce = self.accelerator.gather(nce_loss.detach().float().reshape(1))
+        gathered_top1 = self.accelerator.gather(top1.detach().float().reshape(1))
+        gathered_pairs = self.accelerator.gather(pair_count.detach().long().reshape(1))
+        gathered_lambda = self.accelerator.gather(lambda_val.detach().float().reshape(1))
+
+        if self.is_world_process_zero():
+            self.roi_contrastive_stats["nce_loss"].append(float(gathered_nce.mean().item()))
+            self.roi_contrastive_stats["top1"].append(float(gathered_top1.mean().item()))
+            self.roi_contrastive_stats["pairs"].append(float(gathered_pairs.float().mean().item()))
+            self.roi_contrastive_stats["lambda"].append(float(gathered_lambda.mean().item()))
+            self._trim_roi_contrastive_stats()
+
+    def _trim_roi_contrastive_stats(self):
+        for key in ("nce_loss", "top1", "pairs", "lambda"):
+            if len(self.roi_contrastive_stats[key]) > self.roi_contrastive_stats_cap:
+                self.roi_contrastive_stats[key] = self.roi_contrastive_stats[key][-self.roi_contrastive_stats_cap:]
 
     def _log_sequence_length_stats(self):
         if not self.is_world_process_zero():
@@ -766,6 +806,21 @@ class LLaVATrainer(Trainer):
         # Only add data loading if we have meaningful data
         if avg_data_loading > 0:
             metrics["timing/avg_data_loading_seconds"] = avg_data_loading
+
+        if self.roi_contrastive_stats["nce_loss"]:
+            recent_roi = min(recent_steps, len(self.roi_contrastive_stats["nce_loss"]))
+            roi_nce = sum(self.roi_contrastive_stats["nce_loss"][-recent_roi:]) / recent_roi
+            roi_top1 = sum(self.roi_contrastive_stats["top1"][-recent_roi:]) / recent_roi
+            roi_pairs = sum(self.roi_contrastive_stats["pairs"][-recent_roi:]) / recent_roi
+            roi_lambda = sum(self.roi_contrastive_stats["lambda"][-recent_roi:]) / recent_roi
+            metrics["roi_contrastive/nce_loss"] = roi_nce
+            metrics["roi_contrastive/top1"] = roi_top1
+            metrics["roi_contrastive/pairs"] = roi_pairs
+            metrics["roi_contrastive/lambda"] = roi_lambda
+            rank0_print(
+                f"ROI contrastive - NCE: {roi_nce:.4f}, Top1: {roi_top1:.3f}, "
+                f"Pairs: {roi_pairs:.2f}, Lambda: {roi_lambda:.4f}"
+            )
             
         safe_wandb_log(self.args, metrics, step=self.state.global_step)
         

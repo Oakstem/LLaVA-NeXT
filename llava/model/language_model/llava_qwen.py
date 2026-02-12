@@ -16,6 +16,7 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 import ast
 import re
@@ -34,6 +35,7 @@ from qwen2.modeling_qwen2 import Qwen2Model, Qwen2ForCausalLM
 from llava.mm_utils import select_best_resolution # Import the helper from mm_utils
 from llava.constants import IMAGE_TOKEN_INDEX
 from llava.model.language_model.attention_mask_visualizer import visualize_attention_mask_step
+from gazefollow.focus_loss_utils import locate_focus_start_index, prepare_focus_phrase_sequences
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -70,6 +72,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         self.model = LlavaQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        roi_dim = int(getattr(config, "roi_contrastive_dim", 512))
+        self.roi_text_projector = nn.Linear(config.hidden_size, roi_dim, bias=False)
+        self.roi_vision_projector = nn.Linear(config.hidden_size, roi_dim, bias=False)
+        self._roi_contrastive_step = 0
+        self._roi_contrastive_stats: Optional[Dict[str, torch.Tensor]] = None
         self.latest_person_mask_repr: Optional[torch.Tensor] = None
         self.latest_attention_mask_snapshot: Optional[Dict[str, Any]] = None
         # Initialize weights and apply final processing
@@ -284,14 +291,31 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         pixel_coords_for_attention: Optional[List[Tuple[int, int]]] = None, # New parameter
         **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        self._roi_contrastive_stats = None
         self.latest_person_mask_repr = None
         ids_to_attend_pixels = []
         original_input_ids = input_ids # Save before potential modification
         # original_attention_mask = attention_mask # Keep a reference if needed
         final_ids_to_attend = kwargs.get("boost_positions" , None)
         mask_logic_applied = False
+        image_features_ret = None
         image_token_filter_indices = kwargs.pop("image_token_filter_indices", None)
         attention_mask_viz_config = kwargs.pop("attention_mask_viz", None)
+        roi_gaze_xy = kwargs.pop("roi_gaze_xy", None)
+        roi_gaze_valid = kwargs.pop("roi_gaze_valid", None)
+        roi_contrastive_enabled = bool(getattr(self.config, "roi_contrastive_enable", False))
+        roi_requires_hidden_states = (
+            roi_contrastive_enabled
+            and self.training
+            and not dpo_forward
+            and images is not None
+            and labels is not None
+            and roi_gaze_xy is not None
+            and roi_gaze_valid is not None
+        )
+        forced_output_hidden_states = roi_requires_hidden_states and not bool(output_hidden_states)
+        if forced_output_hidden_states:
+            output_hidden_states = True
 
         if inputs_embeds is None:
             if images is not None and image_sizes is not None:
@@ -308,6 +332,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         image_sizes=image_sizes,
                         image_token_filter_indices=image_token_filter_indices,
                     )
+                image_features_ret = _image_features_ret
                 if kwargs.get("use_target_insert_indices_for_source"):
                     self._maybe_share_target_insert_positions(self.tokens_indexing)
 
@@ -477,7 +502,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             return logits, labels
 
         else:
-            return super().forward(
+            outputs = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 source_attention_mask=source_attention_mask,
@@ -495,6 +520,17 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 # query_indices=kwargs.get("query_indices", None),
                 **kwargs
             )
+            if roi_requires_hidden_states:
+                outputs = self._apply_roi_contrastive_loss(
+                    outputs=outputs,
+                    labels=labels,
+                    image_features=image_features_ret,
+                    roi_gaze_xy=roi_gaze_xy,
+                    roi_gaze_valid=roi_gaze_valid,
+                )
+            if forced_output_hidden_states and isinstance(outputs, CausalLMOutputWithPast):
+                outputs.hidden_states = None
+            return outputs
 
     @torch.no_grad()
     def generate(
@@ -614,6 +650,164 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         snapshot = self.latest_attention_mask_snapshot
         self.latest_attention_mask_snapshot = None
         return snapshot
+
+    def _ensure_roi_projection_heads(self, target_dim: int, device: torch.device, dtype: torch.dtype) -> None:
+        if self.roi_text_projector.out_features != target_dim:
+            self.roi_text_projector = nn.Linear(self.config.hidden_size, target_dim, bias=False).to(device=device, dtype=dtype)
+            self.roi_vision_projector = nn.Linear(self.config.hidden_size, target_dim, bias=False).to(device=device, dtype=dtype)
+        else:
+            self.roi_text_projector = self.roi_text_projector.to(device=device, dtype=dtype)
+            self.roi_vision_projector = self.roi_vision_projector.to(device=device, dtype=dtype)
+
+    @staticmethod
+    def _build_roi_patch_indices(x_norm: float, y_norm: float, grid_side: int, radius: int) -> List[int]:
+        center_x = int(round(x_norm * (grid_side - 1)))
+        center_y = int(round(y_norm * (grid_side - 1)))
+        valid_indices: List[int] = []
+        r2 = radius * radius
+        min_x = max(0, center_x - radius)
+        max_x = min(grid_side - 1, center_x + radius)
+        min_y = max(0, center_y - radius)
+        max_y = min(grid_side - 1, center_y + radius)
+        for y_coord in range(min_y, max_y + 1):
+            dy = y_coord - center_y
+            for x_coord in range(min_x, max_x + 1):
+                dx = x_coord - center_x
+                if dx * dx + dy * dy <= r2:
+                    valid_indices.append(y_coord * grid_side + x_coord)
+        return valid_indices
+
+    def _apply_roi_contrastive_loss(
+        self,
+        outputs: CausalLMOutputWithPast,
+        labels: Optional[torch.Tensor],
+        image_features: Optional[List[torch.Tensor]],
+        roi_gaze_xy: Optional[torch.Tensor],
+        roi_gaze_valid: Optional[torch.Tensor],
+    ) -> CausalLMOutputWithPast:
+        if not isinstance(outputs, CausalLMOutputWithPast):
+            return outputs
+        if outputs.loss is None or outputs.hidden_states is None or labels is None:
+            return outputs
+        if image_features is None or roi_gaze_xy is None or roi_gaze_valid is None:
+            return outputs
+
+        self._roi_contrastive_step += 1
+        phrase_sequences = prepare_focus_phrase_sequences(
+            getattr(self.config, "roi_contrastive_phrase_token_ids", None),
+            labels.device,
+        )
+        if not phrase_sequences:
+            return outputs
+
+        hidden_last = outputs.hidden_states[-1]
+        batch_limit = min(
+            hidden_last.shape[0],
+            labels.shape[0],
+            roi_gaze_xy.shape[0],
+            roi_gaze_valid.shape[0],
+            len(image_features),
+        )
+        if batch_limit <= 0:
+            return outputs
+
+        vision_tower = self.get_vision_tower()
+        default_grid_side = 0
+        if vision_tower is not None:
+            default_grid_side = int(getattr(vision_tower, "num_patches_per_side", 0) or 0)
+
+        radius_ratio = float(getattr(self.config, "roi_contrastive_radius_ratio", 0.08))
+        text_embeddings: List[torch.Tensor] = []
+        vision_embeddings: List[torch.Tensor] = []
+
+        for row_idx in range(batch_limit):
+            if not bool(roi_gaze_valid[row_idx].item()):
+                continue
+
+            focus_start = locate_focus_start_index(labels[row_idx], phrase_sequences)
+            if focus_start is None:
+                continue
+            span_mask = labels[row_idx] >= 0
+            if focus_start > 0:
+                span_mask = span_mask & (torch.arange(labels[row_idx].shape[0], device=labels.device) >= focus_start)
+            if not span_mask.any():
+                continue
+            text_embed = hidden_last[row_idx][span_mask].mean(dim=0)
+
+            sample_image_features = image_features[row_idx]
+            if not torch.is_tensor(sample_image_features) or sample_image_features.ndim != 2:
+                continue
+            grid_side = default_grid_side
+            if grid_side <= 0 or grid_side * grid_side > sample_image_features.shape[0]:
+                grid_side = int(math.sqrt(sample_image_features.shape[0]))
+            base_token_count = grid_side * grid_side
+            if base_token_count <= 0:
+                continue
+
+            x_norm = float(torch.clamp(roi_gaze_xy[row_idx][0], 0.0, 1.0).item())
+            y_norm = float(torch.clamp(roi_gaze_xy[row_idx][1], 0.0, 1.0).item())
+            radius = max(1, int(round(radius_ratio * grid_side)))
+            roi_indices = self._build_roi_patch_indices(x_norm, y_norm, grid_side, radius)
+            if not roi_indices:
+                continue
+            roi_indices_tensor = torch.as_tensor(roi_indices, device=sample_image_features.device, dtype=torch.long)
+            roi_indices_tensor = roi_indices_tensor[roi_indices_tensor < base_token_count]
+            if roi_indices_tensor.numel() == 0:
+                continue
+            vision_embed = sample_image_features.index_select(0, roi_indices_tensor).mean(dim=0)
+
+            text_embeddings.append(text_embed)
+            vision_embeddings.append(vision_embed)
+
+        pair_count = len(text_embeddings)
+        if pair_count < 2:
+            stats_device = outputs.loss.device
+            self._roi_contrastive_stats = {
+                "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "top1": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
+                "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
+            }
+            return outputs
+
+        text_batch = torch.stack(text_embeddings, dim=0)
+        vision_batch = torch.stack(vision_embeddings, dim=0)
+        shared_dim = int(getattr(self.config, "roi_contrastive_dim", 512))
+        self._ensure_roi_projection_heads(shared_dim, device=text_batch.device, dtype=text_batch.dtype)
+        text_proj = F.normalize(self.roi_text_projector(text_batch.float()), dim=-1)
+        vision_proj = F.normalize(self.roi_vision_projector(vision_batch.float()), dim=-1)
+
+        temperature = max(float(getattr(self.config, "roi_contrastive_temperature", 0.07)), 1e-6)
+        similarity = (vision_proj @ text_proj.t()) / temperature
+        targets = torch.arange(pair_count, device=similarity.device, dtype=torch.long)
+        loss_v2t = F.cross_entropy(similarity, targets)
+        loss_t2v = F.cross_entropy(similarity.t(), targets)
+        nce_loss = 0.5 * (loss_v2t + loss_t2v)
+
+        base_weight = float(getattr(self.config, "roi_contrastive_weight", 0.1))
+        warmup_steps = int(getattr(self.config, "roi_contrastive_warmup_steps", 0))
+        warmup_factor = 1.0
+        if warmup_steps > 0:
+            warmup_factor = min(1.0, float(self._roi_contrastive_step) / float(warmup_steps))
+        effective_weight = base_weight * warmup_factor
+
+        outputs.loss = outputs.loss + outputs.loss.new_tensor(effective_weight) * nce_loss.to(
+            device=outputs.loss.device,
+            dtype=outputs.loss.dtype,
+        )
+        top1_acc = (similarity.argmax(dim=-1) == targets).float().mean()
+        self._roi_contrastive_stats = {
+            "nce_loss": nce_loss.detach(),
+            "top1": top1_acc.detach(),
+            "pairs": torch.tensor(pair_count, device=top1_acc.device, dtype=torch.long),
+            "lambda": torch.tensor(effective_weight, device=top1_acc.device, dtype=torch.float32),
+        }
+        return outputs
+
+    def pop_roi_contrastive_stats(self) -> Optional[Dict[str, torch.Tensor]]:
+        stats = self._roi_contrastive_stats
+        self._roi_contrastive_stats = None
+        return stats
 
     @staticmethod
     def _build_custom_attention_mask_static(input_embeds: Optional[torch.Tensor],
