@@ -2,9 +2,8 @@
 # powershell -ExecutionPolicy Bypass -File scripts/run_single_region_workflow.ps1
 Param(
     [string]$RepoRoot = "D:\Projects\LLaVA-NeXT",
-    # [string]$ImagePath = "D:\Projects\data\gazefollow\train\00000093\00093143.jpg",
-    # [string]$ImagePath = "D:\Projects\data\gazefollow\train\00000012\00012014.jpg",
-    [string]$ImagePath = "D:/Projects/data/gazefollow/train/00000000/00000691.jpg",
+    [string]$ImagePath = "",
+    [string]$TrainDir = "D:/Projects/data/gazefollow/train",
     [string]$WindowsPython = "D:\pythonEnvs\p39\Scripts\python.exe",
     [string]$MaskScript = "scripts/create_region_mask_from_bbox.py",
     [string]$MaskOutputDir = "region_masks",
@@ -35,10 +34,33 @@ if (!(Test-Path $maskScriptPath)) {
     throw "Mask script not found at $maskScriptPath"
 }
 
+$resolvedImagePath = $ImagePath
+if ([string]::IsNullOrWhiteSpace($resolvedImagePath)) {
+    if (!(Test-Path -Path $TrainDir -PathType Container)) {
+        throw "Train directory not found at $TrainDir"
+    }
+
+    $candidateDirs = Get-ChildItem -Path $TrainDir -Directory
+    if ($candidateDirs.Count -eq 0) {
+        throw "No subdirectories found under $TrainDir"
+    }
+
+    $selectedDir = Get-Random -InputObject $candidateDirs
+    $candidateImages = Get-ChildItem -Path $selectedDir.FullName -File | Where-Object {
+        $_.Extension -in @(".jpg", ".jpeg", ".png")
+    }
+    if ($candidateImages.Count -eq 0) {
+        throw "No images found in selected directory $($selectedDir.FullName)"
+    }
+
+    $resolvedImagePath = (Get-Random -InputObject $candidateImages).FullName
+    Write-Host "[Selection] Randomly selected image: $resolvedImagePath"
+}
+
 $maskArgs = @(
     $WindowsPython,
     $maskScriptPath,
-    "--image-path", $ImagePath,
+    "--image-path", $resolvedImagePath,
     "--output-dir", $maskOutputPath,
     "--mask-prefix", $MaskPrefix
 )

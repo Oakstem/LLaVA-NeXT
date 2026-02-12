@@ -114,11 +114,30 @@ def _print_mask_info(mask_path: Path, metadata: Optional[Dict[str, Any]], mask: 
         )
 
 
+# DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
+# a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans.
+# a chic woman in a beige coat → a woman in a beige coat and ankle boots.
+# a techy man in a leather jacket → a man in a black leather jacket and glasses.
+# a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans.
+
+# The sentence: a _ →"""
+# DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
+# a scruffy guy in a tee → a guy with messy hair wearing a faded graphic t-shirt and loose jeans.
+# a warm croissant → a golden, flaky croissant with crisp layers and a soft buttery center.
+# a stylish woman in red → a woman with sleek hair wearing a bright red blazer and matching heels.
+# a young child in overalls → a small child with curly hair wearing light denim overalls and a striped tee.
+# a bulky backpack → a large black backpack with thick straps and a padded mesh back.
+# a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
+# a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
+
+# The sentence: a _ →"""
+
+## Objects Only Prompt
 DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
-a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans.
-a chic woman in a beige coat → a woman in a beige coat and ankle boots.
-a techy man in a leather jacket → a man in a black leather jacket and glasses.
-a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans.
+a warm croissant → a golden, flaky croissant with crisp layers and a soft buttery center.
+a bulky backpack → a large black backpack with thick straps and a padded mesh back.
+a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
+a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
 
 The sentence: a _ →"""
 # DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
@@ -165,6 +184,12 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--use-gaze-guidance", action="store_true", default=False)
     parser.add_argument("--save-debug-files", action="store_true", default=False)
+    parser.add_argument(
+        "--save-attention-mask-html",
+        action="store_true",
+        default=False,
+        help="Save attention_mask_sequence.html visualization (disabled by default).",
+    )
     parser.add_argument("--save-mask-overlays", action="store_true", default=False)
     parser.add_argument("--mask-overlay-alpha", type=float, default=0.4)
     parser.add_argument("--exclude-image-inputs", action="store_true", default=False)
@@ -246,7 +271,9 @@ def main() -> None:
         "include_image_inputs": not args.exclude_image_inputs,
         "filter_image_tokens_to_person_mask": False,
         "same_mask_for_person": True,
-        "attention_mask_viz_dir": str(run_dir / "attention_masks"),
+        "attention_mask_viz_dir": str(run_dir / "attention_masks")
+        if args.save_attention_mask_html
+        else False,
     }
 
     prev_hidden_state = None

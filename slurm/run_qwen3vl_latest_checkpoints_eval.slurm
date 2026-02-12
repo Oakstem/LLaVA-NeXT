@@ -62,15 +62,16 @@ GAZE_IOU_RADIUS_RATIO="${GAZE_IOU_RADIUS_RATIO:-0.05}"
 # Run selection
 RUN_SELECTION_LIMIT="${RUN_SELECTION_LIMIT:-10}"
 CHECKPOINT_STEP="${CHECKPOINT_STEP:-9000}"
+RUN_NAME_PATTERN="${RUN_NAME_PATTERN:-llava-*}"
 
 mapfile -t RUN_DIRS < <(
-    find training_outputs -maxdepth 1 -mindepth 1 -type d -name 'llava-*' -printf '%T@ %f\n' |
+    find training_outputs -maxdepth 1 -mindepth 1 -type d -name "$RUN_NAME_PATTERN" -printf '%T@ %f\n' |
         sort -nr |
         awk -v limit="$RUN_SELECTION_LIMIT" 'NR<=limit {print $2}'
 )
 
 if [ "${#RUN_DIRS[@]}" -eq 0 ]; then
-    echo "No training runs found in training_outputs/" >&2
+    echo "No training runs found in training_outputs/ matching pattern: $RUN_NAME_PATTERN" >&2
     exit 1
 fi
 

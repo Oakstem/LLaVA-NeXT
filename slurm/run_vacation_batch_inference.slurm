@@ -44,6 +44,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
 TWO_STEP_INFERENCE="${TWO_STEP_INFERENCE:-true}"
+SECOND_STEP_KEEP_ADAPTER="${SECOND_STEP_KEEP_ADAPTER:-false}"
 
 # GPT extraction parameters
 ENABLE_GPT_EXTRACTION="${ENABLE_GPT_EXTRACTION:-false}"
@@ -80,6 +81,7 @@ echo "Max New Tokens: $MAX_NEW_TOKENS"
 echo "Temperature: $TEMPERATURE"
 echo "Disable Optimizations: $DISABLE_OPTIMIZATIONS"
 echo "Two-Step Inference: $TWO_STEP_INFERENCE"
+echo "Second Step Keep Adapter: $SECOND_STEP_KEEP_ADAPTER"
 echo "Enable GPT Extraction: $ENABLE_GPT_EXTRACTION"
 echo "GPT Model: $GPT_MODEL"
 echo "=========================================="
@@ -172,6 +174,9 @@ fi
 # Add two-step inference option
 if [ "$TWO_STEP_INFERENCE" = "true" ]; then
     ARGS+=("--two-step-inference")
+fi
+if [ "$SECOND_STEP_KEEP_ADAPTER" = "true" ]; then
+    ARGS+=("--second-step-keep-adapter")
 fi
 
 # Add GPT extraction options

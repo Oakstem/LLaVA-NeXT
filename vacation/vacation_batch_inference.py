@@ -170,6 +170,14 @@ def parse_args() -> argparse.Namespace:
         default=" \n",
         help="Separator placed between response A and prompt B in two-step inference.",
     )
+    parser.add_argument(
+        "--second-step-keep-adapter",
+        action="store_true",
+        help=(
+            "In two-step inference, keep adapters enabled for step 2. "
+            "Default behavior disables adapters in step 2 when --adapter-path is set."
+        ),
+    )
     
     # Frame selection arguments
     parser.add_argument(
@@ -572,7 +580,11 @@ def run_two_step_inference_on_frame(
         response_a = response_a.strip() + "."
     combined_prompt = f"{response_a}{args.second_separator}{prompt_b}".strip()
 
-    if hasattr(model, "disable_adapter") and args.adapter_path:
+    if (
+        hasattr(model, "disable_adapter")
+        and args.adapter_path
+        and not args.second_step_keep_adapter
+    ):
         with model.disable_adapter():
             response_b = run_inference_on_frame(
                 model,
@@ -691,6 +703,7 @@ def main():
         "prompt_a": args.prompt_a if args.two_step_inference else None,
         "prompt_b": args.prompt_b if args.two_step_inference else None,
         "second_separator": args.second_separator if args.two_step_inference else None,
+        "second_step_keep_adapter": args.second_step_keep_adapter if args.two_step_inference else None,
         "model_path": args.model_path,
         "frames_dir": str(frames_dir),
         "annotations_file": str(annotations_path),
@@ -760,6 +773,9 @@ def main():
         print("Using two-step prompts:")
         print(f"Prompt A:\n{args.prompt_a}\n")
         print(f"Prompt B:\n{args.prompt_b}\n")
+        if args.adapter_path:
+            step2_mode = "enabled" if args.second_step_keep_adapter else "disabled"
+            print(f"Step 2 adapters: {step2_mode}\n")
     else:
         print(f"Using prompt:\n{args.prompt}\n")
     print("Starting inference...")
