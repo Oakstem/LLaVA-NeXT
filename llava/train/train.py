@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
-from typing import Dict, Optional, Sequence, List, Any
+from typing import Dict, Optional, Sequence, List, Any, Tuple
 from PIL import Image, ImageFile
 from packaging import version
 import numpy as np
@@ -48,7 +48,7 @@ from llava.model import *
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
 from llava.model.builder import load_pretrained_model
-from typing import Dict, Optional, Sequence, List, Any
+from typing import Dict, Optional, Sequence, List, Any, Tuple
 
 
 def wandb_log(training_args, metrics_dict, step=None):
