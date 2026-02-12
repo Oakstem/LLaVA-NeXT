@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=qwen3vl_stage1b_neg
-#SBATCH --output=logs/qwen3vl_stage1b_neg_%j.out
-#SBATCH --error=logs/qwen3vl_stage1b_neg_%j.err
+#SBATCH --job-name=qwen3vl_neg_detection
+#SBATCH --output=logs/qwen3vl_neg_detection_%j.out
+#SBATCH --error=logs/qwen3vl_neg_detection_%j.err
 #SBATCH --time=08:00:00
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu-tad-pool
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=24G
+#SBATCH --mem=20G
 #SBATCH --nodes=1
 
 set -euo pipefail
