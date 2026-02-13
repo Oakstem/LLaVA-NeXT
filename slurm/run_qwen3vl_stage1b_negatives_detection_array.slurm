@@ -2,7 +2,7 @@
 #SBATCH --job-name=qwen3vl_neg_detection_arr
 #SBATCH --output=logs/qwen3vl_neg_detection_arr_%A_%a.out
 #SBATCH --error=logs/qwen3vl_neg_detection_arr_%A_%a.err
-#SBATCH --time=08:00:00
+#SBATCH --time=12:00:00
 #SBATCH --partition=gpu-tad-pool
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -17,10 +17,7 @@ if [ ! -d "$PROJECT_ROOT" ]; then
     PROJECT_ROOT="$(pwd)"
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/llava/bin/python}"
-if [ ! -x "$PYTHON_BIN" ]; then
-    PYTHON_BIN="/home/alonz/llava/bin/python"
-fi
+PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/.ground-uv/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "Python environment not found in /galitylab/... or /home/alonz/..." >&2
     exit 1
@@ -40,8 +37,8 @@ IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 
 CHUNK_SIZE="${CHUNK_SIZE:-10000}"
 BASE_START_INDEX="${BASE_START_INDEX:-${START_INDEX_BASE:-0}}"
-TOTAL_SAMPLES="${TOTAL_SAMPLES:-}"
-MAX_CONCURRENT_TASKS="${MAX_CONCURRENT_TASKS:-}"
+TOTAL_SAMPLES="${TOTAL_SAMPLES:-}"s
+MAX_CONCURRENT_TASKS="${MAX_CONCURRENT_TASKS:-5}"
 
 RUN_TAG="${RUN_TAG:-${SLURM_ARRAY_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}"
 OUTPUT_DIR="${OUTPUT_DIR:-training_datasets/stage1b_negatives/array_${RUN_TAG}}"

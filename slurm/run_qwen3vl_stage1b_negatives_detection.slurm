@@ -30,8 +30,10 @@ IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 OUTPUT_CSV="${OUTPUT_CSV:-training_datasets/stage1b_negatives/stage1b_qwen3vl_negatives_$(date +%Y%m%d_%H%M%S).csv}"
 
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
-MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
-HF_OFFLINE="${HF_OFFLINE:-false}"
+MODEL_CACHE_DIR=/galitylab/students/alonmardi/.cache/hub/models--Qwen--Qwen3-VL-4B-Instruct
+HF_OFFLINE=true
+# MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
+# HF_OFFLINE="${HF_OFFLINE:-false}"
 QUERY="${QUERY:-Detect all visible people and objects in the image. Return ONLY a JSON array where each element is {\"label\": string, \"bbox\": [x1,y1,x2,y2], \"score\": number}. Use bbox coordinates normalized to [0,1000].}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
