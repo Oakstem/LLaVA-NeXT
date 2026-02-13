@@ -30,6 +30,8 @@ IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 OUTPUT_CSV="${OUTPUT_CSV:-training_datasets/stage1b_negatives/stage1b_qwen3vl_negatives_$(date +%Y%m%d_%H%M%S).csv}"
 
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
+MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
+HF_OFFLINE="${HF_OFFLINE:-false}"
 QUERY="${QUERY:-Detect all visible people and objects in the image. Return ONLY a JSON array where each element is {\"label\": string, \"bbox\": [x1,y1,x2,y2], \"score\": number}. Use bbox coordinates normalized to [0,1000].}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
@@ -38,6 +40,60 @@ LIMIT="${LIMIT:-}"
 START_INDEX="${START_INDEX:-${START_FROM_INDEX:-0}}"
 REMOVE_POLICY="${REMOVE_POLICY:-smallest}"
 RESUME="${RESUME:-true}"
+
+resolve_cached_model_snapshot() {
+    local repo_cache_dir="$1"
+    local ref_file commit_hash
+    if [ ! -d "$repo_cache_dir" ]; then
+        return 1
+    fi
+    ref_file="$repo_cache_dir/refs/main"
+    if [ -f "$ref_file" ]; then
+        commit_hash="$(tr -d '\r\n' < "$ref_file")"
+        if [ -n "$commit_hash" ] && [ -d "$repo_cache_dir/snapshots/$commit_hash" ]; then
+            printf "%s" "$repo_cache_dir/snapshots/$commit_hash"
+            return 0
+        fi
+    fi
+
+    local first_snapshot
+    first_snapshot="$(find "$repo_cache_dir/snapshots" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1 || true)"
+    if [ -n "$first_snapshot" ] && [ -d "$first_snapshot" ]; then
+        printf "%s" "$first_snapshot"
+        return 0
+    fi
+    return 1
+}
+
+if [[ "$MODEL_ID" == "Qwen/Qwen3-VL-4B-Instruct" ]]; then
+    if [ -z "$MODEL_CACHE_DIR" ]; then
+        for candidate in \
+            "/galitylab/students/alonmardi/.cache/models--Qwen--Qwen3-VL-4B-Instruct" \
+            "/galitylab/students/alonmardi/.cache/hub/models--Qwen--Qwen3-VL-4B-Instruct" \
+            "/galitylab/students/alonmardi/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct" \
+            "/home/alonz/.cache/models--Qwen--Qwen3-VL-4B-Instruct" \
+            "/home/alonz/.cache/hub/models--Qwen--Qwen3-VL-4B-Instruct" \
+            "/home/alonz/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct"
+        do
+            if [ -d "$candidate" ]; then
+                MODEL_CACHE_DIR="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$MODEL_CACHE_DIR" ]; then
+        resolved_snapshot="$(resolve_cached_model_snapshot "$MODEL_CACHE_DIR" || true)"
+        if [ -n "${resolved_snapshot:-}" ]; then
+            MODEL_ID="$resolved_snapshot"
+        fi
+    fi
+fi
+
+if [ "$HF_OFFLINE" = "true" ]; then
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+fi
 
 mkdir -p logs
 mkdir -p "$(dirname "$OUTPUT_CSV")"
@@ -100,6 +156,8 @@ echo "Dataset: $DATASET_JSON"
 echo "Images Dir: $IMAGES_DIR"
 echo "Output CSV: $OUTPUT_CSV"
 echo "Model: $MODEL_ID"
+echo "Model Cache Dir: ${MODEL_CACHE_DIR:-none}"
+echo "HF Offline: $HF_OFFLINE"
 echo "Device Map: $DEVICE_MAP"
 echo "Max Tokens: $MAX_NEW_TOKENS"
 echo "Temperature: $TEMPERATURE"
