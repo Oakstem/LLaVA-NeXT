@@ -7,6 +7,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 
+def _is_rank0() -> bool:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
+def roi_debug_enabled(step: int, debug_steps: int) -> bool:
+    return int(debug_steps) > 0 and int(step) <= int(debug_steps) and _is_rank0()
+
+
+def roi_debug_log(step: int, debug_steps: int, message: str) -> None:
+    if roi_debug_enabled(step=step, debug_steps=debug_steps):
+        print(f"[ROI debug step={step}] {message}")
+
+
 def build_focus_phrase_token_ids(tokenizer, phrase: str) -> List[List[int]]:
     if not phrase:
         return []

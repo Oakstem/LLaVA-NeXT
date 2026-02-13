@@ -36,7 +36,11 @@ from llava.mm_utils import select_best_resolution # Import the helper from mm_ut
 from llava.constants import IMAGE_TOKEN_INDEX
 from llava.model.language_model.attention_mask_visualizer import visualize_attention_mask_step
 from gazefollow.focus_loss_utils import locate_focus_start_index, prepare_focus_phrase_sequences
-from gazefollow.roi_contrastive_utils import build_bbox_patch_indices, build_roi_position_vector
+from gazefollow.roi_contrastive_utils import (
+    build_bbox_patch_indices,
+    build_roi_position_vector,
+    roi_debug_log,
+)
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -787,6 +791,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if warmup_steps > 0:
             warmup_factor = min(1.0, float(self._roi_contrastive_step) / float(warmup_steps))
         effective_weight = base_weight * warmup_factor
+        debug_steps = int(getattr(self.config, "roi_contrastive_debug_steps", 20))
+        debug_this_step = debug_steps > 0 and self._roi_contrastive_step <= debug_steps
         oof_enabled = bool(getattr(self.config, "roi_contrastive_oof_enable", False))
         oof_weight = max(0.0, float(getattr(self.config, "roi_contrastive_oof_weight", 0.5)))
         oof_text_proj = self._compute_oof_text_proj(device=hidden_last.device, dtype=hidden_last.dtype) if oof_enabled else None
@@ -801,6 +807,23 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             and roi_candidate_is_positive.ndim == 2
             and roi_candidate_valid.ndim == 2
         )
+        if debug_this_step:
+            valid_gaze_count = -1
+            if roi_gaze_valid is not None:
+                try:
+                    valid_gaze_count = int(roi_gaze_valid[:batch_limit].bool().sum().item())
+                except Exception:
+                    valid_gaze_count = -1
+            roi_debug_log(
+                step=self._roi_contrastive_step,
+                debug_steps=debug_steps,
+                message=(
+                    f"batch_limit={batch_limit}, candidate_inputs_ready={candidate_inputs_ready}, "
+                    f"roi_gaze_valid_count={valid_gaze_count}, "
+                    f"warmup_steps={warmup_steps}, warmup_factor={warmup_factor:.4f}, "
+                    f"base_weight={base_weight:.4f}, effective_weight={effective_weight:.6f}"
+                ),
+            )
         if candidate_inputs_ready:
             batch_limit_candidate = min(
                 hidden_last.shape[0],
@@ -819,21 +842,30 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             candidate_oof_anchors: List[torch.Tensor] = []
             candidate_oof_targets: List[int] = []
             candidate_row_text_index: Dict[int, int] = {}
+            rows_focus_found = 0
+            rows_span_valid = 0
+            rows_image_valid = 0
+            rows_with_candidates = 0
+            rows_with_pos = 0
+            rows_with_pos_and_neg = 0
 
             for row_idx in range(batch_limit_candidate):
                 focus_start = locate_focus_start_index(labels[row_idx], phrase_sequences)
                 if focus_start is None:
                     continue
+                rows_focus_found += 1
                 span_mask = labels[row_idx] >= 0
                 if focus_start > 0:
                     span_mask = span_mask & (torch.arange(labels[row_idx].shape[0], device=labels.device) >= focus_start)
                 if not span_mask.any():
                     continue
+                rows_span_valid += 1
                 text_embed = hidden_last[row_idx][span_mask].mean(dim=0)
 
                 sample_image_features = image_features[row_idx]
                 if not torch.is_tensor(sample_image_features) or sample_image_features.ndim != 2:
                     continue
+                rows_image_valid += 1
                 grid_side = default_grid_side
                 if grid_side <= 0 or grid_side * grid_side > sample_image_features.shape[0]:
                     grid_side = int(math.sqrt(sample_image_features.shape[0]))
@@ -873,10 +905,18 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     candidate_embeds.append(fused_embed)
                     candidate_positive_flags.append(bool(row_is_positive[cand_idx].item()))
 
+                if len(candidate_embeds) > 0:
+                    rows_with_candidates += 1
                 if len(candidate_embeds) < 2:
                     continue
                 positive_mask = torch.tensor(candidate_positive_flags, device=hidden_last.device, dtype=torch.bool)
-                if not positive_mask.any() or positive_mask.all():
+                has_pos = bool(positive_mask.any().item())
+                has_neg = bool((~positive_mask).any().item())
+                if has_pos:
+                    rows_with_pos += 1
+                if has_pos and has_neg:
+                    rows_with_pos_and_neg += 1
+                if not has_pos or not has_neg:
                     continue
 
                 candidate_tensor = torch.stack(candidate_embeds, dim=0)
@@ -933,7 +973,29 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
                     self._roi_contrastive_stats["oof_top1"] = oof_top1.detach().to(device=stats_device, dtype=torch.float32)
                     self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
+                if debug_this_step:
+                    roi_debug_log(
+                        step=self._roi_contrastive_step,
+                        debug_steps=debug_steps,
+                        message=(
+                            f"candidate_path: rows_total={batch_limit_candidate}, focus={rows_focus_found}, span={rows_span_valid}, "
+                            f"image={rows_image_valid}, has_cands={rows_with_candidates}, has_pos={rows_with_pos}, "
+                            f"has_pos_neg={rows_with_pos_and_neg}, row_losses={len(row_losses)}, "
+                            f"pairs={candidate_count_total}, oof_rows={int(oof_rows.item())}, "
+                            f"nce={float(nce_loss.item()):.6f}, oof={float(oof_loss.item()):.6f}"
+                        ),
+                    )
                 return outputs
+            if debug_this_step:
+                roi_debug_log(
+                    step=self._roi_contrastive_step,
+                    debug_steps=debug_steps,
+                    message=(
+                        f"candidate_path_skipped: rows_total={batch_limit_candidate}, focus={rows_focus_found}, span={rows_span_valid}, "
+                        f"image={rows_image_valid}, has_cands={rows_with_candidates}, has_pos={rows_with_pos}, "
+                        f"has_pos_neg={rows_with_pos_and_neg}, row_losses={len(row_losses)}"
+                    ),
+                )
 
         if roi_gaze_xy is None or roi_gaze_valid is None:
             return outputs
@@ -1051,6 +1113,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
             self._roi_contrastive_stats["oof_top1"] = oof_top1.detach().to(device=stats_device, dtype=torch.float32)
             self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
+        if debug_this_step:
+            roi_debug_log(
+                step=self._roi_contrastive_step,
+                debug_steps=debug_steps,
+                message=(
+                    f"fallback_path: pair_count={pair_count}, has_base_term={has_base_term}, has_oof_term={has_oof_term}, "
+                    f"nce={float(nce_loss.item()):.6f}, oof={float(oof_loss.item()):.6f}, "
+                    f"lambda={float(lambda_value):.6f}"
+                ),
+            )
         return outputs
 
     def pop_roi_contrastive_stats(self) -> Optional[Dict[str, torch.Tensor]]:
