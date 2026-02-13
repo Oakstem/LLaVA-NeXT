@@ -54,6 +54,7 @@ from gazefollow.roi_contrastive_utils import (
     build_focus_phrase_token_ids,
     build_roi_candidate_metadata,
     build_roi_gaze_metadata,
+    find_roi_candidate_entry,
     load_roi_candidate_lookup,
 )
 
@@ -1444,7 +1445,7 @@ class LazySupervisedDataset(Dataset):
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
-        self.roi_candidate_lookup: Dict[str, Dict[str, List[List[float]]]] = {}
+        self.roi_candidate_lookup: Dict[str, Dict[str, Any]] = {}
         self.roi_max_positives = max(0, int(getattr(data_args, "roi_max_positives", 0) or 0))
         self.roi_max_negatives = max(0, int(getattr(data_args, "roi_max_negatives", 0) or 0))
         self.roi_positive_radius_ratio = float(getattr(data_args, "roi_positive_radius_ratio", 0.08) or 0.08)
@@ -1666,7 +1667,11 @@ class LazySupervisedDataset(Dataset):
             data_dict["prompt"] = prompt
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
-        roi_gaze_xy, roi_gaze_valid = build_roi_gaze_metadata(self.list_data_dict[i])
+        roi_entry = None
+        if self.roi_candidate_lookup:
+            roi_entry = find_roi_candidate_entry(self.list_data_dict[i], self.roi_candidate_lookup)
+
+        roi_gaze_xy, roi_gaze_valid = build_roi_gaze_metadata(self.list_data_dict[i], roi_entry=roi_entry)
         data_dict["roi_gaze_xy"] = roi_gaze_xy
         data_dict["roi_gaze_valid"] = roi_gaze_valid
         if self.roi_candidate_slots > 0 and self.roi_candidate_lookup:
@@ -1677,6 +1682,7 @@ class LazySupervisedDataset(Dataset):
                 roi_max_negatives=self.roi_max_negatives,
                 roi_candidate_slots=self.roi_candidate_slots,
                 roi_positive_radius_ratio=self.roi_positive_radius_ratio,
+                roi_entry=roi_entry,
             )
             data_dict["roi_candidate_boxes"] = roi_boxes
             data_dict["roi_candidate_is_positive"] = roi_is_positive
