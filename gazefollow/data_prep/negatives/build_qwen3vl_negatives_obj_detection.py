@@ -187,6 +187,13 @@ def extract_ground_truth(sample: Dict[str, Any]) -> Optional[Tuple[float, float,
     return None
 
 
+def should_skip_sample(sample: Dict[str, Any]) -> bool:
+    in_out = _safe_float(sample.get("in_out"))
+    if in_out is None:
+        in_out = _safe_float(sample.get("in_or_out"))
+    return in_out is not None and int(in_out) == 0
+
+
 def _extract_label(detection: Dict[str, Any]) -> str:
     for key in ("label", "object", "name", "class", "category", "entity", "description", "text"):
         value = detection.get(key)
@@ -407,6 +414,9 @@ def main() -> None:
             writer.writeheader()
 
         for local_idx, sample in enumerate(tqdm(dataset, desc="Building stage1b negatives")):
+            if should_skip_sample(sample):
+                continue
+
             sample_id = str(sample.get("id", args.start_index + local_idx))
             if sample_id in seen_sample_ids:
                 continue
