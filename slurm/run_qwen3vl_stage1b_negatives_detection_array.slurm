@@ -32,12 +32,12 @@ if [ ! -f "$JOB_SCRIPT" ]; then
     exit 1
 fi
 
-DATASET_JSON="${DATASET_JSON:-training_datasets/20251102/train_dataset_localization_results_normalized_filtered_conversations.json}"
+DATASET_JSON="${DATASET_JSON:-gazefollow/data/train_annotations_release.csv}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
 
 CHUNK_SIZE="${CHUNK_SIZE:-10000}"
 BASE_START_INDEX="${BASE_START_INDEX:-${START_INDEX_BASE:-0}}"
-TOTAL_SAMPLES="${TOTAL_SAMPLES:-}"s
+TOTAL_SAMPLES="${TOTAL_SAMPLES:-}"
 MAX_CONCURRENT_TASKS="${MAX_CONCURRENT_TASKS:-5}"
 
 RUN_TAG="${RUN_TAG:-${SLURM_ARRAY_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}"
