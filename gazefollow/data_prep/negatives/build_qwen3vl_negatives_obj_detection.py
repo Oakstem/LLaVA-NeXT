@@ -23,11 +23,9 @@ from gazefollow.auto_phrase_grounding.qwen3vl_grounding import load_qwen3vl_mode
 DEFAULT_QUERY = (
     "Detect all visible people and objects in the image. "
     "Return ONLY a JSON array where each element is "
-    "{\"label\": string, \"bbox\": [x1,y1,x2,y2], \"score\": number}. "
+    "{\"label\": string, \"bbox\": [x1,y1,x2,y2]}. "
     "Use bbox coordinates normalized to [0,1000]."
 )
-
-PERSON_LABEL_HINTS = ("person", "man", "woman", "boy", "girl", "people", "child", "kid", "adult")
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,14 +195,6 @@ def _extract_label(detection: Dict[str, Any]) -> str:
     return ""
 
 
-def _extract_score(detection: Dict[str, Any]) -> Optional[float]:
-    for key in ("score", "confidence", "probability", "prob"):
-        value = detection.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-    return None
-
-
 def _normalize_bbox(bbox: Sequence[Any]) -> Optional[List[int]]:
     if len(bbox) != 4:
         return None
@@ -228,31 +218,18 @@ def normalize_detection(detection: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
     label = _extract_label(detection)
-    label_lower = label.lower()
-    category = "person" if any(hint in label_lower for hint in PERSON_LABEL_HINTS) else "object"
-    center = [
-        round((bbox[0] + bbox[2]) / 2.0, 3),
-        round((bbox[1] + bbox[3]) / 2.0, 3),
-    ]
     return {
         "label": label,
-        "category": category,
-        "score": _extract_score(detection),
         "bbox": bbox,
-        "bbox_center": center,
     }
 
 
-def detection_signature(detection: Dict[str, Any]) -> Tuple[str, str, Tuple[int, int, int, int], Optional[float]]:
+def detection_signature(detection: Dict[str, Any]) -> Tuple[str, Tuple[int, int, int, int]]:
     bbox = detection.get("bbox") or [0, 0, 0, 0]
     bbox_t = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
-    score = detection.get("score")
-    score_sig = round(float(score), 4) if isinstance(score, (int, float)) else None
     return (
         str(detection.get("label", "")).strip().lower(),
-        str(detection.get("category", "")).strip().lower(),
         bbox_t,
-        score_sig,
     )
 
 
