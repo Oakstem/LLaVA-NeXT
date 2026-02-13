@@ -325,7 +325,8 @@ class LLaVATrainer(Trainer):
             "oof_top1": [],
             "oof_rows": [],
         }
-        self.roi_contrastive_stats_cap = 2048
+        self.roi_contrastive_stats_window = max(1, int(getattr(self.args, "roi_contrastive_metrics_window", 100)))
+        self.roi_contrastive_stats_cap = max(2048, self.roi_contrastive_stats_window * 4)
         self._sanity_table = None
         self._sanity_consecutive_failures = 0
         self._sanity_failure_limit = getattr(self.args, "sanity_check_failures_to_stop", 5)
@@ -826,7 +827,7 @@ class LLaVATrainer(Trainer):
             metrics["timing/avg_data_loading_seconds"] = avg_data_loading
 
         if self.roi_contrastive_stats["nce_loss"]:
-            recent_roi = min(recent_steps, len(self.roi_contrastive_stats["nce_loss"]))
+            recent_roi = min(self.roi_contrastive_stats_window, len(self.roi_contrastive_stats["nce_loss"]))
             roi_nce = sum(self.roi_contrastive_stats["nce_loss"][-recent_roi:]) / recent_roi
             roi_top1 = sum(self.roi_contrastive_stats["top1"][-recent_roi:]) / recent_roi
             roi_pairs = sum(self.roi_contrastive_stats["pairs"][-recent_roi:]) / recent_roi
@@ -837,10 +838,11 @@ class LLaVATrainer(Trainer):
             metrics["roi_contrastive/lambda"] = roi_lambda
             rank0_print(
                 f"ROI contrastive - NCE: {roi_nce:.4f}, Top1: {roi_top1:.3f}, "
-                f"Pairs: {roi_pairs:.2f}, Lambda: {roi_lambda:.4f}"
+                f"Pairs: {roi_pairs:.2f}, Lambda: {roi_lambda:.4f} "
+                f"(window={recent_roi})"
             )
             if self.roi_contrastive_stats["oof_loss"]:
-                recent_oof = min(recent_steps, len(self.roi_contrastive_stats["oof_loss"]))
+                recent_oof = min(self.roi_contrastive_stats_window, len(self.roi_contrastive_stats["oof_loss"]))
                 roi_oof_loss = sum(self.roi_contrastive_stats["oof_loss"][-recent_oof:]) / recent_oof
                 roi_oof_top1 = sum(self.roi_contrastive_stats["oof_top1"][-recent_oof:]) / recent_oof
                 roi_oof_rows = sum(self.roi_contrastive_stats["oof_rows"][-recent_oof:]) / recent_oof
@@ -849,7 +851,8 @@ class LLaVATrainer(Trainer):
                 metrics["roi_contrastive/oof_rows"] = roi_oof_rows
                 rank0_print(
                     f"ROI contrastive OOF - Loss: {roi_oof_loss:.4f}, "
-                    f"Top1: {roi_oof_top1:.3f}, Rows: {roi_oof_rows:.2f}"
+                    f"Top1: {roi_oof_top1:.3f}, Rows: {roi_oof_rows:.2f} "
+                    f"(window={recent_oof})"
                 )
             
         safe_wandb_log(self.args, metrics, step=self.state.global_step)

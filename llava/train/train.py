@@ -256,6 +256,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Fixed OOF negative phrase used in ROI contrastive loss."},
     )
     roi_contrastive_oof_weight: float = field(default=0.5, metadata={"help": "Weight of the OOF auxiliary term inside ROI contrastive loss."})
+    roi_contrastive_metrics_window: int = field(default=100, metadata={"help": "Rolling window size (in metric updates) for logging ROI contrastive averages."})
     roi_pos_embed_dim: int = field(default=64, metadata={"help": "Hidden dimension for ROI position MLP."})
 
 
@@ -2220,6 +2221,7 @@ def train(attn_implementation=None):
         f"oof_enabled={roi_oof_enabled}, "
         f"oof_weight={training_args.roi_contrastive_oof_weight}, "
         f"oof_tokens={len(roi_oof_token_ids)}, "
+        f"metrics_window={training_args.roi_contrastive_metrics_window}, "
         f"pos_dim={training_args.roi_pos_embed_dim}, "
         f"warmup_steps={warmup_steps}, "
         f"phrase_candidates={len(roi_phrase_token_ids)}"
