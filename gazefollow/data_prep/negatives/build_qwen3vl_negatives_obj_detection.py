@@ -7,12 +7,13 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -31,21 +32,50 @@ PERSON_LABEL_HINTS = ("person", "man", "woman", "boy", "girl", "people", "child"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate CSV of hard-negative ROIs for Stage 1b.")
-    parser.add_argument("--dataset-json", required=True, help="Dataset JSON path.")
+    parser.add_argument(
+        "--dataset-json",
+        "--dataset-path",
+        dest="dataset_path",
+        required=True,
+        help="Dataset path (.json conversations or .csv annotations).",
+    )
     parser.add_argument("--images-dir", required=True, help="Root image directory.")
-    parser.add_argument("--output-csv", required=True, help="Output CSV path.")
+    parser.add_argument(
+        "--output-csv",
+        default=None,
+        help="Output CSV path. Defaults to training_datasets/stage1b_negatives/<timestamp>.csv",
+    )
     parser.add_argument("--model-id", default="Qwen/Qwen3-VL-4B-Instruct", help="Qwen3VL model id.")
     parser.add_argument("--query", default=DEFAULT_QUERY, help="Grounding query prompt.")
     parser.add_argument("--device-map", default="auto", help="Device map passed to model loader.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Max generation tokens.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
     parser.add_argument("--limit", type=int, default=None, help="Optional max number of samples.")
-    parser.add_argument("--start-index", type=int, default=0, help="Optional starting sample index.")
+    parser.add_argument(
+        "--start-index",
+        "--start-from-index",
+        dest="start_index",
+        type=int,
+        default=0,
+        help="Optional starting sample index.",
+    )
     parser.add_argument(
         "--remove-policy",
         choices=("smallest", "all"),
         default="smallest",
         help="How to remove detections containing GT point.",
+    )
+    parser.add_argument(
+        "--gt-positive-radius-ratio",
+        type=float,
+        default=0.05,
+        help="Radius ratio (w.r.t. min(image_w,image_h)) for GT positive box around gaze point.",
+    )
+    parser.add_argument(
+        "--positive-center-distance-threshold",
+        type=float,
+        default=0.1,
+        help="Normalized center-distance threshold for marking a detection as positive.",
     )
     parser.add_argument(
         "--resume",
@@ -56,12 +86,49 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_dataset(dataset_json: Path) -> List[Dict[str, Any]]:
+def load_json_dataset(dataset_json: Path) -> List[Dict[str, Any]]:
     with dataset_json.open("r", encoding="utf-8") as file:
         data = json.load(file)
     if not isinstance(data, list):
         raise ValueError(f"Expected a list dataset, got {type(data)}")
     return data
+
+
+def load_annotations_csv_dataset(dataset_csv: Path) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    with dataset_csv.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for index, row in enumerate(reader):
+            image_path = str(row.get("image_path", "")).strip()
+            sample_id = str(row.get("id", index)).strip() or str(index)
+
+            sample: Dict[str, Any] = {
+                "id": sample_id,
+                "image": image_path,
+                "image_path": image_path,
+            }
+
+            in_or_out = _safe_float(row.get("in_or_out"))
+            if in_or_out is not None:
+                sample["in_out"] = 1 if int(in_or_out) >= 1 else 0
+
+            gaze_x = _safe_float(row.get("gaze_x"))
+            gaze_y = _safe_float(row.get("gaze_y"))
+            if gaze_x is not None and gaze_y is not None:
+                sample["gaze_gt_x"] = float(gaze_x) * 1000.0
+                sample["gaze_gt_y"] = float(gaze_y) * 1000.0
+                sample["gaze_gt_width"] = 1000.0
+                sample["gaze_gt_height"] = 1000.0
+
+            samples.append(sample)
+    return samples
+
+
+def load_dataset(dataset_path: Path) -> List[Dict[str, Any]]:
+    suffix = dataset_path.suffix.lower()
+    if suffix == ".csv":
+        return load_annotations_csv_dataset(dataset_path)
+    return load_json_dataset(dataset_path)
 
 
 def resolve_image_path(sample: Dict[str, Any], images_dir: Path) -> Optional[Path]:
@@ -176,27 +243,111 @@ def normalize_detection(detection: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def detection_signature(detection: Dict[str, Any]) -> Tuple[str, str, Tuple[int, int, int, int], Optional[float]]:
+    bbox = detection.get("bbox") or [0, 0, 0, 0]
+    bbox_t = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+    score = detection.get("score")
+    score_sig = round(float(score), 4) if isinstance(score, (int, float)) else None
+    return (
+        str(detection.get("label", "")).strip().lower(),
+        str(detection.get("category", "")).strip().lower(),
+        bbox_t,
+        score_sig,
+    )
+
+
+def deduplicate_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique: List[Dict[str, Any]] = []
+    seen: set = set()
+    for det in detections:
+        sig = detection_signature(det)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(det)
+    return unique
+
+
 def bbox_contains_point(bbox: Sequence[int], x: float, y: float) -> bool:
     x1, y1, x2, y2 = bbox
     return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _bbox_center(bbox: Sequence[int]) -> Tuple[float, float]:
+    return (float(bbox[0] + bbox[2]) / 2.0, float(bbox[1] + bbox[3]) / 2.0)
+
+
+def _build_gt_radius_bbox(
+    gt_x: float,
+    gt_y: float,
+    image_w: float,
+    image_h: float,
+    radius_ratio: float,
+) -> List[float]:
+    radius = max(1.0, float(radius_ratio) * float(min(image_w, image_h)))
+    x1 = max(0.0, gt_x - radius)
+    y1 = max(0.0, gt_y - radius)
+    x2 = min(float(image_w) - 1.0, gt_x + radius)
+    y2 = min(float(image_h) - 1.0, gt_y + radius)
+    return [x1, y1, x2, y2]
+
+
+def _bbox_intersects(box_a: Sequence[float], box_b: Sequence[float]) -> bool:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+
+def _normalized_center_distance(
+    det_bbox: Sequence[int],
+    gt_x: float,
+    gt_y: float,
+    image_w: float,
+    image_h: float,
+) -> float:
+    cx, cy = _bbox_center(det_bbox)
+    diagonal = max((float(image_w) ** 2 + float(image_h) ** 2) ** 0.5, 1e-6)
+    return (((cx - gt_x) ** 2 + (cy - gt_y) ** 2) ** 0.5) / diagonal
 
 
 def split_positive_and_negatives(
     detections: List[Dict[str, Any]],
     gt_x: float,
     gt_y: float,
+    image_w: float,
+    image_h: float,
+    gt_positive_radius_ratio: float,
+    center_distance_threshold: float,
     remove_policy: str,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    positive_indices = [
-        idx for idx, det in enumerate(detections) if bbox_contains_point(det["bbox"], gt_x, gt_y)
-    ]
+    gt_bbox = _build_gt_radius_bbox(
+        gt_x=gt_x,
+        gt_y=gt_y,
+        image_w=image_w,
+        image_h=image_h,
+        radius_ratio=gt_positive_radius_ratio,
+    )
+    positive_indices: List[int] = []
+    for idx, det in enumerate(detections):
+        det_bbox = det["bbox"]
+        overlap_positive = _bbox_intersects(det_bbox, gt_bbox)
+        center_distance = _normalized_center_distance(
+            det_bbox=det_bbox,
+            gt_x=gt_x,
+            gt_y=gt_y,
+            image_w=image_w,
+            image_h=image_h,
+        )
+        distance_positive = center_distance <= float(center_distance_threshold)
+        if overlap_positive or distance_positive:
+            positive_indices.append(idx)
     if not positive_indices:
         return [], detections
 
     if remove_policy == "all":
-        keep_idx = {idx for idx in range(len(detections)) if idx not in set(positive_indices)}
         positives = [detections[idx] for idx in positive_indices]
-        negatives = [detections[idx] for idx in range(len(detections)) if idx in keep_idx]
+        positive_sigs = {detection_signature(det) for det in positives}
+        negatives = [det for det in detections if detection_signature(det) not in positive_sigs]
         return positives, negatives
 
     best_idx = min(
@@ -204,8 +355,10 @@ def split_positive_and_negatives(
         key=lambda idx: (detections[idx]["bbox"][2] - detections[idx]["bbox"][0])
         * (detections[idx]["bbox"][3] - detections[idx]["bbox"][1]),
     )
-    positives = [detections[best_idx]]
-    negatives = [detections[idx] for idx in range(len(detections)) if idx != best_idx]
+    selected_positive = detections[best_idx]
+    selected_sig = detection_signature(selected_positive)
+    positives = [det for det in detections if detection_signature(det) == selected_sig]
+    negatives = [det for det in detections if detection_signature(det) != selected_sig]
     return positives, negatives
 
 
@@ -226,9 +379,14 @@ def serialize_json(data: Any) -> str:
 
 def main() -> None:
     args = parse_args()
-    dataset_path = Path(args.dataset_json).expanduser().resolve()
+    dataset_path = Path(args.dataset_path).expanduser().resolve()
     images_dir = Path(args.images_dir).expanduser().resolve()
-    output_csv = Path(args.output_csv).expanduser().resolve()
+    if args.output_csv:
+        output_csv = Path(args.output_csv).expanduser().resolve()
+    else:
+        output_dir = (REPO_ROOT / "training_datasets" / "stage1b_negatives").resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_csv = output_dir / f"stage1b_qwen3vl_negatives_{time.strftime('%Y%m%d_%H%M%S')}.csv"
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     dataset = load_dataset(dataset_path)
@@ -323,7 +481,7 @@ def main() -> None:
                             parsed = normalize_detection(det)
                             if parsed is not None:
                                 normalized.append(parsed)
-                    detection_cache[cache_key] = normalized
+                    detection_cache[cache_key] = deduplicate_detections(normalized)
                 except Exception as exc:  # noqa: BLE001
                     detection_cache[cache_key] = []
                     error_cache[cache_key] = str(exc)
@@ -345,7 +503,16 @@ def main() -> None:
                 row["gt_y"] = gt_y
                 row["gt_width"] = gt_w
                 row["gt_height"] = gt_h
-                positives, negatives = split_positive_and_negatives(detections, gt_x, gt_y, args.remove_policy)
+                positives, negatives = split_positive_and_negatives(
+                    detections=detections,
+                    gt_x=gt_x,
+                    gt_y=gt_y,
+                    image_w=gt_w,
+                    image_h=gt_h,
+                    gt_positive_radius_ratio=args.gt_positive_radius_ratio,
+                    center_distance_threshold=args.positive_center_distance_threshold,
+                    remove_policy=args.remove_policy,
+                )
 
             row["removed_positive_count"] = len(positives)
             row["removed_positive_json"] = serialize_json(positives)

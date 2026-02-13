@@ -27,7 +27,7 @@ fi
 
 DATASET_JSON="${DATASET_JSON:-training_datasets/20251102/train_dataset_localization_results_normalized_filtered_conversations.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-OUTPUT_CSV="${OUTPUT_CSV:-training_datasets/stage1b_qwen3vl_negatives_$(date +%Y%m%d_%H%M%S).csv}"
+OUTPUT_CSV="${OUTPUT_CSV:-training_datasets/stage1b_negatives/stage1b_qwen3vl_negatives_$(date +%Y%m%d_%H%M%S).csv}"
 
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
 QUERY="${QUERY:-Detect all visible people and objects in the image. Return ONLY a JSON array where each element is {\"label\": string, \"bbox\": [x1,y1,x2,y2], \"score\": number}. Use bbox coordinates normalized to [0,1000].}"
@@ -35,7 +35,7 @@ DEVICE_MAP="${DEVICE_MAP:-auto}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 LIMIT="${LIMIT:-}"
-START_INDEX="${START_INDEX:-0}"
+START_INDEX="${START_INDEX:-${START_FROM_INDEX:-0}}"
 REMOVE_POLICY="${REMOVE_POLICY:-smallest}"
 RESUME="${RESUME:-true}"
 
@@ -61,8 +61,8 @@ if [ ! -d "$IMAGES_DIR" ]; then
     echo "Images directory not found: $IMAGES_DIR"
     exit 1
 fi
-if [ ! -f "gazefollow/data_prep/build_qwen3vl_negatives_obj_detection.py" ]; then
-    echo "Script not found: gazefollow/data_prep/build_qwen3vl_negatives_obj_detection.py"
+if [ ! -f "gazefollow/data_prep/negatives/build_qwen3vl_negatives_obj_detection.py" ]; then
+    echo "Script not found: gazefollow/data_prep/negatives/build_qwen3vl_negatives_obj_detection.py"
     exit 1
 fi
 
@@ -108,10 +108,10 @@ echo "Limit: ${LIMIT:-none}"
 echo "Remove Policy: $REMOVE_POLICY"
 echo "Resume: $RESUME"
 echo "=========================================="
-echo "$PYTHON_BIN gazefollow/data_prep/build_qwen3vl_negatives_obj_detection.py ${ARGS[*]}"
+echo "$PYTHON_BIN gazefollow/data_prep/negatives/build_qwen3vl_negatives_obj_detection.py ${ARGS[*]}"
 
 start_time=$(date +%s)
-"$PYTHON_BIN" gazefollow/data_prep/build_qwen3vl_negatives_obj_detection.py "${ARGS[@]}"
+"$PYTHON_BIN" gazefollow/data_prep/negatives/build_qwen3vl_negatives_obj_detection.py "${ARGS[@]}"
 exit_code=$?
 end_time=$(date +%s)
 

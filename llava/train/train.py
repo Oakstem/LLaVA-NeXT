@@ -2202,6 +2202,12 @@ def train(attn_implementation=None):
         f"warmup_steps={warmup_steps}, "
         f"phrase_candidates={len(roi_phrase_token_ids)}"
     )
+    if training_args.roi_contrastive_enable and int(training_args.per_device_train_batch_size) < 2:
+        rank0_print(
+            "[ROI contrastive warning] per_device_train_batch_size < 2. "
+            "Current ROI loss uses in-batch negatives only, so pair_count stays <2 and "
+            "roi_contrastive/* metrics will remain at zero."
+        )
     
     # Set vision tower parameter from model args if provided, otherwise use pretrained
     if model_args.vision_tower is None:

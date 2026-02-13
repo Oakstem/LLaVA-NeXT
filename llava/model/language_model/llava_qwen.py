@@ -77,6 +77,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self.roi_vision_projector = nn.Linear(config.hidden_size, roi_dim, bias=False)
         self._roi_contrastive_step = 0
         self._roi_contrastive_stats: Optional[Dict[str, torch.Tensor]] = None
+        self._roi_contrastive_warned_small_pair_count = False
         self.latest_person_mask_repr: Optional[torch.Tensor] = None
         self.latest_attention_mask_snapshot: Optional[Dict[str, Any]] = None
         # Initialize weights and apply final processing
@@ -761,6 +762,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         pair_count = len(text_embeddings)
         if pair_count < 2:
+            if not self._roi_contrastive_warned_small_pair_count:
+                print(
+                    "[ROI contrastive] pair_count < 2 in current micro-batch; "
+                    "InfoNCE is skipped and roi_contrastive/* metrics stay zero. "
+                    "Increase per-device train batch size (>=2) or add explicit same-image negatives."
+                )
+                self._roi_contrastive_warned_small_pair_count = True
             stats_device = outputs.loss.device
             self._roi_contrastive_stats = {
                 "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
