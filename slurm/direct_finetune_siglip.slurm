@@ -87,6 +87,10 @@ DATA_PATH="training_datasets/20251007_165818_sgl_conversation_data_20251007_1715
 # DATA_PATH="training_datasets/20251205_174741_sgl_conversation_data_20251206_191724/train.json"
 # DATA_PATH="training_datasets/train_filtered_20251224_203622_69k.json"
 IMAGE_FOLDER="/galitylab/students/alonmardi/gazefollow"
+ROI_CANDIDATES_CSV="training_datasets/stage1b_negatives/stage1b_yolo_negatives.csv"
+ROI_MAX_POSITIVES="1"
+ROI_MAX_NEGATIVES="8"
+ROI_POSITIVE_RADIUS_RATIO="0.08"
 OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs"
 # DEEPSPEED_CONFIG="scripts/zero3.json"
 DEEPSPEED_CONFIG="scripts/zero1.json"
@@ -131,6 +135,10 @@ ROI_CONTRASTIVE_DIM="512"
 ROI_CONTRASTIVE_PHRASE="looking at"
 ROI_CONTRASTIVE_WARMUP_RATIO="0.1"
 ROI_CONTRASTIVE_RADIUS_RATIO="0.08"
+ROI_POS_EMBED_DIM="64"
+ROI_CONTRASTIVE_OOF_ENABLE="False"
+ROI_CONTRASTIVE_OOF_TEXT="looking at someone or something outside the frame"
+ROI_CONTRASTIVE_OOF_WEIGHT="0.5"
 
 # Evaluation and saving
 EVALUATION_STRATEGY="no"
@@ -173,6 +181,10 @@ echo ""
 echo "=== DATA CONFIGURATION ==="
 echo "Data Path: ${DATA_PATH}"
 echo "Image Folder: ${IMAGE_FOLDER}"
+echo "ROI Candidates CSV: ${ROI_CANDIDATES_CSV}"
+echo "ROI Max Positives: ${ROI_MAX_POSITIVES}"
+echo "ROI Max Negatives: ${ROI_MAX_NEGATIVES}"
+echo "ROI Positive Radius Ratio: ${ROI_POSITIVE_RADIUS_RATIO}"
 echo "DeepSpeed Config: ${DEEPSPEED_CONFIG}"
 echo ""
 echo "=== MODEL ARCHITECTURE ==="
@@ -209,6 +221,10 @@ echo "ROI Contrastive Dim: ${ROI_CONTRASTIVE_DIM}"
 echo "ROI Contrastive Phrase: ${ROI_CONTRASTIVE_PHRASE}"
 echo "ROI Contrastive Warmup Ratio: ${ROI_CONTRASTIVE_WARMUP_RATIO}"
 echo "ROI Contrastive Radius Ratio: ${ROI_CONTRASTIVE_RADIUS_RATIO}"
+echo "ROI Position Embed Dim: ${ROI_POS_EMBED_DIM}"
+echo "ROI Contrastive OOF Enable: ${ROI_CONTRASTIVE_OOF_ENABLE}"
+echo "ROI Contrastive OOF Text: ${ROI_CONTRASTIVE_OOF_TEXT}"
+echo "ROI Contrastive OOF Weight: ${ROI_CONTRASTIVE_OOF_WEIGHT}"
 echo ""
 echo "=== EVALUATION & SAVING ==="
 echo "Evaluation Strategy: ${EVALUATION_STRATEGY}"
@@ -243,6 +259,10 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --version ${PROMPT_VERSION} \
     --data_path ${DATA_PATH} \
     --image_folder ${IMAGE_FOLDER} \
+    --roi_candidates_csv ${ROI_CANDIDATES_CSV} \
+    --roi_max_positives ${ROI_MAX_POSITIVES} \
+    --roi_max_negatives ${ROI_MAX_NEGATIVES} \
+    --roi_positive_radius_ratio ${ROI_POSITIVE_RADIUS_RATIO} \
     --mm_tunable_parts=${MM_TUNABLE_PARTS} \
     --mm_vision_tower_lr=${MM_VISION_TOWER_LR} \
     --vision_tower ${VISION_MODEL_VERSION} \
@@ -280,6 +300,10 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --roi_contrastive_phrase "${ROI_CONTRASTIVE_PHRASE}" \
     --roi_contrastive_warmup_ratio ${ROI_CONTRASTIVE_WARMUP_RATIO} \
     --roi_contrastive_radius_ratio ${ROI_CONTRASTIVE_RADIUS_RATIO} \
+    --roi_pos_embed_dim ${ROI_POS_EMBED_DIM} \
+    --roi_contrastive_oof_enable ${ROI_CONTRASTIVE_OOF_ENABLE} \
+    --roi_contrastive_oof_text "${ROI_CONTRASTIVE_OOF_TEXT}" \
+    --roi_contrastive_oof_weight ${ROI_CONTRASTIVE_OOF_WEIGHT} \
     --logging_steps ${LOGGING_STEPS} \
     --tf32 ${TF32} \
     --model_max_length ${MODEL_MAX_LENGTH} \

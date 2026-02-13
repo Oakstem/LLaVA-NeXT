@@ -188,8 +188,9 @@ class DataArguments:
     enable_evaluation: bool = field(default=True, metadata={"help": "Whether to enable evaluation during training"})
     eval_data_path: Optional[str] = field(default=None, metadata={"help": "Optional separate evaluation data path. If not provided, will split from training data."})
     roi_candidates_csv: Optional[str] = field(default=None, metadata={"help": "Optional Stage-1b ROI candidates CSV path."})
-    roi_max_positives: int = field(default=2, metadata={"help": "Maximum positive ROI candidates per sample."})
+    roi_max_positives: int = field(default=1, metadata={"help": "Maximum positive ROI candidates per sample (GT-gaze positive only)."})
     roi_max_negatives: int = field(default=8, metadata={"help": "Maximum negative ROI candidates per sample."})
+    roi_positive_radius_ratio: float = field(default=0.08, metadata={"help": "Radius ratio around GT gaze point used to build the positive ROI box."})
 
 
 @dataclass
@@ -1445,6 +1446,7 @@ class LazySupervisedDataset(Dataset):
         self.roi_candidate_lookup: Dict[str, Dict[str, List[List[float]]]] = {}
         self.roi_max_positives = max(0, int(getattr(data_args, "roi_max_positives", 0) or 0))
         self.roi_max_negatives = max(0, int(getattr(data_args, "roi_max_negatives", 0) or 0))
+        self.roi_positive_radius_ratio = float(getattr(data_args, "roi_positive_radius_ratio", 0.08) or 0.08)
         self.roi_candidate_slots = self.roi_max_positives + self.roi_max_negatives
         roi_candidates_csv = getattr(data_args, "roi_candidates_csv", None)
         if roi_candidates_csv and self.roi_candidate_slots > 0:
@@ -1673,6 +1675,7 @@ class LazySupervisedDataset(Dataset):
                 roi_max_positives=self.roi_max_positives,
                 roi_max_negatives=self.roi_max_negatives,
                 roi_candidate_slots=self.roi_candidate_slots,
+                roi_positive_radius_ratio=self.roi_positive_radius_ratio,
             )
             data_dict["roi_candidate_boxes"] = roi_boxes
             data_dict["roi_candidate_is_positive"] = roi_is_positive
@@ -1762,6 +1765,7 @@ def create_train_eval_splits(data_path: str, tokenizer: transformers.PreTrainedT
     train_dataset.roi_candidate_lookup = getattr(full_dataset, "roi_candidate_lookup", {})
     train_dataset.roi_max_positives = getattr(full_dataset, "roi_max_positives", 0)
     train_dataset.roi_max_negatives = getattr(full_dataset, "roi_max_negatives", 0)
+    train_dataset.roi_positive_radius_ratio = getattr(full_dataset, "roi_positive_radius_ratio", 0.08)
     train_dataset.roi_candidate_slots = getattr(full_dataset, "roi_candidate_slots", 0)
     rank0_print(f"Applied split: using {len(train_dataset.list_data_dict)} samples for training")
     
@@ -1773,6 +1777,7 @@ def create_train_eval_splits(data_path: str, tokenizer: transformers.PreTrainedT
     eval_dataset.roi_candidate_lookup = getattr(full_dataset, "roi_candidate_lookup", {})
     eval_dataset.roi_max_positives = getattr(full_dataset, "roi_max_positives", 0)
     eval_dataset.roi_max_negatives = getattr(full_dataset, "roi_max_negatives", 0)
+    eval_dataset.roi_positive_radius_ratio = getattr(full_dataset, "roi_positive_radius_ratio", 0.08)
     eval_dataset.roi_candidate_slots = getattr(full_dataset, "roi_candidate_slots", 0)
     rank0_print(f"Applied split: using {len(eval_dataset.list_data_dict)} samples for evaluation")
     
@@ -2216,7 +2221,8 @@ def train(attn_implementation=None):
         rank0_print(
             "ROI candidate CSV enabled: "
             f"path={data_args.roi_candidates_csv}, "
-            f"max_pos={data_args.roi_max_positives}, max_neg={data_args.roi_max_negatives}"
+            f"max_pos={data_args.roi_max_positives}, max_neg={data_args.roi_max_negatives}, "
+            f"pos_source=gt_gaze_radius({data_args.roi_positive_radius_ratio})"
         )
     if (
         training_args.roi_contrastive_enable

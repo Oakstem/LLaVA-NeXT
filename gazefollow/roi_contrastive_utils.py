@@ -203,31 +203,16 @@ def load_roi_candidate_lookup(
             image_height = _safe_float(row.get("gt_height"))
             if image_width is None or image_height is None or image_width <= 0 or image_height <= 0:
                 continue
-            positives_json = str(row.get("removed_positive_json") or "[]")
             negatives_json = str(row.get("negative_detections_json") or "[]")
             try:
-                positives_raw = json.loads(positives_json)
                 negatives_raw = json.loads(negatives_json)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(positives_raw, list) or not isinstance(negatives_raw, list):
+            if not isinstance(negatives_raw, list):
                 continue
 
-            positives_norm: List[List[float]] = []
             negatives_norm: List[List[float]] = []
-            seen_pos: set = set()
             seen_neg: set = set()
-            for det in positives_raw:
-                if not isinstance(det, dict):
-                    continue
-                norm_bbox = _normalize_candidate_bbox(det, image_width=image_width, image_height=image_height)
-                if norm_bbox is None:
-                    continue
-                key = tuple(round(val, 6) for val in norm_bbox)
-                if key in seen_pos:
-                    continue
-                seen_pos.add(key)
-                positives_norm.append(norm_bbox)
             for det in negatives_raw:
                 if not isinstance(det, dict):
                     continue
@@ -240,12 +225,27 @@ def load_roi_candidate_lookup(
                 seen_neg.add(key)
                 negatives_norm.append(norm_bbox)
 
-            if not positives_norm and not negatives_norm:
+            if not negatives_norm:
                 continue
-            entry = {"positives": positives_norm, "negatives": negatives_norm}
+            entry = {"negatives": negatives_norm}
             for key in _row_lookup_keys(row):
                 lookup[key] = entry
     return lookup
+
+
+def build_gaze_positive_bbox(sample_dict: Dict[str, Any], radius_ratio: float) -> Optional[List[float]]:
+    gaze_xy, gaze_valid = build_roi_gaze_metadata(sample_dict)
+    if not bool(gaze_valid.item()):
+        return None
+    x = float(gaze_xy[0].item())
+    y = float(gaze_xy[1].item())
+    radius = max(0.0, min(0.5, float(radius_ratio)))
+    return [
+        max(0.0, x - radius),
+        max(0.0, y - radius),
+        min(1.0, x + radius),
+        min(1.0, y + radius),
+    ]
 
 
 def build_roi_candidate_metadata(
@@ -254,11 +254,12 @@ def build_roi_candidate_metadata(
     roi_max_positives: int,
     roi_max_negatives: int,
     roi_candidate_slots: int,
+    roi_positive_radius_ratio: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     boxes = torch.zeros((roi_candidate_slots, 4), dtype=torch.float32)
     is_positive = torch.zeros((roi_candidate_slots,), dtype=torch.bool)
     valid = torch.zeros((roi_candidate_slots,), dtype=torch.bool)
-    if roi_candidate_slots <= 0 or not roi_candidate_lookup:
+    if roi_candidate_slots <= 0:
         return boxes, is_positive, valid
 
     entry = None
@@ -266,21 +267,21 @@ def build_roi_candidate_metadata(
         if key in roi_candidate_lookup:
             entry = roi_candidate_lookup[key]
             break
-    if not entry:
-        return boxes, is_positive, valid
 
     idx = 0
-    for bbox in entry.get("positives", [])[: max(0, roi_max_positives)]:
-        if idx >= roi_candidate_slots:
-            break
-        boxes[idx] = torch.tensor(bbox, dtype=torch.float32)
-        is_positive[idx] = True
-        valid[idx] = True
-        idx += 1
-    for bbox in entry.get("negatives", [])[: max(0, roi_max_negatives)]:
-        if idx >= roi_candidate_slots:
-            break
-        boxes[idx] = torch.tensor(bbox, dtype=torch.float32)
-        valid[idx] = True
-        idx += 1
+    if roi_max_positives > 0:
+        positive_bbox = build_gaze_positive_bbox(sample_dict, radius_ratio=roi_positive_radius_ratio)
+        if positive_bbox is not None and idx < roi_candidate_slots:
+            boxes[idx] = torch.tensor(positive_bbox, dtype=torch.float32)
+            is_positive[idx] = True
+            valid[idx] = True
+            idx += 1
+
+    if entry:
+        for bbox in entry.get("negatives", [])[: max(0, roi_max_negatives)]:
+            if idx >= roi_candidate_slots:
+                break
+            boxes[idx] = torch.tensor(bbox, dtype=torch.float32)
+            valid[idx] = True
+            idx += 1
     return boxes, is_positive, valid
