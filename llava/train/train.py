@@ -49,6 +49,12 @@ from llava.mm_utils import process_highres_image, process_anyres_image, process_
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
 from llava.model.builder import load_pretrained_model
 from typing import Dict, Optional, Sequence, List, Any, Tuple
+from gazefollow.roi_contrastive_utils import (
+    build_focus_phrase_token_ids,
+    build_roi_candidate_metadata,
+    build_roi_gaze_metadata,
+    load_roi_candidate_lookup,
+)
 
 
 def wandb_log(training_args, metrics_dict, step=None):
@@ -72,37 +78,6 @@ def wandb_summary(training_args, summary_dict):
 
     if wandb.run is not None:
         wandb.run.summary.update(summary_dict)
-
-
-def build_focus_phrase_token_ids(tokenizer, phrase: str) -> List[List[int]]:
-    """Generate candidate token id sequences for the target phrase."""
-    if not phrase:
-        return []
-
-    stripped = phrase.strip()
-    candidates = {phrase}
-    if stripped:
-        candidates.add(stripped)
-        candidates.add(stripped.lower())
-        candidates.add(stripped.capitalize())
-        candidates.add(f" {stripped}")
-        candidates.add(f" {stripped.lower()}")
-
-    token_sequences: List[List[int]] = []
-    seen: set = set()
-    for candidate in candidates:
-        if not candidate:
-            continue
-        ids = tokenizer.encode(candidate, add_special_tokens=False)
-        if not ids:
-            continue
-        key = tuple(ids)
-        if key in seen:
-            continue
-        seen.add(key)
-        token_sequences.append(ids)
-
-    return token_sequences
 
 
 # Import custom evaluation functions
@@ -212,6 +187,9 @@ class DataArguments:
     eval_split_ratio: float = field(default=0.0, metadata={"help": "Ratio of data to use for evaluation (e.g., 0.2 for 20%)"})
     enable_evaluation: bool = field(default=True, metadata={"help": "Whether to enable evaluation during training"})
     eval_data_path: Optional[str] = field(default=None, metadata={"help": "Optional separate evaluation data path. If not provided, will split from training data."})
+    roi_candidates_csv: Optional[str] = field(default=None, metadata={"help": "Optional Stage-1b ROI candidates CSV path."})
+    roi_max_positives: int = field(default=2, metadata={"help": "Maximum positive ROI candidates per sample."})
+    roi_max_negatives: int = field(default=8, metadata={"help": "Maximum negative ROI candidates per sample."})
 
 
 @dataclass
@@ -269,6 +247,13 @@ class TrainingArguments(transformers.TrainingArguments):
     roi_contrastive_phrase: str = field(default="looking at", metadata={"help": "Phrase used to locate the target span for ROI contrastive pooling."})
     roi_contrastive_warmup_ratio: float = field(default=0.1, metadata={"help": "Warmup ratio for ROI contrastive loss weight based on max_steps."})
     roi_contrastive_radius_ratio: float = field(default=0.08, metadata={"help": "ROI radius as a fraction of vision patch-grid width."})
+    roi_contrastive_oof_enable: bool = field(default=False, metadata={"help": "Enable outside-of-frame (OOF) text negative in ROI contrastive loss."})
+    roi_contrastive_oof_text: str = field(
+        default="looking at someone or something outside the frame",
+        metadata={"help": "Fixed OOF negative phrase used in ROI contrastive loss."},
+    )
+    roi_contrastive_oof_weight: float = field(default=0.5, metadata={"help": "Weight of the OOF auxiliary term inside ROI contrastive loss."})
+    roi_pos_embed_dim: int = field(default=64, metadata={"help": "Hidden dimension for ROI position MLP."})
 
 
 # @dataclass
@@ -1457,7 +1442,18 @@ class LazySupervisedDataset(Dataset):
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
-        
+        self.roi_candidate_lookup: Dict[str, Dict[str, List[List[float]]]] = {}
+        self.roi_max_positives = max(0, int(getattr(data_args, "roi_max_positives", 0) or 0))
+        self.roi_max_negatives = max(0, int(getattr(data_args, "roi_max_negatives", 0) or 0))
+        self.roi_candidate_slots = self.roi_max_positives + self.roi_max_negatives
+        roi_candidates_csv = getattr(data_args, "roi_candidates_csv", None)
+        if roi_candidates_csv and self.roi_candidate_slots > 0:
+            self.roi_candidate_lookup = load_roi_candidate_lookup(Path(roi_candidates_csv), logger=rank0_print)
+            rank0_print(
+                f"Loaded ROI candidate lookup from {roi_candidates_csv} "
+                f"(keys={len(self.roi_candidate_lookup)}, slots={self.roi_candidate_slots})"
+            )
+
         # Apply split indices if provided
         if self.split_indices is not None:
             original_data = self.list_data_dict
@@ -1529,33 +1525,6 @@ class LazySupervisedDataset(Dataset):
         else:
             image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         return image, image_size, "image"
-
-    def _build_roi_gaze_metadata(self, sample_dict: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build normalized gaze point metadata for ROI contrastive loss."""
-        default_xy = torch.tensor([-1.0, -1.0], dtype=torch.float32)
-        gaze_x = sample_dict.get("gaze_gt_x")
-        gaze_y = sample_dict.get("gaze_gt_y")
-        gaze_w = sample_dict.get("gaze_gt_width")
-        gaze_h = sample_dict.get("gaze_gt_height")
-        in_out = sample_dict.get("in_out")
-
-        if gaze_x is None or gaze_y is None or gaze_w is None or gaze_h is None:
-            return default_xy, torch.tensor(False, dtype=torch.bool)
-
-        gaze_x = float(gaze_x)
-        gaze_y = float(gaze_y)
-        gaze_w = float(gaze_w)
-        gaze_h = float(gaze_h)
-        if not all(math.isfinite(v) for v in (gaze_x, gaze_y, gaze_w, gaze_h)):
-            return default_xy, torch.tensor(False, dtype=torch.bool)
-        if gaze_w <= 0 or gaze_h <= 0:
-            return default_xy, torch.tensor(False, dtype=torch.bool)
-        if in_out is not None and int(in_out) == 0:
-            return default_xy, torch.tensor(False, dtype=torch.bool)
-
-        x_norm = max(0.0, min(1.0, gaze_x / gaze_w))
-        y_norm = max(0.0, min(1.0, gaze_y / gaze_h))
-        return torch.tensor([x_norm, y_norm], dtype=torch.float32), torch.tensor(True, dtype=torch.bool)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         # TODO: define number of retries somewhere else
@@ -1694,9 +1663,20 @@ class LazySupervisedDataset(Dataset):
             data_dict["prompt"] = prompt
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
-        roi_gaze_xy, roi_gaze_valid = self._build_roi_gaze_metadata(self.list_data_dict[i])
+        roi_gaze_xy, roi_gaze_valid = build_roi_gaze_metadata(self.list_data_dict[i])
         data_dict["roi_gaze_xy"] = roi_gaze_xy
         data_dict["roi_gaze_valid"] = roi_gaze_valid
+        if self.roi_candidate_slots > 0 and self.roi_candidate_lookup:
+            roi_boxes, roi_is_positive, roi_valid = build_roi_candidate_metadata(
+                sample_dict=self.list_data_dict[i],
+                roi_candidate_lookup=self.roi_candidate_lookup,
+                roi_max_positives=self.roi_max_positives,
+                roi_max_negatives=self.roi_max_negatives,
+                roi_candidate_slots=self.roi_candidate_slots,
+            )
+            data_dict["roi_candidate_boxes"] = roi_boxes
+            data_dict["roi_candidate_is_positive"] = roi_is_positive
+            data_dict["roi_candidate_valid"] = roi_valid
 
         return data_dict
 
@@ -1747,6 +1727,10 @@ class DataCollatorForSupervisedDataset(object):
         if "roi_gaze_xy" in instances[0]:
             batch["roi_gaze_xy"] = torch.stack([instance["roi_gaze_xy"] for instance in instances], dim=0)
             batch["roi_gaze_valid"] = torch.stack([instance["roi_gaze_valid"] for instance in instances], dim=0).bool()
+        if "roi_candidate_boxes" in instances[0]:
+            batch["roi_candidate_boxes"] = torch.stack([instance["roi_candidate_boxes"] for instance in instances], dim=0)
+            batch["roi_candidate_is_positive"] = torch.stack([instance["roi_candidate_is_positive"] for instance in instances], dim=0).bool()
+            batch["roi_candidate_valid"] = torch.stack([instance["roi_candidate_valid"] for instance in instances], dim=0).bool()
 
         return batch
 
@@ -1775,6 +1759,10 @@ def create_train_eval_splits(data_path: str, tokenizer: transformers.PreTrainedT
     train_dataset.data_args = data_args
     train_dataset.split_indices = train_indices
     train_dataset.list_data_dict = [full_dataset.list_data_dict[i] for i in train_indices]
+    train_dataset.roi_candidate_lookup = getattr(full_dataset, "roi_candidate_lookup", {})
+    train_dataset.roi_max_positives = getattr(full_dataset, "roi_max_positives", 0)
+    train_dataset.roi_max_negatives = getattr(full_dataset, "roi_max_negatives", 0)
+    train_dataset.roi_candidate_slots = getattr(full_dataset, "roi_candidate_slots", 0)
     rank0_print(f"Applied split: using {len(train_dataset.list_data_dict)} samples for training")
     
     eval_dataset = LazySupervisedDataset.__new__(LazySupervisedDataset)
@@ -1782,6 +1770,10 @@ def create_train_eval_splits(data_path: str, tokenizer: transformers.PreTrainedT
     eval_dataset.data_args = data_args
     eval_dataset.split_indices = eval_indices
     eval_dataset.list_data_dict = [full_dataset.list_data_dict[i] for i in eval_indices]
+    eval_dataset.roi_candidate_lookup = getattr(full_dataset, "roi_candidate_lookup", {})
+    eval_dataset.roi_max_positives = getattr(full_dataset, "roi_max_positives", 0)
+    eval_dataset.roi_max_negatives = getattr(full_dataset, "roi_max_negatives", 0)
+    eval_dataset.roi_candidate_slots = getattr(full_dataset, "roi_candidate_slots", 0)
     rank0_print(f"Applied split: using {len(eval_dataset.list_data_dict)} samples for evaluation")
     
     return train_dataset, eval_dataset
@@ -2182,6 +2174,15 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
     roi_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, training_args.roi_contrastive_phrase)
+    roi_oof_token_ids = tokenizer.encode(training_args.roi_contrastive_oof_text, add_special_tokens=False)
+    roi_oof_enabled = bool(training_args.roi_contrastive_oof_enable)
+    if roi_oof_enabled and not roi_oof_token_ids:
+        rank0_print(
+            "[ROI contrastive warning] --roi_contrastive_oof_enable is set but "
+            f"--roi_contrastive_oof_text produced empty tokenization: {training_args.roi_contrastive_oof_text!r}. "
+            "Disabling OOF auxiliary loss."
+        )
+        roi_oof_enabled = False
     warmup_steps = 0
     if training_args.max_steps and training_args.max_steps > 0:
         warmup_steps = int(training_args.max_steps * training_args.roi_contrastive_warmup_ratio)
@@ -2193,16 +2194,35 @@ def train(attn_implementation=None):
     model.config.roi_contrastive_phrase_token_ids = roi_phrase_token_ids
     model.config.roi_contrastive_warmup_steps = warmup_steps
     model.config.roi_contrastive_radius_ratio = training_args.roi_contrastive_radius_ratio
+    model.config.roi_contrastive_oof_enable = roi_oof_enabled
+    model.config.roi_contrastive_oof_text = training_args.roi_contrastive_oof_text
+    model.config.roi_contrastive_oof_weight = training_args.roi_contrastive_oof_weight
+    model.config.roi_contrastive_oof_token_ids = roi_oof_token_ids
+    model.config.roi_pos_embed_dim = training_args.roi_pos_embed_dim
     rank0_print(
         "ROI contrastive config: "
         f"enabled={training_args.roi_contrastive_enable}, "
         f"weight={training_args.roi_contrastive_weight}, "
         f"temp={training_args.roi_contrastive_temperature}, "
         f"dim={training_args.roi_contrastive_dim}, "
+        f"oof_enabled={roi_oof_enabled}, "
+        f"oof_weight={training_args.roi_contrastive_oof_weight}, "
+        f"oof_tokens={len(roi_oof_token_ids)}, "
+        f"pos_dim={training_args.roi_pos_embed_dim}, "
         f"warmup_steps={warmup_steps}, "
         f"phrase_candidates={len(roi_phrase_token_ids)}"
     )
-    if training_args.roi_contrastive_enable and int(training_args.per_device_train_batch_size) < 2:
+    if data_args.roi_candidates_csv:
+        rank0_print(
+            "ROI candidate CSV enabled: "
+            f"path={data_args.roi_candidates_csv}, "
+            f"max_pos={data_args.roi_max_positives}, max_neg={data_args.roi_max_negatives}"
+        )
+    if (
+        training_args.roi_contrastive_enable
+        and int(training_args.per_device_train_batch_size) < 2
+        and not roi_oof_enabled
+    ):
         rank0_print(
             "[ROI contrastive warning] per_device_train_batch_size < 2. "
             "Current ROI loss uses in-batch negatives only, so pair_count stays <2 and "
@@ -2418,7 +2438,11 @@ def train(attn_implementation=None):
     if training_args.roi_contrastive_enable:
         roi_head_params = []
         for name, param in model.named_parameters():
-            if "roi_text_projector" in name or "roi_vision_projector" in name:
+            if (
+                "roi_text_projector" in name
+                or "roi_vision_projector" in name
+                or "roi_position_mlp" in name
+            ):
                 param.requires_grad_(True)
                 roi_head_params.append(name)
         rank0_print(f"Enabled ROI contrastive head parameters ({len(roi_head_params)}):")

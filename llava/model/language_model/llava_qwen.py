@@ -36,6 +36,7 @@ from llava.mm_utils import select_best_resolution # Import the helper from mm_ut
 from llava.constants import IMAGE_TOKEN_INDEX
 from llava.model.language_model.attention_mask_visualizer import visualize_attention_mask_step
 from gazefollow.focus_loss_utils import locate_focus_start_index, prepare_focus_phrase_sequences
+from gazefollow.roi_contrastive_utils import build_bbox_patch_indices, build_roi_position_vector
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
 # from .qwen.configuration_qwen import QWenConfig
@@ -73,8 +74,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self.model = LlavaQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         roi_dim = int(getattr(config, "roi_contrastive_dim", 512))
+        roi_pos_dim = int(getattr(config, "roi_pos_embed_dim", 64))
         self.roi_text_projector = nn.Linear(config.hidden_size, roi_dim, bias=False)
         self.roi_vision_projector = nn.Linear(config.hidden_size, roi_dim, bias=False)
+        self.roi_position_mlp = nn.Sequential(
+            nn.Linear(6, roi_pos_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(roi_pos_dim, roi_dim, bias=False),
+        )
         self._roi_contrastive_step = 0
         self._roi_contrastive_stats: Optional[Dict[str, torch.Tensor]] = None
         self._roi_contrastive_warned_small_pair_count = False
@@ -304,15 +311,25 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         attention_mask_viz_config = kwargs.pop("attention_mask_viz", None)
         roi_gaze_xy = kwargs.pop("roi_gaze_xy", None)
         roi_gaze_valid = kwargs.pop("roi_gaze_valid", None)
+        roi_candidate_boxes = kwargs.pop("roi_candidate_boxes", None)
+        roi_candidate_is_positive = kwargs.pop("roi_candidate_is_positive", None)
+        roi_candidate_valid = kwargs.pop("roi_candidate_valid", None)
         roi_contrastive_enabled = bool(getattr(self.config, "roi_contrastive_enable", False))
+        roi_candidate_inputs_ready = (
+            roi_candidate_boxes is not None
+            and roi_candidate_is_positive is not None
+            and roi_candidate_valid is not None
+        )
         roi_requires_hidden_states = (
             roi_contrastive_enabled
             and self.training
             and not dpo_forward
             and images is not None
             and labels is not None
-            and roi_gaze_xy is not None
-            and roi_gaze_valid is not None
+            and (
+                (roi_gaze_xy is not None and roi_gaze_valid is not None)
+                or roi_candidate_inputs_ready
+            )
         )
         forced_output_hidden_states = roi_requires_hidden_states and not bool(output_hidden_states)
         if forced_output_hidden_states:
@@ -528,6 +545,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     image_features=image_features_ret,
                     roi_gaze_xy=roi_gaze_xy,
                     roi_gaze_valid=roi_gaze_valid,
+                    roi_candidate_boxes=roi_candidate_boxes,
+                    roi_candidate_is_positive=roi_candidate_is_positive,
+                    roi_candidate_valid=roi_candidate_valid,
                 )
             if forced_output_hidden_states and isinstance(outputs, CausalLMOutputWithPast):
                 outputs.hidden_states = None
@@ -653,12 +673,19 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         return snapshot
 
     def _ensure_roi_projection_heads(self, target_dim: int, device: torch.device, dtype: torch.dtype) -> None:
+        pos_hidden_dim = int(getattr(self.config, "roi_pos_embed_dim", 64))
         if self.roi_text_projector.out_features != target_dim:
             self.roi_text_projector = nn.Linear(self.config.hidden_size, target_dim, bias=False).to(device=device, dtype=dtype)
             self.roi_vision_projector = nn.Linear(self.config.hidden_size, target_dim, bias=False).to(device=device, dtype=dtype)
+            self.roi_position_mlp = nn.Sequential(
+                nn.Linear(6, pos_hidden_dim, bias=True),
+                nn.GELU(),
+                nn.Linear(pos_hidden_dim, target_dim, bias=False),
+            ).to(device=device, dtype=dtype)
         else:
             self.roi_text_projector = self.roi_text_projector.to(device=device, dtype=dtype)
             self.roi_vision_projector = self.roi_vision_projector.to(device=device, dtype=dtype)
+            self.roi_position_mlp = self.roi_position_mlp.to(device=device, dtype=dtype)
 
     @staticmethod
     def _build_roi_patch_indices(x_norm: float, y_norm: float, grid_side: int, radius: int) -> List[int]:
@@ -678,6 +705,40 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     valid_indices.append(y_coord * grid_side + x_coord)
         return valid_indices
 
+    def _compute_oof_text_proj(self, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if not bool(getattr(self.config, "roi_contrastive_oof_enable", False)):
+            return None
+        token_ids = getattr(self.config, "roi_contrastive_oof_token_ids", None)
+        if not isinstance(token_ids, (list, tuple)) or len(token_ids) == 0:
+            return None
+
+        normalized_ids: List[int] = []
+        for token_id in token_ids:
+            try:
+                normalized_ids.append(int(token_id))
+            except (TypeError, ValueError):
+                continue
+        if not normalized_ids:
+            return None
+
+        input_ids = torch.tensor([normalized_ids], device=device, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        oof_outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        if oof_outputs.hidden_states is None or len(oof_outputs.hidden_states) == 0:
+            return None
+        oof_hidden = oof_outputs.hidden_states[-1]
+        if oof_hidden.ndim != 3 or oof_hidden.shape[1] == 0:
+            return None
+        oof_text_embed = oof_hidden[0].mean(dim=0)
+        oof_text_proj = F.normalize(self.roi_text_projector(oof_text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
+        return oof_text_proj.to(device=device)
+
     def _apply_roi_contrastive_loss(
         self,
         outputs: CausalLMOutputWithPast,
@@ -685,12 +746,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         image_features: Optional[List[torch.Tensor]],
         roi_gaze_xy: Optional[torch.Tensor],
         roi_gaze_valid: Optional[torch.Tensor],
+        roi_candidate_boxes: Optional[torch.Tensor] = None,
+        roi_candidate_is_positive: Optional[torch.Tensor] = None,
+        roi_candidate_valid: Optional[torch.Tensor] = None,
     ) -> CausalLMOutputWithPast:
         if not isinstance(outputs, CausalLMOutputWithPast):
             return outputs
         if outputs.loss is None or outputs.hidden_states is None or labels is None:
             return outputs
-        if image_features is None or roi_gaze_xy is None or roi_gaze_valid is None:
+        if image_features is None:
             return outputs
 
         self._roi_contrastive_step += 1
@@ -702,13 +766,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             return outputs
 
         hidden_last = outputs.hidden_states[-1]
-        batch_limit = min(
-            hidden_last.shape[0],
-            labels.shape[0],
-            roi_gaze_xy.shape[0],
-            roi_gaze_valid.shape[0],
-            len(image_features),
-        )
+        batch_limit = min(hidden_last.shape[0], labels.shape[0], len(image_features))
+        if roi_gaze_xy is not None:
+            batch_limit = min(batch_limit, roi_gaze_xy.shape[0])
+        if roi_gaze_valid is not None:
+            batch_limit = min(batch_limit, roi_gaze_valid.shape[0])
         if batch_limit <= 0:
             return outputs
 
@@ -716,6 +778,165 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         default_grid_side = 0
         if vision_tower is not None:
             default_grid_side = int(getattr(vision_tower, "num_patches_per_side", 0) or 0)
+        temperature = max(float(getattr(self.config, "roi_contrastive_temperature", 0.07)), 1e-6)
+        shared_dim = int(getattr(self.config, "roi_contrastive_dim", 512))
+        self._ensure_roi_projection_heads(shared_dim, device=hidden_last.device, dtype=hidden_last.dtype)
+        base_weight = float(getattr(self.config, "roi_contrastive_weight", 0.1))
+        warmup_steps = int(getattr(self.config, "roi_contrastive_warmup_steps", 0))
+        warmup_factor = 1.0
+        if warmup_steps > 0:
+            warmup_factor = min(1.0, float(self._roi_contrastive_step) / float(warmup_steps))
+        effective_weight = base_weight * warmup_factor
+        oof_enabled = bool(getattr(self.config, "roi_contrastive_oof_enable", False))
+        oof_weight = max(0.0, float(getattr(self.config, "roi_contrastive_oof_weight", 0.5)))
+        oof_text_proj = self._compute_oof_text_proj(device=hidden_last.device, dtype=hidden_last.dtype) if oof_enabled else None
+        if oof_enabled and oof_text_proj is None:
+            oof_enabled = False
+
+        candidate_inputs_ready = (
+            roi_candidate_boxes is not None
+            and roi_candidate_is_positive is not None
+            and roi_candidate_valid is not None
+            and roi_candidate_boxes.ndim == 3
+            and roi_candidate_is_positive.ndim == 2
+            and roi_candidate_valid.ndim == 2
+        )
+        if candidate_inputs_ready:
+            batch_limit_candidate = min(
+                hidden_last.shape[0],
+                labels.shape[0],
+                roi_candidate_boxes.shape[0],
+                roi_candidate_is_positive.shape[0],
+                roi_candidate_valid.shape[0],
+                len(image_features),
+            )
+            if roi_gaze_valid is not None:
+                batch_limit_candidate = min(batch_limit_candidate, roi_gaze_valid.shape[0])
+            row_losses: List[torch.Tensor] = []
+            row_top1: List[torch.Tensor] = []
+            candidate_count_total = 0
+            candidate_text_bank: List[torch.Tensor] = []
+            candidate_oof_anchors: List[torch.Tensor] = []
+            candidate_oof_targets: List[int] = []
+            candidate_row_text_index: Dict[int, int] = {}
+
+            for row_idx in range(batch_limit_candidate):
+                focus_start = locate_focus_start_index(labels[row_idx], phrase_sequences)
+                if focus_start is None:
+                    continue
+                span_mask = labels[row_idx] >= 0
+                if focus_start > 0:
+                    span_mask = span_mask & (torch.arange(labels[row_idx].shape[0], device=labels.device) >= focus_start)
+                if not span_mask.any():
+                    continue
+                text_embed = hidden_last[row_idx][span_mask].mean(dim=0)
+
+                sample_image_features = image_features[row_idx]
+                if not torch.is_tensor(sample_image_features) or sample_image_features.ndim != 2:
+                    continue
+                grid_side = default_grid_side
+                if grid_side <= 0 or grid_side * grid_side > sample_image_features.shape[0]:
+                    grid_side = int(math.sqrt(sample_image_features.shape[0]))
+                base_token_count = grid_side * grid_side
+                if base_token_count <= 0:
+                    continue
+
+                row_boxes = roi_candidate_boxes[row_idx]
+                row_is_positive = roi_candidate_is_positive[row_idx].bool()
+                row_valid = roi_candidate_valid[row_idx].bool()
+
+                candidate_embeds: List[torch.Tensor] = []
+                candidate_positive_flags: List[bool] = []
+                for cand_idx in range(row_boxes.shape[0]):
+                    if not bool(row_valid[cand_idx].item()):
+                        continue
+                    x1 = float(torch.clamp(row_boxes[cand_idx][0], 0.0, 1.0).item())
+                    y1 = float(torch.clamp(row_boxes[cand_idx][1], 0.0, 1.0).item())
+                    x2 = float(torch.clamp(row_boxes[cand_idx][2], 0.0, 1.0).item())
+                    y2 = float(torch.clamp(row_boxes[cand_idx][3], 0.0, 1.0).item())
+                    bbox_patch_indices = build_bbox_patch_indices(x1, y1, x2, y2, grid_side)
+                    if not bbox_patch_indices:
+                        continue
+                    bbox_indices_tensor = torch.as_tensor(
+                        bbox_patch_indices, device=sample_image_features.device, dtype=torch.long
+                    )
+                    bbox_indices_tensor = bbox_indices_tensor[bbox_indices_tensor < base_token_count]
+                    if bbox_indices_tensor.numel() == 0:
+                        continue
+
+                    vision_embed = sample_image_features.index_select(0, bbox_indices_tensor).mean(dim=0)
+                    vision_proj = self.roi_vision_projector(vision_embed.float().unsqueeze(0)).squeeze(0)
+                    pos_vector = build_roi_position_vector(x1, y1, x2, y2)
+                    pos_tensor = torch.tensor(pos_vector, device=vision_proj.device, dtype=vision_proj.dtype).unsqueeze(0)
+                    pos_proj = self.roi_position_mlp(pos_tensor).squeeze(0)
+                    fused_embed = F.normalize(vision_proj + pos_proj, dim=-1)
+                    candidate_embeds.append(fused_embed)
+                    candidate_positive_flags.append(bool(row_is_positive[cand_idx].item()))
+
+                if len(candidate_embeds) < 2:
+                    continue
+                positive_mask = torch.tensor(candidate_positive_flags, device=hidden_last.device, dtype=torch.bool)
+                if not positive_mask.any() or positive_mask.all():
+                    continue
+
+                candidate_tensor = torch.stack(candidate_embeds, dim=0)
+                text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
+                logits = (candidate_tensor @ text_proj) / temperature
+                row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
+                row_losses.append(row_loss)
+                row_top1.append(positive_mask[torch.argmax(logits)].float())
+                candidate_count_total += int(candidate_tensor.shape[0])
+                candidate_text_bank.append(text_proj)
+                candidate_row_text_index[row_idx] = len(candidate_text_bank) - 1
+                if oof_enabled and roi_gaze_valid is not None and bool(roi_gaze_valid[row_idx].item()):
+                    positive_anchor = F.normalize(candidate_tensor[positive_mask].mean(dim=0), dim=-1)
+                    candidate_oof_anchors.append(positive_anchor)
+                    candidate_oof_targets.append(candidate_row_text_index[row_idx])
+
+            if row_losses or (oof_enabled and len(candidate_oof_anchors) > 0):
+                stats_device = outputs.loss.device
+                nce_loss = (
+                    torch.stack(row_losses).mean()
+                    if row_losses
+                    else torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+                )
+                top1_acc = (
+                    torch.stack(row_top1).mean()
+                    if row_top1
+                    else torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+                )
+                total_roi_loss = nce_loss
+                oof_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+                oof_top1 = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+                oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
+                if oof_enabled and len(candidate_oof_anchors) > 0 and oof_text_proj is not None:
+                    text_bank = torch.cat([torch.stack(candidate_text_bank, dim=0), oof_text_proj.unsqueeze(0)], dim=0)
+                    anchor_batch = torch.stack(candidate_oof_anchors, dim=0)
+                    targets_oof = torch.tensor(candidate_oof_targets, device=hidden_last.device, dtype=torch.long)
+                    oof_logits = (anchor_batch @ text_bank.t()) / temperature
+                    oof_loss = F.cross_entropy(oof_logits, targets_oof)
+                    oof_top1 = (oof_logits.argmax(dim=-1) == targets_oof).float().mean()
+                    oof_rows = torch.tensor(len(candidate_oof_targets), device=hidden_last.device, dtype=torch.long)
+                    total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
+
+                outputs.loss = outputs.loss + outputs.loss.new_tensor(effective_weight) * total_roi_loss.to(
+                    device=outputs.loss.device,
+                    dtype=outputs.loss.dtype,
+                )
+                self._roi_contrastive_stats = {
+                    "nce_loss": nce_loss.detach(),
+                    "top1": top1_acc.detach(),
+                    "pairs": torch.tensor(candidate_count_total, device=stats_device, dtype=torch.long),
+                    "lambda": torch.tensor(effective_weight, device=stats_device, dtype=torch.float32),
+                }
+                if oof_enabled:
+                    self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
+                    self._roi_contrastive_stats["oof_top1"] = oof_top1.detach().to(device=stats_device, dtype=torch.float32)
+                    self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
+                return outputs
+
+        if roi_gaze_xy is None or roi_gaze_valid is None:
+            return outputs
 
         radius_ratio = float(getattr(self.config, "roi_contrastive_radius_ratio", 0.08))
         text_embeddings: List[torch.Tensor] = []
@@ -761,55 +982,75 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             vision_embeddings.append(vision_embed)
 
         pair_count = len(text_embeddings)
-        if pair_count < 2:
-            if not self._roi_contrastive_warned_small_pair_count:
-                print(
-                    "[ROI contrastive] pair_count < 2 in current micro-batch; "
-                    "InfoNCE is skipped and roi_contrastive/* metrics stay zero. "
-                    "Increase per-device train batch size (>=2) or add explicit same-image negatives."
-                )
-                self._roi_contrastive_warned_small_pair_count = True
-            stats_device = outputs.loss.device
+        stats_device = outputs.loss.device
+        if pair_count < 1:
             self._roi_contrastive_stats = {
                 "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "top1": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
                 "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
             }
+            if oof_enabled:
+                self._roi_contrastive_stats["oof_loss"] = torch.zeros((), device=stats_device, dtype=torch.float32)
+                self._roi_contrastive_stats["oof_top1"] = torch.zeros((), device=stats_device, dtype=torch.float32)
+                self._roi_contrastive_stats["oof_rows"] = torch.zeros((), device=stats_device, dtype=torch.long)
             return outputs
+
+        if pair_count < 2 and not self._roi_contrastive_warned_small_pair_count:
+            print(
+                "[ROI contrastive] pair_count < 2 in current micro-batch; "
+                "InfoNCE is skipped and roi_contrastive/nce_loss may stay near zero. "
+                "Enable OOF negatives or increase per-device train batch size (>=2)."
+            )
+            self._roi_contrastive_warned_small_pair_count = True
 
         text_batch = torch.stack(text_embeddings, dim=0)
         vision_batch = torch.stack(vision_embeddings, dim=0)
-        shared_dim = int(getattr(self.config, "roi_contrastive_dim", 512))
-        self._ensure_roi_projection_heads(shared_dim, device=text_batch.device, dtype=text_batch.dtype)
         text_proj = F.normalize(self.roi_text_projector(text_batch.float()), dim=-1)
         vision_proj = F.normalize(self.roi_vision_projector(vision_batch.float()), dim=-1)
+        nce_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+        top1_acc = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+        if pair_count >= 2:
+            similarity = (vision_proj @ text_proj.t()) / temperature
+            targets = torch.arange(pair_count, device=similarity.device, dtype=torch.long)
+            loss_v2t = F.cross_entropy(similarity, targets)
+            loss_t2v = F.cross_entropy(similarity.t(), targets)
+            nce_loss = 0.5 * (loss_v2t + loss_t2v)
+            top1_acc = (similarity.argmax(dim=-1) == targets).float().mean()
 
-        temperature = max(float(getattr(self.config, "roi_contrastive_temperature", 0.07)), 1e-6)
-        similarity = (vision_proj @ text_proj.t()) / temperature
-        targets = torch.arange(pair_count, device=similarity.device, dtype=torch.long)
-        loss_v2t = F.cross_entropy(similarity, targets)
-        loss_t2v = F.cross_entropy(similarity.t(), targets)
-        nce_loss = 0.5 * (loss_v2t + loss_t2v)
+        total_roi_loss = nce_loss
+        oof_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+        oof_top1 = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+        oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
+        has_oof_term = False
+        if oof_enabled and oof_text_proj is not None:
+            text_bank = torch.cat([text_proj, oof_text_proj.unsqueeze(0)], dim=0)
+            oof_logits = (vision_proj @ text_bank.t()) / temperature
+            oof_targets = torch.arange(pair_count, device=oof_logits.device, dtype=torch.long)
+            oof_loss = F.cross_entropy(oof_logits, oof_targets)
+            oof_top1 = (oof_logits.argmax(dim=-1) == oof_targets).float().mean()
+            oof_rows = torch.tensor(pair_count, device=hidden_last.device, dtype=torch.long)
+            total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
+            has_oof_term = True
 
-        base_weight = float(getattr(self.config, "roi_contrastive_weight", 0.1))
-        warmup_steps = int(getattr(self.config, "roi_contrastive_warmup_steps", 0))
-        warmup_factor = 1.0
-        if warmup_steps > 0:
-            warmup_factor = min(1.0, float(self._roi_contrastive_step) / float(warmup_steps))
-        effective_weight = base_weight * warmup_factor
+        has_base_term = pair_count >= 2
+        lambda_value = effective_weight if (has_base_term or has_oof_term) else 0.0
+        if has_base_term or has_oof_term:
+            outputs.loss = outputs.loss + outputs.loss.new_tensor(effective_weight) * total_roi_loss.to(
+                device=outputs.loss.device,
+                dtype=outputs.loss.dtype,
+            )
 
-        outputs.loss = outputs.loss + outputs.loss.new_tensor(effective_weight) * nce_loss.to(
-            device=outputs.loss.device,
-            dtype=outputs.loss.dtype,
-        )
-        top1_acc = (similarity.argmax(dim=-1) == targets).float().mean()
         self._roi_contrastive_stats = {
             "nce_loss": nce_loss.detach(),
             "top1": top1_acc.detach(),
-            "pairs": torch.tensor(pair_count, device=top1_acc.device, dtype=torch.long),
-            "lambda": torch.tensor(effective_weight, device=top1_acc.device, dtype=torch.float32),
+            "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
+            "lambda": torch.tensor(lambda_value, device=stats_device, dtype=torch.float32),
         }
+        if oof_enabled:
+            self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
+            self._roi_contrastive_stats["oof_top1"] = oof_top1.detach().to(device=stats_device, dtype=torch.float32)
+            self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
         return outputs
 
     def pop_roi_contrastive_stats(self) -> Optional[Dict[str, torch.Tensor]]:

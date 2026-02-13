@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Draw negative detection bboxes from Stage-1b CSV.")
     parser.add_argument(
         "--input-csv",
-        default="training_datasets/stage1b_qwen3vl_negatives_20260212_234014.csv",
+        default="training_datasets/stage1b_negatives/stage1b_yolo_negatives.csv",
         help="Path to Stage-1b negatives CSV.",
     )
     parser.add_argument(
