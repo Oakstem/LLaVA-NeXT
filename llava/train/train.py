@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+from pathlib import Path
 from typing import Dict, Optional, Sequence, List, Any, Tuple
 from PIL import Image, ImageFile
 from packaging import version
