@@ -121,7 +121,7 @@ LORA_ALPHA="32"
 MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
-NUM_TRAIN_EPOCHS="2"
+MAX_STEPS="1500"
 PER_DEVICE_TRAIN_BATCH_SIZE="1"  # Reduced from 2 to 1
 PER_DEVICE_EVAL_BATCH_SIZE="2"  # Reduced from 4 to 2
 GRADIENT_ACCUMULATION_STEPS="8"  # Increased to maintain effective batch size
@@ -212,7 +212,7 @@ echo "LoRA r: ${LORA_R}"
 echo "LoRA alpha: ${LORA_ALPHA}"
 echo ""
 echo "=== TRAINING HYPERPARAMETERS ==="
-echo "Epochs: ${NUM_TRAIN_EPOCHS}"
+echo "Max Steps: ${MAX_STEPS}"
 echo "Train Batch Size: ${PER_DEVICE_TRAIN_BATCH_SIZE}"
 echo "Eval Batch Size: ${PER_DEVICE_EVAL_BATCH_SIZE}"
 echo "Gradient Accumulation Steps: ${GRADIENT_ACCUMULATION_STEPS}"
@@ -292,7 +292,7 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --bf16 ${BF16} \
     --run_name $MID_RUN_NAME \
     --output_dir ${OUTPUT_BASE_DIR}/${MID_RUN_NAME} \
-    --num_train_epochs ${NUM_TRAIN_EPOCHS} \
+    --max_steps ${MAX_STEPS} \
     --per_device_train_batch_size ${PER_DEVICE_TRAIN_BATCH_SIZE} \
     --per_device_eval_batch_size ${PER_DEVICE_EVAL_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
