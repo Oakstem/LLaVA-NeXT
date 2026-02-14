@@ -427,7 +427,7 @@ def compute_similarity_results(
             cls_vector = F.normalize(cls_vector, p=2, dim=-1)
             if normalized_image_embeddings.shape[-1] != cls_vector.shape[-1]:
                 continue
-            similarities = torch.matmul(normalized_image_embeddings, cls_vector)
+            similarities = torch.matmul(normalized_image_embeddings, cls_vector).clamp(min=-1.0, max=1.0)
             usable_k = max(1, min(int(top_k), similarities.shape[0]))
             top_scores, top_indices = torch.topk(similarities, k=usable_k, dim=0)
 
