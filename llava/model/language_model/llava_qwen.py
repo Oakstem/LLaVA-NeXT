@@ -808,42 +808,77 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         oof_enabled = bool(getattr(self.config, "roi_contrastive_oof_enable", False))
         oof_weight = max(0.0, float(getattr(self.config, "roi_contrastive_oof_weight", 0.5)))
         preview_samples = max(1, int(getattr(self.config, "roi_contrastive_preview_samples", 5)))
-        preview_topk = max(1, int(getattr(self.config, "roi_contrastive_preview_topk", 5)))
         oof_text_projs = self._compute_oof_text_projs(device=hidden_last.device, dtype=hidden_last.dtype) if oof_enabled else None
         if oof_enabled and oof_text_projs is None:
             oof_enabled = False
 
-        preview_rows: List[torch.Tensor] = []
-        preview_option_counts: List[int] = []
         preview_row_indices: List[int] = []
         preview_pred_candidate_slots: List[int] = []
+        preview_candidate_slot_scores: List[torch.Tensor] = []
+        preview_oof_scores: List[torch.Tensor] = []
 
-        def append_preview_scores(option_scores: torch.Tensor, row_index: int = -1, pred_candidate_slot: int = -1):
-            if len(preview_rows) >= preview_samples:
+        def append_preview_row(
+            row_index: int,
+            pred_candidate_slot: int,
+            candidate_slot_scores: torch.Tensor,
+            oof_scores: Optional[torch.Tensor] = None,
+        ):
+            if len(preview_row_indices) >= preview_samples:
                 return
-            if option_scores.ndim != 1 or option_scores.numel() == 0:
-                return
-            topk_count = min(preview_topk, int(option_scores.numel()))
-            top_scores = torch.topk(option_scores, k=topk_count, largest=True).values.detach().float()
-            padded = torch.full((preview_topk,), float("nan"), device=top_scores.device, dtype=torch.float32)
-            padded[:topk_count] = top_scores
-            preview_rows.append(padded)
-            preview_option_counts.append(int(option_scores.numel()))
             preview_row_indices.append(int(row_index))
             preview_pred_candidate_slots.append(int(pred_candidate_slot))
+            if candidate_slot_scores.ndim == 1:
+                preview_candidate_slot_scores.append(candidate_slot_scores.detach().float())
+            else:
+                preview_candidate_slot_scores.append(torch.empty((0,), device=hidden_last.device, dtype=torch.float32))
+            if oof_scores is not None and oof_scores.ndim == 1:
+                preview_oof_scores.append(oof_scores.detach().float())
+            else:
+                preview_oof_scores.append(torch.empty((0,), device=hidden_last.device, dtype=torch.float32))
 
         def build_preview_tensors(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            preview_tensor = torch.full((preview_samples, preview_topk), float("nan"), device=device, dtype=torch.float32)
-            option_count_tensor = torch.zeros((preview_samples,), device=device, dtype=torch.long)
             row_index_tensor = torch.full((preview_samples,), -1, device=device, dtype=torch.long)
             pred_candidate_slot_tensor = torch.full((preview_samples,), -1, device=device, dtype=torch.long)
-            limit = min(preview_samples, len(preview_rows))
+            max_candidate_slots = 0
+            for slot_scores in preview_candidate_slot_scores:
+                max_candidate_slots = max(max_candidate_slots, int(slot_scores.numel()))
+            max_oof_scores = 0
+            for row_oof_scores in preview_oof_scores:
+                max_oof_scores = max(max_oof_scores, int(row_oof_scores.numel()))
+            candidate_slot_score_tensor = torch.full(
+                (preview_samples, max_candidate_slots),
+                float("nan"),
+                device=device,
+                dtype=torch.float32,
+            )
+            oof_score_tensor = torch.full(
+                (preview_samples, max_oof_scores),
+                float("nan"),
+                device=device,
+                dtype=torch.float32,
+            )
+            limit = min(preview_samples, len(preview_row_indices))
             for idx in range(limit):
-                preview_tensor[idx] = preview_rows[idx].to(device=device, dtype=torch.float32)
-                option_count_tensor[idx] = int(preview_option_counts[idx])
                 row_index_tensor[idx] = int(preview_row_indices[idx])
                 pred_candidate_slot_tensor[idx] = int(preview_pred_candidate_slots[idx])
-            return preview_tensor, option_count_tensor, row_index_tensor, pred_candidate_slot_tensor
+                if idx < len(preview_candidate_slot_scores):
+                    slot_scores = preview_candidate_slot_scores[idx]
+                    if slot_scores.numel() > 0:
+                        candidate_slot_score_tensor[idx, : int(slot_scores.numel())] = slot_scores.to(
+                            device=device, dtype=torch.float32
+                        )
+                if idx < len(preview_oof_scores):
+                    row_oof_scores = preview_oof_scores[idx]
+                    if row_oof_scores.numel() > 0:
+                        oof_score_tensor[idx, : int(row_oof_scores.numel())] = row_oof_scores.to(
+                            device=device, dtype=torch.float32
+                        )
+            return (
+                row_index_tensor,
+                pred_candidate_slot_tensor,
+                candidate_slot_score_tensor,
+                oof_score_tensor,
+            )
 
         candidate_inputs_ready = (
             roi_candidate_boxes is not None
@@ -970,15 +1005,21 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 candidate_tensor = torch.stack(candidate_embeds, dim=0)
                 text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
                 logits = (candidate_tensor @ text_proj) / temperature
-                preview_option_scores = logits
-                if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
-                    # OOF / extra-OOF phrases are logged as extra options using their best candidate alignment.
-                    oof_option_scores = ((candidate_tensor @ oof_text_projs.t()) / temperature).max(dim=0).values
-                    preview_option_scores = torch.cat([preview_option_scores, oof_option_scores], dim=0)
                 pred_candidate_slot = -1
                 if candidate_source_slots:
                     pred_candidate_slot = int(candidate_source_slots[int(torch.argmax(logits).item())])
-                append_preview_scores(preview_option_scores, row_index=row_idx, pred_candidate_slot=pred_candidate_slot)
+                slot_scores = torch.full(
+                    (row_boxes.shape[0],),
+                    float("nan"),
+                    device=logits.device,
+                    dtype=torch.float32,
+                )
+                for local_candidate_idx, source_slot_idx in enumerate(candidate_source_slots):
+                    slot_scores[int(source_slot_idx)] = logits[local_candidate_idx].detach().float()
+                row_oof_scores = None
+                if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
+                    row_oof_scores = ((candidate_tensor @ oof_text_projs.t()) / temperature).max(dim=0).values
+                append_preview_row(row_idx, pred_candidate_slot, slot_scores, oof_scores=row_oof_scores)
                 row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
                 row_losses.append(row_loss)
                 row_top1.append(positive_mask[torch.argmax(logits)].float())
@@ -1020,16 +1061,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     device=outputs.loss.device,
                     dtype=outputs.loss.dtype,
                 )
-                preview_tensor, option_count_tensor, preview_row_index_tensor, preview_pred_slot_tensor = build_preview_tensors(stats_device)
+                preview_row_index_tensor, preview_pred_slot_tensor, preview_candidate_slot_score_tensor, preview_oof_score_tensor = build_preview_tensors(stats_device)
                 self._roi_contrastive_stats = {
                     "nce_loss": nce_loss.detach(),
                     "top1": top1_acc.detach(),
                     "pairs": torch.tensor(candidate_count_total, device=stats_device, dtype=torch.long),
                     "lambda": torch.tensor(effective_weight, device=stats_device, dtype=torch.float32),
-                    "preview_topk_scores": preview_tensor,
-                    "preview_option_counts": option_count_tensor,
                     "preview_row_indices": preview_row_index_tensor,
                     "preview_pred_candidate_slots": preview_pred_slot_tensor,
+                    "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
+                    "preview_oof_scores": preview_oof_score_tensor,
                 }
                 if oof_enabled:
                     self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
@@ -1108,16 +1149,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         pair_count = len(text_embeddings)
         stats_device = outputs.loss.device
         if pair_count < 1:
-            preview_tensor, option_count_tensor, preview_row_index_tensor, preview_pred_slot_tensor = build_preview_tensors(stats_device)
+            preview_row_index_tensor, preview_pred_slot_tensor, preview_candidate_slot_score_tensor, preview_oof_score_tensor = build_preview_tensors(stats_device)
             self._roi_contrastive_stats = {
                 "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "top1": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
                 "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
-                "preview_topk_scores": preview_tensor,
-                "preview_option_counts": option_count_tensor,
                 "preview_row_indices": preview_row_index_tensor,
                 "preview_pred_candidate_slots": preview_pred_slot_tensor,
+                "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
+                "preview_oof_scores": preview_oof_score_tensor,
             }
             if oof_enabled:
                 self._roi_contrastive_stats["oof_loss"] = torch.zeros((), device=stats_device, dtype=torch.float32)
@@ -1152,7 +1193,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         oof_top1 = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
         oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
         has_oof_term = False
-        preview_logits = similarity
         if oof_enabled and oof_text_projs is not None:
             text_bank = torch.cat([text_proj, oof_text_projs], dim=0)
             oof_logits = (vision_proj @ text_bank.t()) / temperature
@@ -1162,10 +1202,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             oof_rows = torch.tensor(pair_count, device=hidden_last.device, dtype=torch.long)
             total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
             has_oof_term = True
-            preview_logits = oof_logits
-
-        for row_idx in range(min(preview_samples, int(preview_logits.shape[0]))):
-            append_preview_scores(preview_logits[row_idx])
 
         has_base_term = pair_count >= 2
         lambda_value = effective_weight if (has_base_term or has_oof_term) else 0.0
@@ -1175,16 +1211,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dtype=outputs.loss.dtype,
             )
 
-        preview_tensor, option_count_tensor, preview_row_index_tensor, preview_pred_slot_tensor = build_preview_tensors(stats_device)
+        preview_row_index_tensor, preview_pred_slot_tensor, preview_candidate_slot_score_tensor, preview_oof_score_tensor = build_preview_tensors(stats_device)
         self._roi_contrastive_stats = {
             "nce_loss": nce_loss.detach(),
             "top1": top1_acc.detach(),
             "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
             "lambda": torch.tensor(lambda_value, device=stats_device, dtype=torch.float32),
-            "preview_topk_scores": preview_tensor,
-            "preview_option_counts": option_count_tensor,
             "preview_row_indices": preview_row_index_tensor,
             "preview_pred_candidate_slots": preview_pred_slot_tensor,
+            "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
+            "preview_oof_scores": preview_oof_score_tensor,
         }
         if oof_enabled:
             self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)

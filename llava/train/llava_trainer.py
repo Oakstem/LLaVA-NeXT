@@ -328,8 +328,6 @@ class LLaVATrainer(Trainer):
         self.roi_contrastive_stats_window = max(1, int(getattr(self.args, "roi_contrastive_metrics_window", 100)))
         self.roi_contrastive_stats_cap = max(2048, self.roi_contrastive_stats_window * 4)
         self.roi_contrastive_preview_samples = max(1, int(getattr(self.args, "roi_contrastive_preview_samples", 5)))
-        self.roi_contrastive_preview_topk = max(1, int(getattr(self.args, "roi_contrastive_preview_topk", 5)))
-        self.roi_contrastive_preview_rows: List[Dict[str, object]] = []
         self.roi_contrastive_local_preview_rows: List[Dict[str, object]] = []
         self._roi_overlay_batch: Optional[Dict[str, Any]] = None
         self._sanity_table = None
@@ -754,22 +752,17 @@ class LLaVATrainer(Trainer):
         oof_loss = stats.get("oof_loss")
         oof_top1 = stats.get("oof_top1")
         oof_rows = stats.get("oof_rows")
-        preview_topk_scores = stats.get("preview_topk_scores")
-        preview_option_counts = stats.get("preview_option_counts")
         preview_row_indices = stats.get("preview_row_indices")
         preview_pred_candidate_slots = stats.get("preview_pred_candidate_slots")
+        preview_candidate_slot_scores = stats.get("preview_candidate_slot_scores")
+        preview_oof_scores = stats.get("preview_oof_scores")
         gathered_oof_loss = None
         gathered_oof_top1 = None
         gathered_oof_rows = None
-        gathered_preview_scores = None
-        gathered_preview_counts = None
         if oof_loss is not None and oof_top1 is not None and oof_rows is not None:
             gathered_oof_loss = self.accelerator.gather(oof_loss.detach().float().reshape(1))
             gathered_oof_top1 = self.accelerator.gather(oof_top1.detach().float().reshape(1))
             gathered_oof_rows = self.accelerator.gather(oof_rows.detach().long().reshape(1))
-        if preview_topk_scores is not None and preview_option_counts is not None:
-            gathered_preview_scores = self.accelerator.gather(preview_topk_scores.detach().float())
-            gathered_preview_counts = self.accelerator.gather(preview_option_counts.detach().long())
 
         if self.is_world_process_zero():
             self.roi_contrastive_stats["nce_loss"].append(float(gathered_nce.mean().item()))
@@ -778,47 +771,30 @@ class LLaVATrainer(Trainer):
             self.roi_contrastive_stats["lambda"].append(float(gathered_lambda.mean().item()))
             self.roi_contrastive_local_preview_rows = []
             if (
-                preview_topk_scores is not None
-                and preview_option_counts is not None
-                and preview_row_indices is not None
+                preview_row_indices is not None
                 and preview_pred_candidate_slots is not None
             ):
                 local_limit = min(
-                    int(preview_topk_scores.shape[0]),
-                    int(preview_option_counts.shape[0]),
                     int(preview_row_indices.shape[0]),
                     int(preview_pred_candidate_slots.shape[0]),
                 )
                 for local_idx in range(local_limit):
-                    option_count = int(preview_option_counts[local_idx].item())
-                    if option_count <= 0:
-                        continue
-                    row_scores = preview_topk_scores[local_idx]
-                    finite_mask = torch.isfinite(row_scores)
-                    top_scores = row_scores[finite_mask][: self.roi_contrastive_preview_topk].tolist()
+                    candidate_scores: List[float] = []
+                    if torch.is_tensor(preview_candidate_slot_scores) and local_idx < preview_candidate_slot_scores.shape[0]:
+                        slot_scores_row = preview_candidate_slot_scores[local_idx]
+                        candidate_scores = [float(score) for score in slot_scores_row.tolist()]
+                    oof_scores: List[float] = []
+                    if torch.is_tensor(preview_oof_scores) and local_idx < preview_oof_scores.shape[0]:
+                        oof_scores_row = preview_oof_scores[local_idx]
+                        oof_scores = [float(score) for score in oof_scores_row.tolist()]
                     self.roi_contrastive_local_preview_rows.append(
                         {
-                            "option_count": option_count,
-                            "scores": [float(score) for score in top_scores],
                             "row_idx": int(preview_row_indices[local_idx].item()),
                             "pred_candidate_slot": int(preview_pred_candidate_slots[local_idx].item()),
+                            "candidate_slot_scores": candidate_scores,
+                            "oof_scores": oof_scores,
                         }
                     )
-            self.roi_contrastive_preview_rows = []
-            if gathered_preview_scores is not None and gathered_preview_counts is not None:
-                total_rows = min(gathered_preview_scores.shape[0], gathered_preview_counts.shape[0])
-                for row_idx in range(total_rows):
-                    option_count = int(gathered_preview_counts[row_idx].item())
-                    if option_count <= 0:
-                        continue
-                    row_scores = gathered_preview_scores[row_idx]
-                    finite_mask = torch.isfinite(row_scores)
-                    top_scores = row_scores[finite_mask][: self.roi_contrastive_preview_topk].tolist()
-                    self.roi_contrastive_preview_rows.append(
-                        {"option_count": option_count, "scores": [float(score) for score in top_scores]}
-                    )
-                    if len(self.roi_contrastive_preview_rows) >= self.roi_contrastive_preview_samples:
-                        break
             if gathered_oof_loss is not None and gathered_oof_top1 is not None and gathered_oof_rows is not None:
                 self.roi_contrastive_stats["oof_loss"].append(float(gathered_oof_loss.mean().item()))
                 self.roi_contrastive_stats["oof_top1"].append(float(gathered_oof_top1.mean().item()))
@@ -943,22 +919,6 @@ class LLaVATrainer(Trainer):
                     f"Top1: {roi_oof_top1:.3f}, Rows: {roi_oof_rows:.2f} "
                     f"(window={recent_oof})"
                 )
-            if self.roi_contrastive_preview_rows:
-                rank0_print(
-                    f"ROI contrastive top-{self.roi_contrastive_preview_topk} preview "
-                    f"(samples={len(self.roi_contrastive_preview_rows)})"
-                )
-                for sample_idx, sample in enumerate(self.roi_contrastive_preview_rows):
-                    option_count = int(sample["option_count"])
-                    scores = list(sample["scores"])
-                    score_text = ", ".join(f"{score:.4f}" for score in scores)
-                    rank0_print(
-                        f"  sample_{sample_idx}: options={option_count}, "
-                        f"top{len(scores)}=[{score_text}]"
-                    )
-                    metrics[f"roi_contrastive/preview_sample_{sample_idx}_option_count"] = option_count
-                    for rank_idx, score in enumerate(scores):
-                        metrics[f"roi_contrastive/preview_sample_{sample_idx}_top{rank_idx + 1}"] = score
             overlay_images = self._build_roi_candidate_overlays()
             if overlay_images:
                 metrics["roi_contrastive/preview_overlays"] = overlay_images
@@ -972,7 +932,7 @@ class LLaVATrainer(Trainer):
                 self.step_times[key] = self.step_times[key][-max_history:]
 
     @staticmethod
-    def _draw_norm_box(draw: ImageDraw.ImageDraw, box: torch.Tensor, image_w: int, image_h: int, color, width: int):
+    def _norm_box_to_pixels(box: torch.Tensor, image_w: int, image_h: int):
         x1 = int(max(0, min(image_w - 1, round(float(box[0].item()) * image_w))))
         y1 = int(max(0, min(image_h - 1, round(float(box[1].item()) * image_h))))
         x2 = int(max(0, min(image_w - 1, round(float(box[2].item()) * image_w))))
@@ -981,7 +941,29 @@ class LLaVATrainer(Trainer):
             x1, x2 = x2, x1
         if y2 < y1:
             y1, y2 = y2, y1
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _draw_labeled_norm_box(
+        draw: ImageDraw.ImageDraw,
+        box: torch.Tensor,
+        image_w: int,
+        image_h: int,
+        color,
+        width: int,
+        label: str,
+    ):
+        x1, y1, x2, y2 = LLaVATrainer._norm_box_to_pixels(box, image_w, image_h)
         draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+        text = label.strip()
+        if not text:
+            return
+        text_x = x1 + 2
+        text_y = max(0, y1 - 14)
+        if hasattr(draw, "textbbox"):
+            text_left, text_top, text_right, text_bottom = draw.textbbox((text_x, text_y), text)
+            draw.rectangle([text_left - 1, text_top - 1, text_right + 1, text_bottom + 1], fill=(0, 0, 0))
+        draw.text((text_x, text_y), text, fill=color)
 
     def _resolve_overlay_image_path(self, image_file: str) -> Optional[pathlib.Path]:
         if not image_file:
@@ -1051,11 +1033,36 @@ class LLaVATrainer(Trainer):
             for cand_idx in range(int(row_boxes.shape[0])):
                 if not bool(row_valid[cand_idx].item()):
                     continue
-                self._draw_norm_box(draw, row_boxes[cand_idx], image_w, image_h, color=(255, 214, 10), width=2)
-                if bool(row_pos[cand_idx].item()):
-                    self._draw_norm_box(draw, row_boxes[cand_idx], image_w, image_h, color=(0, 255, 80), width=3)
-            if pred_slot >= 0 and pred_slot < int(row_boxes.shape[0]) and bool(row_valid[pred_slot].item()):
-                self._draw_norm_box(draw, row_boxes[pred_slot], image_w, image_h, color=(255, 64, 64), width=4)
+                is_gt = bool(row_pos[cand_idx].item())
+                is_pred = pred_slot >= 0 and cand_idx == pred_slot
+                if is_pred:
+                    color = (255, 64, 64)
+                    line_width = 4
+                elif is_gt:
+                    color = (0, 255, 80)
+                    line_width = 3
+                else:
+                    color = (255, 214, 10)
+                    line_width = 2
+                label_parts = [f"cand_{cand_idx}"]
+                slot_scores = preview.get("candidate_slot_scores", [])
+                if cand_idx < len(slot_scores):
+                    score_val = float(slot_scores[cand_idx])
+                    if score_val == score_val and score_val not in (float("inf"), float("-inf")):
+                        label_parts.append(f"s={score_val:.3f}")
+                if is_gt:
+                    label_parts.append("GT")
+                if is_pred:
+                    label_parts.append("pred")
+                self._draw_labeled_norm_box(
+                    draw,
+                    row_boxes[cand_idx],
+                    image_w,
+                    image_h,
+                    color=color,
+                    width=line_width,
+                    label="|".join(label_parts),
+                )
 
             if (
                 torch.is_tensor(gaze_xy)
@@ -1070,11 +1077,26 @@ class LLaVATrainer(Trainer):
                 draw.ellipse([gx - r, gy - r, gx + r, gy + r], outline=(0, 255, 255), width=3)
 
             sample_id = sample_ids[row_idx] if row_idx < len(sample_ids) else str(row_idx)
-            top_scores = preview.get("scores", [])
-            top1_score = float(top_scores[0]) if top_scores else float("nan")
+            oof_parts: List[str] = []
+            configured_oof_labels = list(getattr(getattr(self.model, "config", None), "roi_contrastive_oof_texts", []) or [])
+            oof_scores = preview.get("oof_scores", [])
+            for oof_idx, raw_score in enumerate(oof_scores):
+                score_val = float(raw_score)
+                if score_val != score_val or score_val in (float("inf"), float("-inf")):
+                    continue
+                label = configured_oof_labels[oof_idx] if oof_idx < len(configured_oof_labels) else f"oof_{oof_idx}"
+                oof_parts.append(f"{label}:{score_val:.2f}")
+            if oof_parts:
+                overlay_text = "OOF " + " | ".join(oof_parts)
+                text_x = 8
+                text_y = 8
+                if hasattr(draw, "textbbox"):
+                    left, top, right, bottom = draw.textbbox((text_x, text_y), overlay_text)
+                    draw.rectangle([left - 2, top - 2, right + 2, bottom + 2], fill=(0, 0, 0))
+                draw.text((text_x, text_y), overlay_text, fill=(255, 255, 255))
             caption = (
                 f"step={self.state.global_step} sample={sample_id} row={row_idx} "
-                f"pred_slot={pred_slot} top1_score={top1_score:.4f}"
+                f"pred_slot={pred_slot}"
             )
             overlays.append(wandb.Image(image, caption=caption))
         return overlays
