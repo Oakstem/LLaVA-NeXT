@@ -486,8 +486,8 @@ def main() -> None:
             writer.writeheader()
 
         for local_idx, sample in enumerate(tqdm(dataset, desc="Building stage1b negatives (YOLO)")):
-            if should_skip_sample(sample):
-                continue
+            # if should_skip_sample(sample):
+            #     continue
 
             sample_id = str(sample.get("id", args.start_index + local_idx))
             if sample_id in seen_sample_ids:
