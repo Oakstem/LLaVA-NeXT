@@ -1537,6 +1537,15 @@ class LazySupervisedDataset(Dataset):
             image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         return image, image_size, "image"
 
+    @staticmethod
+    def _normalize_image_file_path(image_file: str) -> str:
+        normalized = str(image_file).strip()
+        if not normalized:
+            return normalized
+        if "." not in os.path.basename(normalized):
+            normalized = normalized + ".jpg"
+        return normalized
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         # TODO: define number of retries somewhere else
         num_base_retries = 3
@@ -1674,6 +1683,12 @@ class LazySupervisedDataset(Dataset):
             data_dict["prompt"] = prompt
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
+        if "image" in self.list_data_dict[i]:
+            sample_image_ref = self.list_data_dict[i].get("image")
+            if isinstance(sample_image_ref, list):
+                sample_image_ref = sample_image_ref[0] if sample_image_ref else ""
+            if sample_image_ref:
+                data_dict["image_file"] = self._normalize_image_file_path(sample_image_ref)
         roi_entry = None
         if self.roi_candidate_lookup:
             roi_entry = find_roi_candidate_entry(self.list_data_dict[i], self.roi_candidate_lookup)
@@ -1741,6 +1756,10 @@ class DataCollatorForSupervisedDataset(object):
 
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
+        if "id" in instances[0]:
+            batch["sample_ids"] = [str(instance["id"]) for instance in instances]
+        if "image_file" in instances[0]:
+            batch["image_files"] = [str(instance.get("image_file", "")) for instance in instances]
         if "roi_gaze_xy" in instances[0]:
             batch["roi_gaze_xy"] = torch.stack([instance["roi_gaze_xy"] for instance in instances], dim=0)
             batch["roi_gaze_valid"] = torch.stack([instance["roi_gaze_valid"] for instance in instances], dim=0).bool()
@@ -2349,6 +2368,7 @@ def train(attn_implementation=None):
     model.config.add_time_instruction = data_args.add_time_instruction
     model.config.force_sample = data_args.force_sample
     model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
+    model.config.train_image_folder = data_args.image_folder
 
     ### Deciding train which part of the model
     if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train

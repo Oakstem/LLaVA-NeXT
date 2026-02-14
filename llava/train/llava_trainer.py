@@ -9,7 +9,7 @@ import pathlib
 import time
 from collections import OrderedDict
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
@@ -35,7 +35,7 @@ try:
     from apex import amp
 except ImportError:
     amp = None
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 from datetime import timedelta
 
 # Import custom evaluation functions
@@ -330,6 +330,8 @@ class LLaVATrainer(Trainer):
         self.roi_contrastive_preview_samples = max(1, int(getattr(self.args, "roi_contrastive_preview_samples", 5)))
         self.roi_contrastive_preview_topk = max(1, int(getattr(self.args, "roi_contrastive_preview_topk", 5)))
         self.roi_contrastive_preview_rows: List[Dict[str, object]] = []
+        self.roi_contrastive_local_preview_rows: List[Dict[str, object]] = []
+        self._roi_overlay_batch: Optional[Dict[str, Any]] = None
         self._sanity_table = None
         self._sanity_consecutive_failures = 0
         self._sanity_failure_limit = getattr(self.args, "sanity_check_failures_to_stop", 5)
@@ -592,6 +594,11 @@ class LLaVATrainer(Trainer):
         step_start = time.time()
         
         model.train()
+
+        self._cache_roi_overlay_batch(inputs)
+        if isinstance(inputs, dict):
+            inputs.pop("sample_ids", None)
+            inputs.pop("image_files", None)
         
         # Time input preparation (data movement to GPU, etc.)
         input_prep_start = time.time()
@@ -645,6 +652,33 @@ class LLaVATrainer(Trainer):
             self.last_log_step = self.state.global_step
 
         return loss.detach() / self.args.gradient_accumulation_steps
+
+    def _cache_roi_overlay_batch(self, inputs):
+        self._roi_overlay_batch = None
+        if not isinstance(inputs, dict):
+            return
+
+        image_files = inputs.get("image_files")
+        roi_candidate_boxes = inputs.get("roi_candidate_boxes")
+        roi_candidate_is_positive = inputs.get("roi_candidate_is_positive")
+        roi_candidate_valid = inputs.get("roi_candidate_valid")
+        if not isinstance(image_files, list) or not torch.is_tensor(roi_candidate_boxes):
+            return
+        if not torch.is_tensor(roi_candidate_is_positive) or not torch.is_tensor(roi_candidate_valid):
+            return
+
+        sample_ids = inputs.get("sample_ids")
+        roi_gaze_xy = inputs.get("roi_gaze_xy")
+        roi_gaze_valid = inputs.get("roi_gaze_valid")
+        self._roi_overlay_batch = {
+            "image_files": [str(x) if x is not None else "" for x in image_files],
+            "sample_ids": [str(x) for x in sample_ids] if isinstance(sample_ids, list) else [],
+            "roi_candidate_boxes": roi_candidate_boxes.detach().cpu(),
+            "roi_candidate_is_positive": roi_candidate_is_positive.detach().cpu().bool(),
+            "roi_candidate_valid": roi_candidate_valid.detach().cpu().bool(),
+            "roi_gaze_xy": roi_gaze_xy.detach().cpu() if torch.is_tensor(roi_gaze_xy) else None,
+            "roi_gaze_valid": roi_gaze_valid.detach().cpu().bool() if torch.is_tensor(roi_gaze_valid) else None,
+        }
 
     def _collect_sequence_length_metrics(self, model):
         try:
@@ -722,6 +756,8 @@ class LLaVATrainer(Trainer):
         oof_rows = stats.get("oof_rows")
         preview_topk_scores = stats.get("preview_topk_scores")
         preview_option_counts = stats.get("preview_option_counts")
+        preview_row_indices = stats.get("preview_row_indices")
+        preview_pred_candidate_slots = stats.get("preview_pred_candidate_slots")
         gathered_oof_loss = None
         gathered_oof_top1 = None
         gathered_oof_rows = None
@@ -740,6 +776,34 @@ class LLaVATrainer(Trainer):
             self.roi_contrastive_stats["top1"].append(float(gathered_top1.mean().item()))
             self.roi_contrastive_stats["pairs"].append(float(gathered_pairs.float().mean().item()))
             self.roi_contrastive_stats["lambda"].append(float(gathered_lambda.mean().item()))
+            self.roi_contrastive_local_preview_rows = []
+            if (
+                preview_topk_scores is not None
+                and preview_option_counts is not None
+                and preview_row_indices is not None
+                and preview_pred_candidate_slots is not None
+            ):
+                local_limit = min(
+                    int(preview_topk_scores.shape[0]),
+                    int(preview_option_counts.shape[0]),
+                    int(preview_row_indices.shape[0]),
+                    int(preview_pred_candidate_slots.shape[0]),
+                )
+                for local_idx in range(local_limit):
+                    option_count = int(preview_option_counts[local_idx].item())
+                    if option_count <= 0:
+                        continue
+                    row_scores = preview_topk_scores[local_idx]
+                    finite_mask = torch.isfinite(row_scores)
+                    top_scores = row_scores[finite_mask][: self.roi_contrastive_preview_topk].tolist()
+                    self.roi_contrastive_local_preview_rows.append(
+                        {
+                            "option_count": option_count,
+                            "scores": [float(score) for score in top_scores],
+                            "row_idx": int(preview_row_indices[local_idx].item()),
+                            "pred_candidate_slot": int(preview_pred_candidate_slots[local_idx].item()),
+                        }
+                    )
             self.roi_contrastive_preview_rows = []
             if gathered_preview_scores is not None and gathered_preview_counts is not None:
                 total_rows = min(gathered_preview_scores.shape[0], gathered_preview_counts.shape[0])
@@ -895,6 +959,9 @@ class LLaVATrainer(Trainer):
                     metrics[f"roi_contrastive/preview_sample_{sample_idx}_option_count"] = option_count
                     for rank_idx, score in enumerate(scores):
                         metrics[f"roi_contrastive/preview_sample_{sample_idx}_top{rank_idx + 1}"] = score
+            overlay_images = self._build_roi_candidate_overlays()
+            if overlay_images:
+                metrics["roi_contrastive/preview_overlays"] = overlay_images
             
         safe_wandb_log(self.args, metrics, step=self.state.global_step)
         
@@ -903,6 +970,114 @@ class LLaVATrainer(Trainer):
         for key in self.step_times:
             if len(self.step_times[key]) > max_history:
                 self.step_times[key] = self.step_times[key][-max_history:]
+
+    @staticmethod
+    def _draw_norm_box(draw: ImageDraw.ImageDraw, box: torch.Tensor, image_w: int, image_h: int, color, width: int):
+        x1 = int(max(0, min(image_w - 1, round(float(box[0].item()) * image_w))))
+        y1 = int(max(0, min(image_h - 1, round(float(box[1].item()) * image_h))))
+        x2 = int(max(0, min(image_w - 1, round(float(box[2].item()) * image_w))))
+        y2 = int(max(0, min(image_h - 1, round(float(box[3].item()) * image_h))))
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+
+    def _resolve_overlay_image_path(self, image_file: str) -> Optional[pathlib.Path]:
+        if not image_file:
+            return None
+        candidate_paths = []
+        image_path = pathlib.Path(image_file)
+        if image_path.is_absolute():
+            candidate_paths.append(image_path)
+        else:
+            image_root = getattr(getattr(self.model, "config", None), "train_image_folder", None)
+            if image_root:
+                candidate_paths.append(pathlib.Path(str(image_root)) / image_path)
+            candidate_paths.append(image_path)
+
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
+        for candidate in candidate_paths:
+            if candidate.suffix:
+                if candidate.is_file():
+                    return candidate
+                continue
+            for ext in exts:
+                with_ext = candidate.with_suffix(ext)
+                if with_ext.is_file():
+                    return with_ext
+        return None
+
+    def _build_roi_candidate_overlays(self) -> List[wandb.Image]:
+        if not self.is_world_process_zero():
+            return []
+        if not self.roi_contrastive_local_preview_rows or not self._roi_overlay_batch:
+            return []
+        batch = self._roi_overlay_batch
+        image_files = batch.get("image_files", [])
+        boxes = batch.get("roi_candidate_boxes")
+        positives = batch.get("roi_candidate_is_positive")
+        valids = batch.get("roi_candidate_valid")
+        if not isinstance(image_files, list) or not torch.is_tensor(boxes):
+            return []
+        if not torch.is_tensor(positives) or not torch.is_tensor(valids):
+            return []
+
+        sample_ids = batch.get("sample_ids", [])
+        gaze_xy = batch.get("roi_gaze_xy")
+        gaze_valid = batch.get("roi_gaze_valid")
+        max_overlays = min(self.roi_contrastive_preview_samples, len(self.roi_contrastive_local_preview_rows))
+        overlays: List[wandb.Image] = []
+        for preview_idx in range(max_overlays):
+            preview = self.roi_contrastive_local_preview_rows[preview_idx]
+            row_idx = int(preview.get("row_idx", -1))
+            pred_slot = int(preview.get("pred_candidate_slot", -1))
+            if row_idx < 0 or row_idx >= len(image_files) or row_idx >= boxes.shape[0]:
+                continue
+            image_path = self._resolve_overlay_image_path(image_files[row_idx])
+            if image_path is None:
+                continue
+
+            try:
+                image = Image.open(image_path).convert("RGB")
+            except Exception:
+                continue
+            draw = ImageDraw.Draw(image)
+            image_w, image_h = image.size
+
+            row_boxes = boxes[row_idx]
+            row_pos = positives[row_idx]
+            row_valid = valids[row_idx]
+            for cand_idx in range(int(row_boxes.shape[0])):
+                if not bool(row_valid[cand_idx].item()):
+                    continue
+                self._draw_norm_box(draw, row_boxes[cand_idx], image_w, image_h, color=(255, 214, 10), width=2)
+                if bool(row_pos[cand_idx].item()):
+                    self._draw_norm_box(draw, row_boxes[cand_idx], image_w, image_h, color=(0, 255, 80), width=3)
+            if pred_slot >= 0 and pred_slot < int(row_boxes.shape[0]) and bool(row_valid[pred_slot].item()):
+                self._draw_norm_box(draw, row_boxes[pred_slot], image_w, image_h, color=(255, 64, 64), width=4)
+
+            if (
+                torch.is_tensor(gaze_xy)
+                and torch.is_tensor(gaze_valid)
+                and row_idx < gaze_xy.shape[0]
+                and row_idx < gaze_valid.shape[0]
+                and bool(gaze_valid[row_idx].item())
+            ):
+                gx = int(max(0, min(image_w - 1, round(float(gaze_xy[row_idx][0].item()) * image_w))))
+                gy = int(max(0, min(image_h - 1, round(float(gaze_xy[row_idx][1].item()) * image_h))))
+                r = 6
+                draw.ellipse([gx - r, gy - r, gx + r, gy + r], outline=(0, 255, 255), width=3)
+
+            sample_id = sample_ids[row_idx] if row_idx < len(sample_ids) else str(row_idx)
+            top_scores = preview.get("scores", [])
+            top1_score = float(top_scores[0]) if top_scores else float("nan")
+            caption = (
+                f"step={self.state.global_step} sample={sample_id} row={row_idx} "
+                f"pred_slot={pred_slot} top1_score={top1_score:.4f}"
+            )
+            overlays.append(wandb.Image(image, caption=caption))
+        return overlays
     
     def optimizer_step(self, optimizer):
         """Override optimizer step with timing."""
