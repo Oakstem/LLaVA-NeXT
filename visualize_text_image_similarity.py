@@ -146,7 +146,7 @@ def gather_vision_feature_sets(
 def compute_similarity_map(text_vec: torch.Tensor, vision_tokens: torch.Tensor) -> torch.Tensor:
     normalized_text = F.normalize(text_vec, dim=0)
     normalized_tokens = F.normalize(vision_tokens, dim=-1)
-    return torch.matmul(normalized_tokens, normalized_text)
+    return torch.matmul(normalized_tokens, normalized_text).clamp(min=-1.0, max=1.0)
 
 
 def upscale_to_image(similarity: torch.Tensor, image_size: Tuple[int, int]) -> torch.Tensor:
