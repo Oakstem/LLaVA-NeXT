@@ -1004,7 +1004,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
                 candidate_tensor = torch.stack(candidate_embeds, dim=0)
                 text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
-                logits = (candidate_tensor @ text_proj) / temperature
+                cosine_scores = candidate_tensor @ text_proj
+                logits = cosine_scores / temperature
                 pred_candidate_slot = -1
                 if candidate_source_slots:
                     pred_candidate_slot = int(candidate_source_slots[int(torch.argmax(logits).item())])
@@ -1015,10 +1016,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     dtype=torch.float32,
                 )
                 for local_candidate_idx, source_slot_idx in enumerate(candidate_source_slots):
-                    slot_scores[int(source_slot_idx)] = logits[local_candidate_idx].detach().float()
+                    slot_scores[int(source_slot_idx)] = torch.clamp(
+                        cosine_scores[local_candidate_idx], min=-1.0, max=1.0
+                    ).detach().float()
                 row_oof_scores = None
                 if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
-                    row_oof_scores = ((candidate_tensor @ oof_text_projs.t()) / temperature).max(dim=0).values
+                    row_oof_scores = torch.clamp(candidate_tensor @ oof_text_projs.t(), min=-1.0, max=1.0).max(dim=0).values
                 append_preview_row(row_idx, pred_candidate_slot, slot_scores, oof_scores=row_oof_scores)
                 row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
                 row_losses.append(row_loss)
@@ -1045,7 +1048,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 )
                 total_roi_loss = nce_loss
                 oof_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
-                oof_top1 = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+                top1_with_oof = top1_acc
                 oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
                 if oof_enabled and len(candidate_oof_anchors) > 0 and oof_text_projs is not None:
                     text_bank = torch.cat([torch.stack(candidate_text_bank, dim=0), oof_text_projs], dim=0)
@@ -1053,7 +1056,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     targets_oof = torch.tensor(candidate_oof_targets, device=hidden_last.device, dtype=torch.long)
                     oof_logits = (anchor_batch @ text_bank.t()) / temperature
                     oof_loss = F.cross_entropy(oof_logits, targets_oof)
-                    oof_top1 = (oof_logits.argmax(dim=-1) == targets_oof).float().mean()
+                    top1_with_oof = (oof_logits.argmax(dim=-1) == targets_oof).float().mean()
                     oof_rows = torch.tensor(len(candidate_oof_targets), device=hidden_last.device, dtype=torch.long)
                     total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
 
@@ -1065,6 +1068,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 self._roi_contrastive_stats = {
                     "nce_loss": nce_loss.detach(),
                     "top1": top1_acc.detach(),
+                    "top1_with_oof": top1_with_oof.detach(),
                     "pairs": torch.tensor(candidate_count_total, device=stats_device, dtype=torch.long),
                     "lambda": torch.tensor(effective_weight, device=stats_device, dtype=torch.float32),
                     "preview_row_indices": preview_row_index_tensor,
@@ -1074,7 +1078,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 }
                 if oof_enabled:
                     self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
-                    self._roi_contrastive_stats["oof_top1"] = oof_top1.detach().to(device=stats_device, dtype=torch.float32)
                     self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
                 if debug_this_step:
                     roi_debug_log(
@@ -1153,6 +1156,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             self._roi_contrastive_stats = {
                 "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "top1": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "top1_with_oof": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
                 "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "preview_row_indices": preview_row_index_tensor,
@@ -1162,7 +1166,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             }
             if oof_enabled:
                 self._roi_contrastive_stats["oof_loss"] = torch.zeros((), device=stats_device, dtype=torch.float32)
-                self._roi_contrastive_stats["oof_top1"] = torch.zeros((), device=stats_device, dtype=torch.float32)
                 self._roi_contrastive_stats["oof_rows"] = torch.zeros((), device=stats_device, dtype=torch.long)
             return outputs
 
@@ -1190,7 +1193,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         total_roi_loss = nce_loss
         oof_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
-        oof_top1 = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
+        top1_with_oof = top1_acc
         oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
         has_oof_term = False
         if oof_enabled and oof_text_projs is not None:
@@ -1198,7 +1201,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             oof_logits = (vision_proj @ text_bank.t()) / temperature
             oof_targets = torch.arange(pair_count, device=oof_logits.device, dtype=torch.long)
             oof_loss = F.cross_entropy(oof_logits, oof_targets)
-            oof_top1 = (oof_logits.argmax(dim=-1) == oof_targets).float().mean()
+            top1_with_oof = (oof_logits.argmax(dim=-1) == oof_targets).float().mean()
             oof_rows = torch.tensor(pair_count, device=hidden_last.device, dtype=torch.long)
             total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
             has_oof_term = True
@@ -1215,6 +1218,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self._roi_contrastive_stats = {
             "nce_loss": nce_loss.detach(),
             "top1": top1_acc.detach(),
+            "top1_with_oof": top1_with_oof.detach(),
             "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
             "lambda": torch.tensor(lambda_value, device=stats_device, dtype=torch.float32),
             "preview_row_indices": preview_row_index_tensor,
@@ -1224,7 +1228,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         }
         if oof_enabled:
             self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
-            self._roi_contrastive_stats["oof_top1"] = oof_top1.detach().to(device=stats_device, dtype=torch.float32)
             self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
         if debug_this_step:
             roi_debug_log(

@@ -319,10 +319,10 @@ class LLaVATrainer(Trainer):
         self.roi_contrastive_stats = {
             "nce_loss": [],
             "top1": [],
+            "top1_with_oof": [],
             "pairs": [],
             "lambda": [],
             "oof_loss": [],
-            "oof_top1": [],
             "oof_rows": [],
         }
         self.roi_contrastive_stats_window = max(1, int(getattr(self.args, "roi_contrastive_metrics_window", 100)))
@@ -739,34 +739,34 @@ class LLaVATrainer(Trainer):
 
         nce_loss = stats.get("nce_loss")
         top1 = stats.get("top1")
+        top1_with_oof = stats.get("top1_with_oof", top1)
         pair_count = stats.get("pairs")
         lambda_val = stats.get("lambda")
-        if nce_loss is None or top1 is None or pair_count is None or lambda_val is None:
+        if nce_loss is None or top1 is None or top1_with_oof is None or pair_count is None or lambda_val is None:
             return
 
         gathered_nce = self.accelerator.gather(nce_loss.detach().float().reshape(1))
         gathered_top1 = self.accelerator.gather(top1.detach().float().reshape(1))
+        gathered_top1_with_oof = self.accelerator.gather(top1_with_oof.detach().float().reshape(1))
         gathered_pairs = self.accelerator.gather(pair_count.detach().long().reshape(1))
         gathered_lambda = self.accelerator.gather(lambda_val.detach().float().reshape(1))
 
         oof_loss = stats.get("oof_loss")
-        oof_top1 = stats.get("oof_top1")
         oof_rows = stats.get("oof_rows")
         preview_row_indices = stats.get("preview_row_indices")
         preview_pred_candidate_slots = stats.get("preview_pred_candidate_slots")
         preview_candidate_slot_scores = stats.get("preview_candidate_slot_scores")
         preview_oof_scores = stats.get("preview_oof_scores")
         gathered_oof_loss = None
-        gathered_oof_top1 = None
         gathered_oof_rows = None
-        if oof_loss is not None and oof_top1 is not None and oof_rows is not None:
+        if oof_loss is not None and oof_rows is not None:
             gathered_oof_loss = self.accelerator.gather(oof_loss.detach().float().reshape(1))
-            gathered_oof_top1 = self.accelerator.gather(oof_top1.detach().float().reshape(1))
             gathered_oof_rows = self.accelerator.gather(oof_rows.detach().long().reshape(1))
 
         if self.is_world_process_zero():
             self.roi_contrastive_stats["nce_loss"].append(float(gathered_nce.mean().item()))
             self.roi_contrastive_stats["top1"].append(float(gathered_top1.mean().item()))
+            self.roi_contrastive_stats["top1_with_oof"].append(float(gathered_top1_with_oof.mean().item()))
             self.roi_contrastive_stats["pairs"].append(float(gathered_pairs.float().mean().item()))
             self.roi_contrastive_stats["lambda"].append(float(gathered_lambda.mean().item()))
             self.roi_contrastive_local_preview_rows = []
@@ -795,14 +795,13 @@ class LLaVATrainer(Trainer):
                             "oof_scores": oof_scores,
                         }
                     )
-            if gathered_oof_loss is not None and gathered_oof_top1 is not None and gathered_oof_rows is not None:
+            if gathered_oof_loss is not None and gathered_oof_rows is not None:
                 self.roi_contrastive_stats["oof_loss"].append(float(gathered_oof_loss.mean().item()))
-                self.roi_contrastive_stats["oof_top1"].append(float(gathered_oof_top1.mean().item()))
                 self.roi_contrastive_stats["oof_rows"].append(float(gathered_oof_rows.float().mean().item()))
             self._trim_roi_contrastive_stats()
 
     def _trim_roi_contrastive_stats(self):
-        for key in ("nce_loss", "top1", "pairs", "lambda", "oof_loss", "oof_top1", "oof_rows"):
+        for key in ("nce_loss", "top1", "top1_with_oof", "pairs", "lambda", "oof_loss", "oof_rows"):
             if len(self.roi_contrastive_stats[key]) > self.roi_contrastive_stats_cap:
                 self.roi_contrastive_stats[key] = self.roi_contrastive_stats[key][-self.roi_contrastive_stats_cap:]
 
@@ -895,28 +894,28 @@ class LLaVATrainer(Trainer):
             recent_roi = min(self.roi_contrastive_stats_window, len(self.roi_contrastive_stats["nce_loss"]))
             roi_nce = sum(self.roi_contrastive_stats["nce_loss"][-recent_roi:]) / recent_roi
             roi_top1 = sum(self.roi_contrastive_stats["top1"][-recent_roi:]) / recent_roi
+            roi_top1_with_oof = sum(self.roi_contrastive_stats["top1_with_oof"][-recent_roi:]) / recent_roi
             roi_pairs = sum(self.roi_contrastive_stats["pairs"][-recent_roi:]) / recent_roi
             roi_lambda = sum(self.roi_contrastive_stats["lambda"][-recent_roi:]) / recent_roi
             metrics["roi_contrastive/nce_loss"] = roi_nce
             metrics["roi_contrastive/top1"] = roi_top1
+            metrics["roi_contrastive/top1_with_oof"] = roi_top1_with_oof
             metrics["roi_contrastive/pairs"] = roi_pairs
             metrics["roi_contrastive/lambda"] = roi_lambda
             rank0_print(
-                f"ROI contrastive - NCE: {roi_nce:.4f}, Top1: {roi_top1:.3f}, "
+                f"ROI contrastive - NCE: {roi_nce:.4f}, Top1: {roi_top1:.3f}, Top1+OOF: {roi_top1_with_oof:.3f}, "
                 f"Pairs: {roi_pairs:.2f}, Lambda: {roi_lambda:.4f} "
                 f"(window={recent_roi})"
             )
             if self.roi_contrastive_stats["oof_loss"]:
                 recent_oof = min(self.roi_contrastive_stats_window, len(self.roi_contrastive_stats["oof_loss"]))
                 roi_oof_loss = sum(self.roi_contrastive_stats["oof_loss"][-recent_oof:]) / recent_oof
-                roi_oof_top1 = sum(self.roi_contrastive_stats["oof_top1"][-recent_oof:]) / recent_oof
                 roi_oof_rows = sum(self.roi_contrastive_stats["oof_rows"][-recent_oof:]) / recent_oof
                 metrics["roi_contrastive/oof_loss"] = roi_oof_loss
-                metrics["roi_contrastive/oof_top1"] = roi_oof_top1
                 metrics["roi_contrastive/oof_rows"] = roi_oof_rows
                 rank0_print(
                     f"ROI contrastive OOF - Loss: {roi_oof_loss:.4f}, "
-                    f"Top1: {roi_oof_top1:.3f}, Rows: {roi_oof_rows:.2f} "
+                    f"Rows: {roi_oof_rows:.2f} "
                     f"(window={recent_oof})"
                 )
             overlay_images = self._build_roi_candidate_overlays()
