@@ -255,8 +255,14 @@ class TrainingArguments(transformers.TrainingArguments):
         default="looking at someone or something outside the frame",
         metadata={"help": "Fixed OOF negative phrase used in ROI contrastive loss."},
     )
+    roi_contrastive_oof_extra_texts: str = field(
+        default="",
+        metadata={"help": "Additional OOF negative phrases separated by '||' (e.g. 'looking towards the camera||looking at the camera')."},
+    )
     roi_contrastive_oof_weight: float = field(default=0.5, metadata={"help": "Weight of the OOF auxiliary term inside ROI contrastive loss."})
     roi_contrastive_metrics_window: int = field(default=100, metadata={"help": "Rolling window size (in metric updates) for logging ROI contrastive averages."})
+    roi_contrastive_preview_samples: int = field(default=5, metadata={"help": "Number of ROI samples to log detailed top-k scores for each logging interval."})
+    roi_contrastive_preview_topk: int = field(default=5, metadata={"help": "Number of top ROI option scores to log per sampled ROI row."})
     roi_pos_embed_dim: int = field(default=64, metadata={"help": "Hidden dimension for ROI position MLP."})
 
 
@@ -2187,12 +2193,33 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
     roi_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, training_args.roi_contrastive_phrase)
-    roi_oof_token_ids = tokenizer.encode(training_args.roi_contrastive_oof_text, add_special_tokens=False)
+    oof_phrase_texts: List[str] = []
+    if training_args.roi_contrastive_oof_text.strip():
+        oof_phrase_texts.append(training_args.roi_contrastive_oof_text.strip())
+    if training_args.roi_contrastive_oof_extra_texts.strip():
+        for phrase in training_args.roi_contrastive_oof_extra_texts.split("||"):
+            phrase = phrase.strip()
+            if phrase:
+                oof_phrase_texts.append(phrase)
+    dedup_oof_phrases: List[str] = []
+    seen_oof_phrase: set = set()
+    for phrase in oof_phrase_texts:
+        if phrase in seen_oof_phrase:
+            continue
+        seen_oof_phrase.add(phrase)
+        dedup_oof_phrases.append(phrase)
+
+    roi_oof_token_id_sequences: List[List[int]] = []
+    for phrase in dedup_oof_phrases:
+        token_ids = tokenizer.encode(phrase, add_special_tokens=False)
+        if token_ids:
+            roi_oof_token_id_sequences.append(token_ids)
+    roi_oof_token_ids = roi_oof_token_id_sequences[0] if roi_oof_token_id_sequences else []
     roi_oof_enabled = bool(training_args.roi_contrastive_oof_enable)
-    if roi_oof_enabled and not roi_oof_token_ids:
+    if roi_oof_enabled and not roi_oof_token_id_sequences:
         rank0_print(
             "[ROI contrastive warning] --roi_contrastive_oof_enable is set but "
-            f"--roi_contrastive_oof_text produced empty tokenization: {training_args.roi_contrastive_oof_text!r}. "
+            f"OOF phrase tokenization is empty for configured phrases: {dedup_oof_phrases!r}. "
             "Disabling OOF auxiliary loss."
         )
         roi_oof_enabled = False
@@ -2209,8 +2236,12 @@ def train(attn_implementation=None):
     model.config.roi_contrastive_radius_ratio = training_args.roi_contrastive_radius_ratio
     model.config.roi_contrastive_oof_enable = roi_oof_enabled
     model.config.roi_contrastive_oof_text = training_args.roi_contrastive_oof_text
+    model.config.roi_contrastive_oof_texts = dedup_oof_phrases
     model.config.roi_contrastive_oof_weight = training_args.roi_contrastive_oof_weight
     model.config.roi_contrastive_oof_token_ids = roi_oof_token_ids
+    model.config.roi_contrastive_oof_token_id_sequences = roi_oof_token_id_sequences
+    model.config.roi_contrastive_preview_samples = max(1, int(training_args.roi_contrastive_preview_samples))
+    model.config.roi_contrastive_preview_topk = max(1, int(training_args.roi_contrastive_preview_topk))
     model.config.roi_pos_embed_dim = training_args.roi_pos_embed_dim
     rank0_print(
         "ROI contrastive config: "
@@ -2219,9 +2250,12 @@ def train(attn_implementation=None):
         f"temp={training_args.roi_contrastive_temperature}, "
         f"dim={training_args.roi_contrastive_dim}, "
         f"oof_enabled={roi_oof_enabled}, "
+        f"oof_text_count={len(roi_oof_token_id_sequences)}, "
         f"oof_weight={training_args.roi_contrastive_oof_weight}, "
         f"oof_tokens={len(roi_oof_token_ids)}, "
         f"metrics_window={training_args.roi_contrastive_metrics_window}, "
+        f"preview_samples={model.config.roi_contrastive_preview_samples}, "
+        f"preview_topk={model.config.roi_contrastive_preview_topk}, "
         f"pos_dim={training_args.roi_pos_embed_dim}, "
         f"warmup_steps={warmup_steps}, "
         f"phrase_candidates={len(roi_phrase_token_ids)}"

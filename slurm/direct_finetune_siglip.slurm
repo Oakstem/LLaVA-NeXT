@@ -129,16 +129,19 @@ WEIGHT_DECAY="0.01"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
 ROI_CONTRASTIVE_ENABLE="True"
-ROI_CONTRASTIVE_WEIGHT="0.1"
-ROI_CONTRASTIVE_TEMPERATURE="0.07"
+ROI_CONTRASTIVE_WEIGHT="0.2"
+ROI_CONTRASTIVE_TEMPERATURE="0.1"
 ROI_CONTRASTIVE_DIM="512"
 ROI_CONTRASTIVE_PHRASE="looking at"
 ROI_CONTRASTIVE_WARMUP_RATIO="0.1"
 ROI_CONTRASTIVE_RADIUS_RATIO="0.08"
 ROI_POS_EMBED_DIM="64"
-ROI_CONTRASTIVE_OOF_ENABLE="False"
+ROI_CONTRASTIVE_OOF_ENABLE="True"
 ROI_CONTRASTIVE_OOF_TEXT="looking at someone or something outside the frame"
+ROI_CONTRASTIVE_OOF_EXTRA_TEXTS="looking towards the camera||looking at the camera"
 ROI_CONTRASTIVE_OOF_WEIGHT="0.5"
+ROI_CONTRASTIVE_PREVIEW_SAMPLES="5"
+ROI_CONTRASTIVE_PREVIEW_TOPK="5"
 
 # Evaluation and saving
 EVALUATION_STRATEGY="no"
@@ -224,7 +227,10 @@ echo "ROI Contrastive Radius Ratio: ${ROI_CONTRASTIVE_RADIUS_RATIO}"
 echo "ROI Position Embed Dim: ${ROI_POS_EMBED_DIM}"
 echo "ROI Contrastive OOF Enable: ${ROI_CONTRASTIVE_OOF_ENABLE}"
 echo "ROI Contrastive OOF Text: ${ROI_CONTRASTIVE_OOF_TEXT}"
+echo "ROI Contrastive OOF Extra Texts: ${ROI_CONTRASTIVE_OOF_EXTRA_TEXTS}"
 echo "ROI Contrastive OOF Weight: ${ROI_CONTRASTIVE_OOF_WEIGHT}"
+echo "ROI Contrastive Preview Samples: ${ROI_CONTRASTIVE_PREVIEW_SAMPLES}"
+echo "ROI Contrastive Preview TopK: ${ROI_CONTRASTIVE_PREVIEW_TOPK}"
 echo ""
 echo "=== EVALUATION & SAVING ==="
 echo "Evaluation Strategy: ${EVALUATION_STRATEGY}"
@@ -303,7 +309,10 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --roi_pos_embed_dim ${ROI_POS_EMBED_DIM} \
     --roi_contrastive_oof_enable ${ROI_CONTRASTIVE_OOF_ENABLE} \
     --roi_contrastive_oof_text "${ROI_CONTRASTIVE_OOF_TEXT}" \
+    --roi_contrastive_oof_extra_texts "${ROI_CONTRASTIVE_OOF_EXTRA_TEXTS}" \
     --roi_contrastive_oof_weight ${ROI_CONTRASTIVE_OOF_WEIGHT} \
+    --roi_contrastive_preview_samples ${ROI_CONTRASTIVE_PREVIEW_SAMPLES} \
+    --roi_contrastive_preview_topk ${ROI_CONTRASTIVE_PREVIEW_TOPK} \
     --logging_steps ${LOGGING_STEPS} \
     --tf32 ${TF32} \
     --model_max_length ${MODEL_MAX_LENGTH} \

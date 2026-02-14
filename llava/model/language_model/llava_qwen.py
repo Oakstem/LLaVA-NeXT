@@ -709,39 +709,51 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     valid_indices.append(y_coord * grid_side + x_coord)
         return valid_indices
 
-    def _compute_oof_text_proj(self, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+    def _compute_oof_text_projs(self, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
         if not bool(getattr(self.config, "roi_contrastive_oof_enable", False)):
             return None
-        token_ids = getattr(self.config, "roi_contrastive_oof_token_ids", None)
-        if not isinstance(token_ids, (list, tuple)) or len(token_ids) == 0:
+        token_id_sequences = getattr(self.config, "roi_contrastive_oof_token_id_sequences", None)
+        if not token_id_sequences:
+            fallback_ids = getattr(self.config, "roi_contrastive_oof_token_ids", None)
+            if isinstance(fallback_ids, (list, tuple)) and len(fallback_ids) > 0:
+                token_id_sequences = [fallback_ids]
+        if not isinstance(token_id_sequences, (list, tuple)) or len(token_id_sequences) == 0:
             return None
 
-        normalized_ids: List[int] = []
-        for token_id in token_ids:
-            try:
-                normalized_ids.append(int(token_id))
-            except (TypeError, ValueError):
+        oof_proj_list: List[torch.Tensor] = []
+        for token_ids in token_id_sequences:
+            if not isinstance(token_ids, (list, tuple)) or len(token_ids) == 0:
                 continue
-        if not normalized_ids:
-            return None
+            normalized_ids: List[int] = []
+            for token_id in token_ids:
+                try:
+                    normalized_ids.append(int(token_id))
+                except (TypeError, ValueError):
+                    continue
+            if not normalized_ids:
+                continue
 
-        input_ids = torch.tensor([normalized_ids], device=device, dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        oof_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        if oof_outputs.hidden_states is None or len(oof_outputs.hidden_states) == 0:
+            input_ids = torch.tensor([normalized_ids], device=device, dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            oof_outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            if oof_outputs.hidden_states is None or len(oof_outputs.hidden_states) == 0:
+                continue
+            oof_hidden = oof_outputs.hidden_states[-1]
+            if oof_hidden.ndim != 3 or oof_hidden.shape[1] == 0:
+                continue
+            oof_text_embed = oof_hidden[0].mean(dim=0)
+            oof_proj = F.normalize(self.roi_text_projector(oof_text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
+            oof_proj_list.append(oof_proj.to(device=device))
+
+        if not oof_proj_list:
             return None
-        oof_hidden = oof_outputs.hidden_states[-1]
-        if oof_hidden.ndim != 3 or oof_hidden.shape[1] == 0:
-            return None
-        oof_text_embed = oof_hidden[0].mean(dim=0)
-        oof_text_proj = F.normalize(self.roi_text_projector(oof_text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
-        return oof_text_proj.to(device=device)
+        return torch.stack(oof_proj_list, dim=0)
 
     def _apply_roi_contrastive_loss(
         self,
@@ -795,9 +807,35 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         debug_this_step = debug_steps > 0 and self._roi_contrastive_step <= debug_steps
         oof_enabled = bool(getattr(self.config, "roi_contrastive_oof_enable", False))
         oof_weight = max(0.0, float(getattr(self.config, "roi_contrastive_oof_weight", 0.5)))
-        oof_text_proj = self._compute_oof_text_proj(device=hidden_last.device, dtype=hidden_last.dtype) if oof_enabled else None
-        if oof_enabled and oof_text_proj is None:
+        preview_samples = max(1, int(getattr(self.config, "roi_contrastive_preview_samples", 5)))
+        preview_topk = max(1, int(getattr(self.config, "roi_contrastive_preview_topk", 5)))
+        oof_text_projs = self._compute_oof_text_projs(device=hidden_last.device, dtype=hidden_last.dtype) if oof_enabled else None
+        if oof_enabled and oof_text_projs is None:
             oof_enabled = False
+
+        preview_rows: List[torch.Tensor] = []
+        preview_option_counts: List[int] = []
+
+        def append_preview_scores(option_scores: torch.Tensor):
+            if len(preview_rows) >= preview_samples:
+                return
+            if option_scores.ndim != 1 or option_scores.numel() == 0:
+                return
+            topk_count = min(preview_topk, int(option_scores.numel()))
+            top_scores = torch.topk(option_scores, k=topk_count, largest=True).values.detach().float()
+            padded = torch.full((preview_topk,), float("nan"), device=top_scores.device, dtype=torch.float32)
+            padded[:topk_count] = top_scores
+            preview_rows.append(padded)
+            preview_option_counts.append(int(option_scores.numel()))
+
+        def build_preview_tensors(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+            preview_tensor = torch.full((preview_samples, preview_topk), float("nan"), device=device, dtype=torch.float32)
+            option_count_tensor = torch.zeros((preview_samples,), device=device, dtype=torch.long)
+            limit = min(preview_samples, len(preview_rows))
+            for idx in range(limit):
+                preview_tensor[idx] = preview_rows[idx].to(device=device, dtype=torch.float32)
+                option_count_tensor[idx] = int(preview_option_counts[idx])
+            return preview_tensor, option_count_tensor
 
         candidate_inputs_ready = (
             roi_candidate_boxes is not None
@@ -922,6 +960,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 candidate_tensor = torch.stack(candidate_embeds, dim=0)
                 text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
                 logits = (candidate_tensor @ text_proj) / temperature
+                preview_option_scores = logits
+                if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
+                    # OOF / extra-OOF phrases are logged as extra options using their best candidate alignment.
+                    oof_option_scores = ((candidate_tensor @ oof_text_projs.t()) / temperature).max(dim=0).values
+                    preview_option_scores = torch.cat([preview_option_scores, oof_option_scores], dim=0)
+                append_preview_scores(preview_option_scores)
                 row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
                 row_losses.append(row_loss)
                 row_top1.append(positive_mask[torch.argmax(logits)].float())
@@ -949,8 +993,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 oof_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
                 oof_top1 = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
                 oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
-                if oof_enabled and len(candidate_oof_anchors) > 0 and oof_text_proj is not None:
-                    text_bank = torch.cat([torch.stack(candidate_text_bank, dim=0), oof_text_proj.unsqueeze(0)], dim=0)
+                if oof_enabled and len(candidate_oof_anchors) > 0 and oof_text_projs is not None:
+                    text_bank = torch.cat([torch.stack(candidate_text_bank, dim=0), oof_text_projs], dim=0)
                     anchor_batch = torch.stack(candidate_oof_anchors, dim=0)
                     targets_oof = torch.tensor(candidate_oof_targets, device=hidden_last.device, dtype=torch.long)
                     oof_logits = (anchor_batch @ text_bank.t()) / temperature
@@ -963,11 +1007,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     device=outputs.loss.device,
                     dtype=outputs.loss.dtype,
                 )
+                preview_tensor, option_count_tensor = build_preview_tensors(stats_device)
                 self._roi_contrastive_stats = {
                     "nce_loss": nce_loss.detach(),
                     "top1": top1_acc.detach(),
                     "pairs": torch.tensor(candidate_count_total, device=stats_device, dtype=torch.long),
                     "lambda": torch.tensor(effective_weight, device=stats_device, dtype=torch.float32),
+                    "preview_topk_scores": preview_tensor,
+                    "preview_option_counts": option_count_tensor,
                 }
                 if oof_enabled:
                     self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
@@ -1046,11 +1093,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         pair_count = len(text_embeddings)
         stats_device = outputs.loss.device
         if pair_count < 1:
+            preview_tensor, option_count_tensor = build_preview_tensors(stats_device)
             self._roi_contrastive_stats = {
                 "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "top1": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
                 "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "preview_topk_scores": preview_tensor,
+                "preview_option_counts": option_count_tensor,
             }
             if oof_enabled:
                 self._roi_contrastive_stats["oof_loss"] = torch.zeros((), device=stats_device, dtype=torch.float32)
@@ -1070,10 +1120,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         vision_batch = torch.stack(vision_embeddings, dim=0)
         text_proj = F.normalize(self.roi_text_projector(text_batch.float()), dim=-1)
         vision_proj = F.normalize(self.roi_vision_projector(vision_batch.float()), dim=-1)
+        similarity = (vision_proj @ text_proj.t()) / temperature
         nce_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
         top1_acc = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
         if pair_count >= 2:
-            similarity = (vision_proj @ text_proj.t()) / temperature
             targets = torch.arange(pair_count, device=similarity.device, dtype=torch.long)
             loss_v2t = F.cross_entropy(similarity, targets)
             loss_t2v = F.cross_entropy(similarity.t(), targets)
@@ -1085,8 +1135,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         oof_top1 = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
         oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
         has_oof_term = False
-        if oof_enabled and oof_text_proj is not None:
-            text_bank = torch.cat([text_proj, oof_text_proj.unsqueeze(0)], dim=0)
+        preview_logits = similarity
+        if oof_enabled and oof_text_projs is not None:
+            text_bank = torch.cat([text_proj, oof_text_projs], dim=0)
             oof_logits = (vision_proj @ text_bank.t()) / temperature
             oof_targets = torch.arange(pair_count, device=oof_logits.device, dtype=torch.long)
             oof_loss = F.cross_entropy(oof_logits, oof_targets)
@@ -1094,6 +1145,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             oof_rows = torch.tensor(pair_count, device=hidden_last.device, dtype=torch.long)
             total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
             has_oof_term = True
+            preview_logits = oof_logits
+
+        for row_idx in range(min(preview_samples, int(preview_logits.shape[0]))):
+            append_preview_scores(preview_logits[row_idx])
 
         has_base_term = pair_count >= 2
         lambda_value = effective_weight if (has_base_term or has_oof_term) else 0.0
@@ -1103,11 +1158,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dtype=outputs.loss.dtype,
             )
 
+        preview_tensor, option_count_tensor = build_preview_tensors(stats_device)
         self._roi_contrastive_stats = {
             "nce_loss": nce_loss.detach(),
             "top1": top1_acc.detach(),
             "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
             "lambda": torch.tensor(lambda_value, device=stats_device, dtype=torch.float32),
+            "preview_topk_scores": preview_tensor,
+            "preview_option_counts": option_count_tensor,
         }
         if oof_enabled:
             self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)

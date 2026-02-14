@@ -327,6 +327,9 @@ class LLaVATrainer(Trainer):
         }
         self.roi_contrastive_stats_window = max(1, int(getattr(self.args, "roi_contrastive_metrics_window", 100)))
         self.roi_contrastive_stats_cap = max(2048, self.roi_contrastive_stats_window * 4)
+        self.roi_contrastive_preview_samples = max(1, int(getattr(self.args, "roi_contrastive_preview_samples", 5)))
+        self.roi_contrastive_preview_topk = max(1, int(getattr(self.args, "roi_contrastive_preview_topk", 5)))
+        self.roi_contrastive_preview_rows: List[Dict[str, object]] = []
         self._sanity_table = None
         self._sanity_consecutive_failures = 0
         self._sanity_failure_limit = getattr(self.args, "sanity_check_failures_to_stop", 5)
@@ -717,19 +720,41 @@ class LLaVATrainer(Trainer):
         oof_loss = stats.get("oof_loss")
         oof_top1 = stats.get("oof_top1")
         oof_rows = stats.get("oof_rows")
+        preview_topk_scores = stats.get("preview_topk_scores")
+        preview_option_counts = stats.get("preview_option_counts")
         gathered_oof_loss = None
         gathered_oof_top1 = None
         gathered_oof_rows = None
+        gathered_preview_scores = None
+        gathered_preview_counts = None
         if oof_loss is not None and oof_top1 is not None and oof_rows is not None:
             gathered_oof_loss = self.accelerator.gather(oof_loss.detach().float().reshape(1))
             gathered_oof_top1 = self.accelerator.gather(oof_top1.detach().float().reshape(1))
             gathered_oof_rows = self.accelerator.gather(oof_rows.detach().long().reshape(1))
+        if preview_topk_scores is not None and preview_option_counts is not None:
+            gathered_preview_scores = self.accelerator.gather(preview_topk_scores.detach().float())
+            gathered_preview_counts = self.accelerator.gather(preview_option_counts.detach().long())
 
         if self.is_world_process_zero():
             self.roi_contrastive_stats["nce_loss"].append(float(gathered_nce.mean().item()))
             self.roi_contrastive_stats["top1"].append(float(gathered_top1.mean().item()))
             self.roi_contrastive_stats["pairs"].append(float(gathered_pairs.float().mean().item()))
             self.roi_contrastive_stats["lambda"].append(float(gathered_lambda.mean().item()))
+            self.roi_contrastive_preview_rows = []
+            if gathered_preview_scores is not None and gathered_preview_counts is not None:
+                total_rows = min(gathered_preview_scores.shape[0], gathered_preview_counts.shape[0])
+                for row_idx in range(total_rows):
+                    option_count = int(gathered_preview_counts[row_idx].item())
+                    if option_count <= 0:
+                        continue
+                    row_scores = gathered_preview_scores[row_idx]
+                    finite_mask = torch.isfinite(row_scores)
+                    top_scores = row_scores[finite_mask][: self.roi_contrastive_preview_topk].tolist()
+                    self.roi_contrastive_preview_rows.append(
+                        {"option_count": option_count, "scores": [float(score) for score in top_scores]}
+                    )
+                    if len(self.roi_contrastive_preview_rows) >= self.roi_contrastive_preview_samples:
+                        break
             if gathered_oof_loss is not None and gathered_oof_top1 is not None and gathered_oof_rows is not None:
                 self.roi_contrastive_stats["oof_loss"].append(float(gathered_oof_loss.mean().item()))
                 self.roi_contrastive_stats["oof_top1"].append(float(gathered_oof_top1.mean().item()))
@@ -854,6 +879,22 @@ class LLaVATrainer(Trainer):
                     f"Top1: {roi_oof_top1:.3f}, Rows: {roi_oof_rows:.2f} "
                     f"(window={recent_oof})"
                 )
+            if self.roi_contrastive_preview_rows:
+                rank0_print(
+                    f"ROI contrastive top-{self.roi_contrastive_preview_topk} preview "
+                    f"(samples={len(self.roi_contrastive_preview_rows)})"
+                )
+                for sample_idx, sample in enumerate(self.roi_contrastive_preview_rows):
+                    option_count = int(sample["option_count"])
+                    scores = list(sample["scores"])
+                    score_text = ", ".join(f"{score:.4f}" for score in scores)
+                    rank0_print(
+                        f"  sample_{sample_idx}: options={option_count}, "
+                        f"top{len(scores)}=[{score_text}]"
+                    )
+                    metrics[f"roi_contrastive/preview_sample_{sample_idx}_option_count"] = option_count
+                    for rank_idx, score in enumerate(scores):
+                        metrics[f"roi_contrastive/preview_sample_{sample_idx}_top{rank_idx + 1}"] = score
             
         safe_wandb_log(self.args, metrics, step=self.state.global_step)
         
