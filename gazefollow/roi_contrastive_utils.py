@@ -22,6 +22,102 @@ def roi_debug_log(step: int, debug_steps: int, message: str) -> None:
         print(f"[ROI debug step={step}] {message}")
 
 
+class ROIContrastivePreviewBuffer:
+    """Collect and materialize fixed-size ROI contrastive preview tensors."""
+
+    def __init__(self, preview_samples: int):
+        self.preview_samples = max(1, int(preview_samples))
+        self.row_indices: List[int] = []
+        self.pred_candidate_slots: List[int] = []
+        self.candidate_slot_scores: List[torch.Tensor] = []
+        self.oof_scores: List[torch.Tensor] = []
+
+    def append(
+        self,
+        row_index: int,
+        pred_candidate_slot: int,
+        candidate_slot_scores: torch.Tensor,
+        oof_scores: Optional[torch.Tensor] = None,
+    ) -> None:
+        if len(self.row_indices) >= self.preview_samples:
+            return
+        self.row_indices.append(int(row_index))
+        self.pred_candidate_slots.append(int(pred_candidate_slot))
+        if candidate_slot_scores.ndim == 1:
+            self.candidate_slot_scores.append(candidate_slot_scores.detach().float())
+        else:
+            self.candidate_slot_scores.append(torch.empty((0,), dtype=torch.float32))
+        if oof_scores is not None and oof_scores.ndim == 1:
+            self.oof_scores.append(oof_scores.detach().float())
+        else:
+            self.oof_scores.append(torch.empty((0,), dtype=torch.float32))
+
+    def to_tensors(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        row_index_tensor = torch.full((self.preview_samples,), -1, device=device, dtype=torch.long)
+        pred_candidate_slot_tensor = torch.full((self.preview_samples,), -1, device=device, dtype=torch.long)
+
+        max_candidate_slots = 0
+        for slot_scores in self.candidate_slot_scores:
+            max_candidate_slots = max(max_candidate_slots, int(slot_scores.numel()))
+        max_oof_scores = 0
+        for row_oof_scores in self.oof_scores:
+            max_oof_scores = max(max_oof_scores, int(row_oof_scores.numel()))
+
+        candidate_slot_score_tensor = torch.full(
+            (self.preview_samples, max_candidate_slots),
+            float("nan"),
+            device=device,
+            dtype=torch.float32,
+        )
+        oof_score_tensor = torch.full(
+            (self.preview_samples, max_oof_scores),
+            float("nan"),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        limit = min(self.preview_samples, len(self.row_indices))
+        for idx in range(limit):
+            row_index_tensor[idx] = int(self.row_indices[idx])
+            pred_candidate_slot_tensor[idx] = int(self.pred_candidate_slots[idx])
+            if idx < len(self.candidate_slot_scores):
+                slot_scores = self.candidate_slot_scores[idx]
+                if slot_scores.numel() > 0:
+                    candidate_slot_score_tensor[idx, : int(slot_scores.numel())] = slot_scores.to(
+                        device=device, dtype=torch.float32
+                    )
+            if idx < len(self.oof_scores):
+                row_oof_scores = self.oof_scores[idx]
+                if row_oof_scores.numel() > 0:
+                    oof_score_tensor[idx, : int(row_oof_scores.numel())] = row_oof_scores.to(
+                        device=device, dtype=torch.float32
+                    )
+        return (
+            row_index_tensor,
+            pred_candidate_slot_tensor,
+            candidate_slot_score_tensor,
+            oof_score_tensor,
+        )
+
+
+def build_circular_roi_patch_indices(x_norm: float, y_norm: float, grid_side: int, radius: int) -> List[int]:
+    center_x = int(round(x_norm * (grid_side - 1)))
+    center_y = int(round(y_norm * (grid_side - 1)))
+    valid_indices: List[int] = []
+    r2 = radius * radius
+    min_x = max(0, center_x - radius)
+    max_x = min(grid_side - 1, center_x + radius)
+    min_y = max(0, center_y - radius)
+    max_y = min(grid_side - 1, center_y + radius)
+    for y_coord in range(min_y, max_y + 1):
+        dy = y_coord - center_y
+        for x_coord in range(min_x, max_x + 1):
+            dx = x_coord - center_x
+            if dx * dx + dy * dy <= r2:
+                valid_indices.append(y_coord * grid_side + x_coord)
+    return valid_indices
+
+
 def build_focus_phrase_token_ids(tokenizer, phrase: str) -> List[List[int]]:
     if not phrase:
         return []

@@ -37,7 +37,9 @@ from llava.constants import IMAGE_TOKEN_INDEX
 from llava.model.language_model.attention_mask_visualizer import visualize_attention_mask_step
 from gazefollow.focus_loss_utils import locate_focus_start_index, prepare_focus_phrase_sequences
 from gazefollow.roi_contrastive_utils import (
+    ROIContrastivePreviewBuffer,
     build_bbox_patch_indices,
+    build_circular_roi_patch_indices,
     build_roi_position_vector,
     roi_debug_log,
 )
@@ -691,24 +693,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             self.roi_vision_projector = self.roi_vision_projector.to(device=device, dtype=dtype)
             self.roi_position_mlp = self.roi_position_mlp.to(device=device, dtype=dtype)
 
-    @staticmethod
-    def _build_roi_patch_indices(x_norm: float, y_norm: float, grid_side: int, radius: int) -> List[int]:
-        center_x = int(round(x_norm * (grid_side - 1)))
-        center_y = int(round(y_norm * (grid_side - 1)))
-        valid_indices: List[int] = []
-        r2 = radius * radius
-        min_x = max(0, center_x - radius)
-        max_x = min(grid_side - 1, center_x + radius)
-        min_y = max(0, center_y - radius)
-        max_y = min(grid_side - 1, center_y + radius)
-        for y_coord in range(min_y, max_y + 1):
-            dy = y_coord - center_y
-            for x_coord in range(min_x, max_x + 1):
-                dx = x_coord - center_x
-                if dx * dx + dy * dy <= r2:
-                    valid_indices.append(y_coord * grid_side + x_coord)
-        return valid_indices
-
     def _compute_oof_text_projs(self, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
         if not bool(getattr(self.config, "roi_contrastive_oof_enable", False)):
             return None
@@ -766,6 +750,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         roi_candidate_is_positive: Optional[torch.Tensor] = None,
         roi_candidate_valid: Optional[torch.Tensor] = None,
     ) -> CausalLMOutputWithPast:
+        """
+        Add ROI contrastive supervision on top of the language-model loss.
+
+        Execution flow:
+        1. Validate inputs and initialize ROI projection/scheduling state.
+        2. Prefer candidate-box supervision when ROI candidate metadata exists.
+           Optionally, true-OOF rows can use OOF text anchors as positives.
+        3. Fall back to gaze-centered circular ROI supervision otherwise.
+        4. Store debug/preview tensors in `self._roi_contrastive_stats`.
+        """
         if not isinstance(outputs, CausalLMOutputWithPast):
             return outputs
         if outputs.loss is None or outputs.hidden_states is None or labels is None:
@@ -790,6 +784,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if batch_limit <= 0:
             return outputs
 
+        # Step 1: collect runtime knobs and ensure projection heads match configured ROI dim.
         vision_tower = self.get_vision_tower()
         default_grid_side = 0
         if vision_tower is not None:
@@ -807,78 +802,27 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         debug_this_step = debug_steps > 0 and self._roi_contrastive_step <= debug_steps
         oof_enabled = bool(getattr(self.config, "roi_contrastive_oof_enable", False))
         oof_weight = max(0.0, float(getattr(self.config, "roi_contrastive_oof_weight", 0.5)))
+        use_true_oof_frames = bool(getattr(self.config, "roi_contrastive_use_true_oof_frames", False))
         preview_samples = max(1, int(getattr(self.config, "roi_contrastive_preview_samples", 5)))
         oof_text_projs = self._compute_oof_text_projs(device=hidden_last.device, dtype=hidden_last.dtype) if oof_enabled else None
         if oof_enabled and oof_text_projs is None:
             oof_enabled = False
 
-        preview_row_indices: List[int] = []
-        preview_pred_candidate_slots: List[int] = []
-        preview_candidate_slot_scores: List[torch.Tensor] = []
-        preview_oof_scores: List[torch.Tensor] = []
+        preview_buffer = ROIContrastivePreviewBuffer(preview_samples)
 
-        def append_preview_row(
-            row_index: int,
-            pred_candidate_slot: int,
-            candidate_slot_scores: torch.Tensor,
-            oof_scores: Optional[torch.Tensor] = None,
-        ):
-            if len(preview_row_indices) >= preview_samples:
-                return
-            preview_row_indices.append(int(row_index))
-            preview_pred_candidate_slots.append(int(pred_candidate_slot))
-            if candidate_slot_scores.ndim == 1:
-                preview_candidate_slot_scores.append(candidate_slot_scores.detach().float())
-            else:
-                preview_candidate_slot_scores.append(torch.empty((0,), device=hidden_last.device, dtype=torch.float32))
-            if oof_scores is not None and oof_scores.ndim == 1:
-                preview_oof_scores.append(oof_scores.detach().float())
-            else:
-                preview_oof_scores.append(torch.empty((0,), device=hidden_last.device, dtype=torch.float32))
+        def _build_focus_span_mask(row_idx: int, focus_start: int) -> torch.Tensor:
+            span_mask = labels[row_idx] >= 0
+            if focus_start > 0:
+                token_positions = torch.arange(labels[row_idx].shape[0], device=labels.device)
+                span_mask = span_mask & (token_positions >= focus_start)
+            return span_mask
 
-        def build_preview_tensors(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            row_index_tensor = torch.full((preview_samples,), -1, device=device, dtype=torch.long)
-            pred_candidate_slot_tensor = torch.full((preview_samples,), -1, device=device, dtype=torch.long)
-            max_candidate_slots = 0
-            for slot_scores in preview_candidate_slot_scores:
-                max_candidate_slots = max(max_candidate_slots, int(slot_scores.numel()))
-            max_oof_scores = 0
-            for row_oof_scores in preview_oof_scores:
-                max_oof_scores = max(max_oof_scores, int(row_oof_scores.numel()))
-            candidate_slot_score_tensor = torch.full(
-                (preview_samples, max_candidate_slots),
-                float("nan"),
-                device=device,
-                dtype=torch.float32,
-            )
-            oof_score_tensor = torch.full(
-                (preview_samples, max_oof_scores),
-                float("nan"),
-                device=device,
-                dtype=torch.float32,
-            )
-            limit = min(preview_samples, len(preview_row_indices))
-            for idx in range(limit):
-                row_index_tensor[idx] = int(preview_row_indices[idx])
-                pred_candidate_slot_tensor[idx] = int(preview_pred_candidate_slots[idx])
-                if idx < len(preview_candidate_slot_scores):
-                    slot_scores = preview_candidate_slot_scores[idx]
-                    if slot_scores.numel() > 0:
-                        candidate_slot_score_tensor[idx, : int(slot_scores.numel())] = slot_scores.to(
-                            device=device, dtype=torch.float32
-                        )
-                if idx < len(preview_oof_scores):
-                    row_oof_scores = preview_oof_scores[idx]
-                    if row_oof_scores.numel() > 0:
-                        oof_score_tensor[idx, : int(row_oof_scores.numel())] = row_oof_scores.to(
-                            device=device, dtype=torch.float32
-                        )
-            return (
-                row_index_tensor,
-                pred_candidate_slot_tensor,
-                candidate_slot_score_tensor,
-                oof_score_tensor,
-            )
+        def _resolve_grid_side(sample_image_features: torch.Tensor) -> Tuple[int, int]:
+            grid_side = default_grid_side
+            if grid_side <= 0 or grid_side * grid_side > sample_image_features.shape[0]:
+                grid_side = int(math.sqrt(sample_image_features.shape[0]))
+            base_token_count = grid_side * grid_side
+            return grid_side, base_token_count
 
         candidate_inputs_ready = (
             roi_candidate_boxes is not None
@@ -891,10 +835,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if debug_this_step:
             valid_gaze_count = -1
             if roi_gaze_valid is not None:
-                try:
-                    valid_gaze_count = int(roi_gaze_valid[:batch_limit].bool().sum().item())
-                except Exception:
-                    valid_gaze_count = -1
+                valid_gaze_count = int(roi_gaze_valid[:batch_limit].bool().sum().item())
             roi_debug_log(
                 step=self._roi_contrastive_step,
                 debug_steps=debug_steps,
@@ -902,9 +843,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     f"batch_limit={batch_limit}, candidate_inputs_ready={candidate_inputs_ready}, "
                     f"roi_gaze_valid_count={valid_gaze_count}, "
                     f"warmup_steps={warmup_steps}, warmup_factor={warmup_factor:.4f}, "
-                    f"base_weight={base_weight:.4f}, effective_weight={effective_weight:.6f}"
+                    f"base_weight={base_weight:.4f}, effective_weight={effective_weight:.6f}, "
+                    f"use_true_oof_frames={use_true_oof_frames}"
                 ),
             )
+        # Step 2: candidate-box path (preferred when explicit positive/negative ROIs exist).
         if candidate_inputs_ready:
             batch_limit_candidate = min(
                 hidden_last.shape[0],
@@ -922,22 +865,20 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             candidate_text_bank: List[torch.Tensor] = []
             candidate_oof_anchors: List[torch.Tensor] = []
             candidate_oof_targets: List[int] = []
-            candidate_row_text_index: Dict[int, int] = {}
             rows_focus_found = 0
             rows_span_valid = 0
             rows_image_valid = 0
             rows_with_candidates = 0
             rows_with_pos = 0
             rows_with_pos_and_neg = 0
+            rows_true_oof_supervised = 0
 
             for row_idx in range(batch_limit_candidate):
                 focus_start = locate_focus_start_index(labels[row_idx], phrase_sequences)
                 if focus_start is None:
                     continue
                 rows_focus_found += 1
-                span_mask = labels[row_idx] >= 0
-                if focus_start > 0:
-                    span_mask = span_mask & (torch.arange(labels[row_idx].shape[0], device=labels.device) >= focus_start)
+                span_mask = _build_focus_span_mask(row_idx, focus_start)
                 if not span_mask.any():
                     continue
                 rows_span_valid += 1
@@ -947,10 +888,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 if not torch.is_tensor(sample_image_features) or sample_image_features.ndim != 2:
                     continue
                 rows_image_valid += 1
-                grid_side = default_grid_side
-                if grid_side <= 0 or grid_side * grid_side > sample_image_features.shape[0]:
-                    grid_side = int(math.sqrt(sample_image_features.shape[0]))
-                base_token_count = grid_side * grid_side
+                grid_side, base_token_count = _resolve_grid_side(sample_image_features)
                 if base_token_count <= 0:
                     continue
 
@@ -990,7 +928,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
                 if len(candidate_embeds) > 0:
                     rows_with_candidates += 1
-                if len(candidate_embeds) < 2:
+                if len(candidate_embeds) < 1:
                     continue
                 positive_mask = torch.tensor(candidate_positive_flags, device=hidden_last.device, dtype=torch.bool)
                 has_pos = bool(positive_mask.any().item())
@@ -999,40 +937,75 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     rows_with_pos += 1
                 if has_pos and has_neg:
                     rows_with_pos_and_neg += 1
-                if not has_pos or not has_neg:
-                    continue
 
                 candidate_tensor = torch.stack(candidate_embeds, dim=0)
                 text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
                 cosine_scores = candidate_tensor @ text_proj
-                logits = cosine_scores / temperature
-                pred_candidate_slot = -1
-                if candidate_source_slots:
-                    pred_candidate_slot = int(candidate_source_slots[int(torch.argmax(logits).item())])
                 slot_scores = torch.full(
                     (row_boxes.shape[0],),
                     float("nan"),
-                    device=logits.device,
+                    device=cosine_scores.device,
                     dtype=torch.float32,
                 )
                 for local_candidate_idx, source_slot_idx in enumerate(candidate_source_slots):
                     slot_scores[int(source_slot_idx)] = torch.clamp(
                         cosine_scores[local_candidate_idx], min=-1.0, max=1.0
                     ).detach().float()
+
                 row_oof_scores = None
-                if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
-                    row_oof_scores = torch.clamp(candidate_tensor @ oof_text_projs.t(), min=-1.0, max=1.0).max(dim=0).values
-                append_preview_row(row_idx, pred_candidate_slot, slot_scores, oof_scores=row_oof_scores)
-                row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
+                pred_candidate_slot = -1
+                row_loss = None
+                row_top1_value = None
+                track_row_text = False
+
+                if has_pos and has_neg:
+                    logits = cosine_scores / temperature
+                    if candidate_source_slots:
+                        pred_candidate_slot = int(candidate_source_slots[int(torch.argmax(logits).item())])
+                    if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
+                        row_oof_scores = torch.clamp(candidate_tensor @ oof_text_projs.t(), min=-1.0, max=1.0).max(dim=0).values
+                    row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
+                    row_top1_value = positive_mask[torch.argmax(logits)].float()
+                    track_row_text = True
+                else:
+                    is_true_oof = roi_gaze_valid is not None and not bool(roi_gaze_valid[row_idx].item())
+                    can_use_true_oof = (
+                        use_true_oof_frames
+                        and is_true_oof
+                        and oof_enabled
+                        and oof_text_projs is not None
+                        and oof_text_projs.numel() > 0
+                        and not has_pos
+                    )
+                    if not can_use_true_oof:
+                        continue
+                    oof_scores = oof_text_projs @ text_proj
+                    candidate_logits = cosine_scores / temperature
+                    oof_logits = oof_scores / temperature
+                    logits = torch.cat([oof_logits, candidate_logits], dim=0)
+                    row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(oof_logits, dim=0)
+                    top_index = int(torch.argmax(logits).item())
+                    row_top1_value = logits.new_tensor(float(top_index < int(oof_logits.shape[0])))
+                    if top_index >= int(oof_logits.shape[0]) and candidate_source_slots:
+                        best_candidate_local = top_index - int(oof_logits.shape[0])
+                        if 0 <= best_candidate_local < len(candidate_source_slots):
+                            pred_candidate_slot = int(candidate_source_slots[best_candidate_local])
+                    row_oof_scores = torch.clamp(oof_scores, min=-1.0, max=1.0)
+                    track_row_text = True
+                    rows_true_oof_supervised += 1
+
+                preview_buffer.append(row_idx, pred_candidate_slot, slot_scores, oof_scores=row_oof_scores)
+                if row_loss is None or row_top1_value is None or not track_row_text:
+                    continue
                 row_losses.append(row_loss)
-                row_top1.append(positive_mask[torch.argmax(logits)].float())
+                row_top1.append(row_top1_value)
                 candidate_count_total += int(candidate_tensor.shape[0])
                 candidate_text_bank.append(text_proj)
-                candidate_row_text_index[row_idx] = len(candidate_text_bank) - 1
-                if oof_enabled and roi_gaze_valid is not None and bool(roi_gaze_valid[row_idx].item()):
+                text_index = len(candidate_text_bank) - 1
+                if has_pos and oof_enabled and roi_gaze_valid is not None and bool(roi_gaze_valid[row_idx].item()):
                     positive_anchor = F.normalize(candidate_tensor[positive_mask].mean(dim=0), dim=-1)
                     candidate_oof_anchors.append(positive_anchor)
-                    candidate_oof_targets.append(candidate_row_text_index[row_idx])
+                    candidate_oof_targets.append(text_index)
 
             if row_losses or (oof_enabled and len(candidate_oof_anchors) > 0):
                 stats_device = outputs.loss.device
@@ -1064,7 +1037,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     device=outputs.loss.device,
                     dtype=outputs.loss.dtype,
                 )
-                preview_row_index_tensor, preview_pred_slot_tensor, preview_candidate_slot_score_tensor, preview_oof_score_tensor = build_preview_tensors(stats_device)
+                (
+                    preview_row_index_tensor,
+                    preview_pred_slot_tensor,
+                    preview_candidate_slot_score_tensor,
+                    preview_oof_score_tensor,
+                ) = preview_buffer.to_tensors(stats_device)
                 self._roi_contrastive_stats = {
                     "nce_loss": nce_loss.detach(),
                     "top1": top1_acc.detach(),
@@ -1086,7 +1064,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         message=(
                             f"candidate_path: rows_total={batch_limit_candidate}, focus={rows_focus_found}, span={rows_span_valid}, "
                             f"image={rows_image_valid}, has_cands={rows_with_candidates}, has_pos={rows_with_pos}, "
-                            f"has_pos_neg={rows_with_pos_and_neg}, row_losses={len(row_losses)}, "
+                            f"has_pos_neg={rows_with_pos_and_neg}, true_oof_rows={rows_true_oof_supervised}, "
+                            f"row_losses={len(row_losses)}, "
                             f"pairs={candidate_count_total}, oof_rows={int(oof_rows.item())}, "
                             f"nce={float(nce_loss.item()):.6f}, oof={float(oof_loss.item()):.6f}"
                         ),
@@ -1099,10 +1078,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     message=(
                         f"candidate_path_skipped: rows_total={batch_limit_candidate}, focus={rows_focus_found}, span={rows_span_valid}, "
                         f"image={rows_image_valid}, has_cands={rows_with_candidates}, has_pos={rows_with_pos}, "
-                        f"has_pos_neg={rows_with_pos_and_neg}, row_losses={len(row_losses)}"
+                        f"has_pos_neg={rows_with_pos_and_neg}, true_oof_rows={rows_true_oof_supervised}, "
+                        f"row_losses={len(row_losses)}"
                     ),
                 )
 
+        # Step 3: gaze-centered fallback path when candidate metadata is missing or unusable.
         if roi_gaze_xy is None or roi_gaze_valid is None:
             return outputs
 
@@ -1117,9 +1098,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             focus_start = locate_focus_start_index(labels[row_idx], phrase_sequences)
             if focus_start is None:
                 continue
-            span_mask = labels[row_idx] >= 0
-            if focus_start > 0:
-                span_mask = span_mask & (torch.arange(labels[row_idx].shape[0], device=labels.device) >= focus_start)
+            span_mask = _build_focus_span_mask(row_idx, focus_start)
             if not span_mask.any():
                 continue
             text_embed = hidden_last[row_idx][span_mask].mean(dim=0)
@@ -1127,17 +1106,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             sample_image_features = image_features[row_idx]
             if not torch.is_tensor(sample_image_features) or sample_image_features.ndim != 2:
                 continue
-            grid_side = default_grid_side
-            if grid_side <= 0 or grid_side * grid_side > sample_image_features.shape[0]:
-                grid_side = int(math.sqrt(sample_image_features.shape[0]))
-            base_token_count = grid_side * grid_side
+            grid_side, base_token_count = _resolve_grid_side(sample_image_features)
             if base_token_count <= 0:
                 continue
 
             x_norm = float(torch.clamp(roi_gaze_xy[row_idx][0], 0.0, 1.0).item())
             y_norm = float(torch.clamp(roi_gaze_xy[row_idx][1], 0.0, 1.0).item())
             radius = max(1, int(round(radius_ratio * grid_side)))
-            roi_indices = self._build_roi_patch_indices(x_norm, y_norm, grid_side, radius)
+            roi_indices = build_circular_roi_patch_indices(x_norm, y_norm, grid_side, radius)
             if not roi_indices:
                 continue
             roi_indices_tensor = torch.as_tensor(roi_indices, device=sample_image_features.device, dtype=torch.long)
@@ -1152,7 +1128,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         pair_count = len(text_embeddings)
         stats_device = outputs.loss.device
         if pair_count < 1:
-            preview_row_index_tensor, preview_pred_slot_tensor, preview_candidate_slot_score_tensor, preview_oof_score_tensor = build_preview_tensors(stats_device)
+            (
+                preview_row_index_tensor,
+                preview_pred_slot_tensor,
+                preview_candidate_slot_score_tensor,
+                preview_oof_score_tensor,
+            ) = preview_buffer.to_tensors(stats_device)
             self._roi_contrastive_stats = {
                 "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "top1": torch.zeros((), device=stats_device, dtype=torch.float32),
@@ -1214,7 +1195,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dtype=outputs.loss.dtype,
             )
 
-        preview_row_index_tensor, preview_pred_slot_tensor, preview_candidate_slot_score_tensor, preview_oof_score_tensor = build_preview_tensors(stats_device)
+        (
+            preview_row_index_tensor,
+            preview_pred_slot_tensor,
+            preview_candidate_slot_score_tensor,
+            preview_oof_score_tensor,
+        ) = preview_buffer.to_tensors(stats_device)
         self._roi_contrastive_stats = {
             "nce_loss": nce_loss.detach(),
             "top1": top1_acc.detach(),
