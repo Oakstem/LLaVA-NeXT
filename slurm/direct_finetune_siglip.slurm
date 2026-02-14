@@ -142,6 +142,7 @@ ROI_CONTRASTIVE_OOF_ENABLE="True"
 ROI_CONTRASTIVE_OOF_TEXT="looking at someone or something outside the frame"
 ROI_CONTRASTIVE_OOF_EXTRA_TEXTS="looking towards the camera||looking at the camera"
 ROI_CONTRASTIVE_OOF_WEIGHT="0.5"
+ROI_CONTRASTIVE_USE_TRUE_OOF_FRAMES="True"
 ROI_CONTRASTIVE_PREVIEW_SAMPLES="5"
 ROI_CONTRASTIVE_PREVIEW_TOPK="5"
 
@@ -233,6 +234,7 @@ echo "ROI Contrastive OOF Enable: ${ROI_CONTRASTIVE_OOF_ENABLE}"
 echo "ROI Contrastive OOF Text: ${ROI_CONTRASTIVE_OOF_TEXT}"
 echo "ROI Contrastive OOF Extra Texts: ${ROI_CONTRASTIVE_OOF_EXTRA_TEXTS}"
 echo "ROI Contrastive OOF Weight: ${ROI_CONTRASTIVE_OOF_WEIGHT}"
+echo "ROI Contrastive Use True OOF Frames: ${ROI_CONTRASTIVE_USE_TRUE_OOF_FRAMES}"
 echo "ROI Contrastive Preview Samples: ${ROI_CONTRASTIVE_PREVIEW_SAMPLES}"
 echo "ROI Contrastive Preview TopK: ${ROI_CONTRASTIVE_PREVIEW_TOPK}"
 echo ""
@@ -317,6 +319,7 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --roi_contrastive_oof_text "${ROI_CONTRASTIVE_OOF_TEXT}" \
     --roi_contrastive_oof_extra_texts "${ROI_CONTRASTIVE_OOF_EXTRA_TEXTS}" \
     --roi_contrastive_oof_weight ${ROI_CONTRASTIVE_OOF_WEIGHT} \
+    --roi_contrastive_use_true_oof_frames ${ROI_CONTRASTIVE_USE_TRUE_OOF_FRAMES} \
     --roi_contrastive_preview_samples ${ROI_CONTRASTIVE_PREVIEW_SAMPLES} \
     --roi_contrastive_preview_topk ${ROI_CONTRASTIVE_PREVIEW_TOPK} \
     --logging_steps ${LOGGING_STEPS} \
