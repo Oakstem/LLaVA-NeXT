@@ -40,11 +40,11 @@ def prepare_focus_phrase_sequences(raw_ids: Optional[Any], device: torch.device)
     return unique_sequences
 
 
-def locate_focus_start_index(sample_labels: torch.LongTensor, candidate_sequences: List[torch.LongTensor]) -> Optional[int]:
-    """Return index immediately after the focus phrase, or None if the phrase is absent."""
+def locate_focus_start_index(sample_labels: torch.LongTensor, focus_phrases: List[torch.LongTensor]) -> Optional[int]:
+    """Return index immediately after the focus phrase, or None if the phrase is absent. default focus phrase is 'looking at'."""
     match_end_index: Optional[int] = None
     seq_length = sample_labels.size(0)
-    for candidate in candidate_sequences:
+    for candidate in focus_phrases:
         cand_len = candidate.size(0)
         if cand_len == 0 or seq_length < cand_len:
             continue

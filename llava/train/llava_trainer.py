@@ -59,6 +59,7 @@ from llava.constants import DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT
 from llava.conversation import SeparatorStyle
 from llava.mm_utils import process_images, tokenizer_image_token, KeywordsStoppingCriteria
 from llava.utils import rank0_print
+from gazefollow.roi_overlay_render import draw_labeled_norm_box, draw_overlay_text_lines
 
 
 def safe_wandb_log(args, metrics_dict, step=None):
@@ -930,40 +931,6 @@ class LLaVATrainer(Trainer):
             if len(self.step_times[key]) > max_history:
                 self.step_times[key] = self.step_times[key][-max_history:]
 
-    @staticmethod
-    def _norm_box_to_pixels(box: torch.Tensor, image_w: int, image_h: int):
-        x1 = int(max(0, min(image_w - 1, round(float(box[0].item()) * image_w))))
-        y1 = int(max(0, min(image_h - 1, round(float(box[1].item()) * image_h))))
-        x2 = int(max(0, min(image_w - 1, round(float(box[2].item()) * image_w))))
-        y2 = int(max(0, min(image_h - 1, round(float(box[3].item()) * image_h))))
-        if x2 < x1:
-            x1, x2 = x2, x1
-        if y2 < y1:
-            y1, y2 = y2, y1
-        return x1, y1, x2, y2
-
-    @staticmethod
-    def _draw_labeled_norm_box(
-        draw: ImageDraw.ImageDraw,
-        box: torch.Tensor,
-        image_w: int,
-        image_h: int,
-        color,
-        width: int,
-        label: str,
-    ):
-        x1, y1, x2, y2 = LLaVATrainer._norm_box_to_pixels(box, image_w, image_h)
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
-        text = label.strip()
-        if not text:
-            return
-        text_x = x1 + 2
-        text_y = max(0, y1 - 14)
-        if hasattr(draw, "textbbox"):
-            text_left, text_top, text_right, text_bottom = draw.textbbox((text_x, text_y), text)
-            draw.rectangle([text_left - 1, text_top - 1, text_right + 1, text_bottom + 1], fill=(0, 0, 0))
-        draw.text((text_x, text_y), text, fill=color)
-
     def _resolve_overlay_image_path(self, image_file: str) -> Optional[pathlib.Path]:
         if not image_file:
             return None
@@ -1053,7 +1020,7 @@ class LLaVATrainer(Trainer):
                     label_parts.append("GT")
                 if is_pred:
                     label_parts.append("pred")
-                self._draw_labeled_norm_box(
+                draw_labeled_norm_box(
                     draw,
                     row_boxes[cand_idx],
                     image_w,
@@ -1076,23 +1043,46 @@ class LLaVATrainer(Trainer):
                 draw.ellipse([gx - r, gy - r, gx + r, gy + r], outline=(0, 255, 255), width=3)
 
             sample_id = sample_ids[row_idx] if row_idx < len(sample_ids) else str(row_idx)
-            oof_parts: List[str] = []
+            gt_is_oof = (
+                torch.is_tensor(gaze_valid)
+                and row_idx < gaze_valid.shape[0]
+                and not bool(gaze_valid[row_idx].item())
+            )
             configured_oof_labels = list(getattr(getattr(self.model, "config", None), "roi_contrastive_oof_texts", []) or [])
             oof_scores = preview.get("oof_scores", [])
+            pred_is_oof = pred_slot < 0 and len(oof_scores) > 0
+            pred_oof_idx = -1
+            if pred_is_oof:
+                best_score = float("-inf")
+                for oof_idx, raw_score in enumerate(oof_scores):
+                    score_val = float(raw_score)
+                    if score_val != score_val or score_val in (float("inf"), float("-inf")):
+                        continue
+                    if score_val > best_score:
+                        best_score = score_val
+                        pred_oof_idx = oof_idx
+
+            oof_lines: List[Dict[str, Any]] = []
             for oof_idx, raw_score in enumerate(oof_scores):
                 score_val = float(raw_score)
                 if score_val != score_val or score_val in (float("inf"), float("-inf")):
                     continue
                 label = configured_oof_labels[oof_idx] if oof_idx < len(configured_oof_labels) else f"oof_{oof_idx}"
-                oof_parts.append(f"{label}:{score_val:.2f}")
-            if oof_parts:
-                overlay_text = "OOF " + " | ".join(oof_parts)
-                text_x = 8
-                text_y = 8
-                if hasattr(draw, "textbbox"):
-                    left, top, right, bottom = draw.textbbox((text_x, text_y), overlay_text)
-                    draw.rectangle([left - 2, top - 2, right + 2, bottom + 2], fill=(0, 0, 0))
-                draw.text((text_x, text_y), overlay_text, fill=(255, 255, 255))
+                color = (255, 255, 255)
+                if gt_is_oof:
+                    color = (0, 255, 80)
+                if pred_is_oof and oof_idx == pred_oof_idx:
+                    color = (255, 64, 64)
+                tags: List[str] = []
+                if gt_is_oof:
+                    tags.append("GT")
+                if pred_is_oof and oof_idx == pred_oof_idx:
+                    tags.append("pred")
+                line_text = f"OOF[{oof_idx}] {label}:{score_val:.2f}"
+                if tags:
+                    line_text += f" ({','.join(tags)})"
+                oof_lines.append({"text": line_text, "color": color})
+            draw_overlay_text_lines(draw, oof_lines, text_x=8, text_y=8)
             caption = (
                 f"step={self.state.global_step} sample={sample_id} row={row_idx} "
                 f"pred_slot={pred_slot}"
