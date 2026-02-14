@@ -91,6 +91,8 @@ ROI_CANDIDATES_CSV="training_datasets/stage1b_negatives/stage1b_yolo_negatives.c
 ROI_MAX_POSITIVES="1"
 ROI_MAX_NEGATIVES="8"
 ROI_POSITIVE_RADIUS_RATIO="0.08"
+ROI_CANDIDATES_RECOMPUTE_POSITIVES="True"
+ROI_CANDIDATES_POSITIVE_CENTER_DISTANCE_THRESHOLD="0.1"
 OUTPUT_BASE_DIR="/galitylab/students/alonmardi/projects/LLaVA-NeXT/training_outputs"
 # DEEPSPEED_CONFIG="scripts/zero3.json"
 DEEPSPEED_CONFIG="scripts/zero1.json"
@@ -188,6 +190,8 @@ echo "ROI Candidates CSV: ${ROI_CANDIDATES_CSV}"
 echo "ROI Max Positives: ${ROI_MAX_POSITIVES}"
 echo "ROI Max Negatives: ${ROI_MAX_NEGATIVES}"
 echo "ROI Positive Radius Ratio: ${ROI_POSITIVE_RADIUS_RATIO}"
+echo "ROI Candidates Recompute Positives: ${ROI_CANDIDATES_RECOMPUTE_POSITIVES}"
+echo "ROI Candidates Positive Center Distance Threshold: ${ROI_CANDIDATES_POSITIVE_CENTER_DISTANCE_THRESHOLD}"
 echo "DeepSpeed Config: ${DEEPSPEED_CONFIG}"
 echo ""
 echo "=== MODEL ARCHITECTURE ==="
@@ -269,6 +273,8 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --roi_max_positives ${ROI_MAX_POSITIVES} \
     --roi_max_negatives ${ROI_MAX_NEGATIVES} \
     --roi_positive_radius_ratio ${ROI_POSITIVE_RADIUS_RATIO} \
+    --roi_candidates_recompute_positives ${ROI_CANDIDATES_RECOMPUTE_POSITIVES} \
+    --roi_candidates_positive_center_distance_threshold ${ROI_CANDIDATES_POSITIVE_CENTER_DISTANCE_THRESHOLD} \
     --mm_tunable_parts=${MM_TUNABLE_PARTS} \
     --mm_vision_tower_lr=${MM_VISION_TOWER_LR} \
     --vision_tower ${VISION_MODEL_VERSION} \

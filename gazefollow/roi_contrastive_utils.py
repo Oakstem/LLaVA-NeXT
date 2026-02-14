@@ -59,6 +59,118 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_detection_bbox(value: Any) -> Optional[Tuple[int, int, int, int]]:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    coords = [_safe_int(v) for v in value]
+    if any(v is None for v in coords):
+        return None
+    x1, y1, x2, y2 = coords  # type: ignore[misc]
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
+
+def _detection_signature(det: Dict[str, Any]) -> Tuple[str, str, Tuple[int, int, int, int], Optional[float]]:
+    bbox = _parse_detection_bbox(det.get("bbox")) or (0, 0, 0, 0)
+    score = det.get("score")
+    score_sig = round(float(score), 4) if isinstance(score, (int, float)) else None
+    return (
+        str(det.get("label", "")).strip().lower(),
+        str(det.get("category", "")).strip().lower(),
+        bbox,
+        score_sig,
+    )
+
+
+def _sanitize_negatives(
+    negatives: List[Dict[str, Any]],
+    removed: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    removed_sigs = {_detection_signature(det) for det in removed}
+    filtered: List[Dict[str, Any]] = []
+    seen: set = set()
+    for det in negatives:
+        sig = _detection_signature(det)
+        if sig in removed_sigs:
+            continue
+        if sig in seen:
+            continue
+        seen.add(sig)
+        filtered.append(det)
+    return filtered
+
+
+def _bbox_intersects(box_a: Tuple[int, int, int, int], box_b: List[float]) -> bool:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+
+def _bbox_center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    return (float(bbox[0] + bbox[2]) / 2.0, float(bbox[1] + bbox[3]) / 2.0)
+
+
+def _normalized_center_distance(
+    det_bbox: Tuple[int, int, int, int],
+    gt_x: float,
+    gt_y: float,
+    image_w: float,
+    image_h: float,
+) -> float:
+    cx, cy = _bbox_center(det_bbox)
+    diagonal = max((float(image_w) ** 2 + float(image_h) ** 2) ** 0.5, 1e-6)
+    return (((cx - gt_x) ** 2 + (cy - gt_y) ** 2) ** 0.5) / diagonal
+
+
+def _recompute_removed_and_negatives(
+    all_detections: List[Dict[str, Any]],
+    gt_x: float,
+    gt_y: float,
+    gt_w: float,
+    gt_h: float,
+    gt_radius_ratio: float,
+    center_distance_threshold: float,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    radius = max(1.0, float(gt_radius_ratio) * min(float(gt_w), float(gt_h)))
+    gt_box = [
+        max(0.0, float(gt_x) - radius),
+        max(0.0, float(gt_y) - radius),
+        min(float(gt_w) - 1.0, float(gt_x) + radius),
+        min(float(gt_h) - 1.0, float(gt_y) + radius),
+    ]
+    positives: List[Dict[str, Any]] = []
+    negatives: List[Dict[str, Any]] = []
+    for det in all_detections:
+        bbox = _parse_detection_bbox(det.get("bbox"))
+        if bbox is None:
+            negatives.append(det)
+            continue
+        overlap_positive = _bbox_intersects(bbox, gt_box)
+        center_distance = _normalized_center_distance(
+            det_bbox=bbox,
+            gt_x=float(gt_x),
+            gt_y=float(gt_y),
+            image_w=float(gt_w),
+            image_h=float(gt_h),
+        )
+        distance_positive = center_distance <= float(center_distance_threshold)
+        if overlap_positive or distance_positive:
+            positives.append(det)
+        else:
+            negatives.append(det)
+    return positives, negatives
+
+
 def build_roi_gaze_metadata(
     sample_dict: Dict[str, Any],
     roi_entry: Optional[Dict[str, Any]] = None,
@@ -216,6 +328,9 @@ def _sample_lookup_keys(sample: Dict[str, Any]) -> List[str]:
 def load_roi_candidate_lookup(
     csv_path: Path,
     logger: Optional[Callable[[str], None]] = None,
+    recompute_positives: bool = False,
+    positive_center_distance_threshold: float = 0.1,
+    gt_radius_ratio: float = 0.05,
 ) -> Dict[str, Dict[str, Any]]:
     csv_path = csv_path.expanduser()
     if not csv_path.is_absolute():
@@ -240,12 +355,40 @@ def load_roi_candidate_lookup(
                 continue
             if not isinstance(negatives_raw, list):
                 continue
+            negatives_raw = [det for det in negatives_raw if isinstance(det, dict)]
+
+            removed_json = str(row.get("removed_positive_json") or "[]")
+            try:
+                removed_raw = json.loads(removed_json)
+            except json.JSONDecodeError:
+                removed_raw = []
+            if not isinstance(removed_raw, list):
+                removed_raw = []
+            removed_raw = [det for det in removed_raw if isinstance(det, dict)]
 
             negatives_norm: List[List[float]] = []
             seen_neg: set = set()
+            gt_x = _safe_float(row.get("gt_x"))
+            gt_y = _safe_float(row.get("gt_y"))
+            if (
+                recompute_positives
+                and gt_x is not None
+                and gt_y is not None
+            ):
+                recomputed_removed, recomputed_negatives = _recompute_removed_and_negatives(
+                    all_detections=(removed_raw + negatives_raw),
+                    gt_x=gt_x,
+                    gt_y=gt_y,
+                    gt_w=image_width,
+                    gt_h=image_height,
+                    gt_radius_ratio=gt_radius_ratio,
+                    center_distance_threshold=positive_center_distance_threshold,
+                )
+                removed_raw = recomputed_removed
+                negatives_raw = recomputed_negatives
+
+            negatives_raw = _sanitize_negatives(negatives_raw, removed_raw)
             for det in negatives_raw:
-                if not isinstance(det, dict):
-                    continue
                 norm_bbox = _normalize_candidate_bbox(det, image_width=image_width, image_height=image_height)
                 if norm_bbox is None:
                     continue
@@ -255,8 +398,6 @@ def load_roi_candidate_lookup(
                 seen_neg.add(key)
                 negatives_norm.append(norm_bbox)
 
-            gt_x = _safe_float(row.get("gt_x"))
-            gt_y = _safe_float(row.get("gt_y"))
             in_out_raw = row.get("in_out")
             in_out = None
             if in_out_raw is not None and str(in_out_raw).strip() != "":

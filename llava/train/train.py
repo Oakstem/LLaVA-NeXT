@@ -193,6 +193,8 @@ class DataArguments:
     roi_max_positives: int = field(default=1, metadata={"help": "Maximum positive ROI candidates per sample (GT-gaze positive only)."})
     roi_max_negatives: int = field(default=8, metadata={"help": "Maximum negative ROI candidates per sample."})
     roi_positive_radius_ratio: float = field(default=0.08, metadata={"help": "Radius ratio around GT gaze point used to build the positive ROI box."})
+    roi_candidates_recompute_positives: bool = field(default=False, metadata={"help": "Recompute positive/negative split from CSV candidates using GT overlap+distance logic."})
+    roi_candidates_positive_center_distance_threshold: float = field(default=0.1, metadata={"help": "Normalized center-distance threshold used when recomputing positives from CSV detections."})
 
 
 @dataclass
@@ -1459,10 +1461,20 @@ class LazySupervisedDataset(Dataset):
         self.roi_candidate_slots = self.roi_max_positives + self.roi_max_negatives
         roi_candidates_csv = getattr(data_args, "roi_candidates_csv", None)
         if roi_candidates_csv and self.roi_candidate_slots > 0:
-            self.roi_candidate_lookup = load_roi_candidate_lookup(Path(roi_candidates_csv), logger=rank0_print)
+            self.roi_candidate_lookup = load_roi_candidate_lookup(
+                Path(roi_candidates_csv),
+                logger=rank0_print,
+                recompute_positives=bool(getattr(data_args, "roi_candidates_recompute_positives", False)),
+                positive_center_distance_threshold=float(
+                    getattr(data_args, "roi_candidates_positive_center_distance_threshold", 0.1)
+                ),
+                gt_radius_ratio=self.roi_positive_radius_ratio,
+            )
             rank0_print(
                 f"Loaded ROI candidate lookup from {roi_candidates_csv} "
-                f"(keys={len(self.roi_candidate_lookup)}, slots={self.roi_candidate_slots})"
+                f"(keys={len(self.roi_candidate_lookup)}, slots={self.roi_candidate_slots}, "
+                f"recompute={bool(getattr(data_args, 'roi_candidates_recompute_positives', False))}, "
+                f"center_dist_th={float(getattr(data_args, 'roi_candidates_positive_center_distance_threshold', 0.1)):.3f})"
             )
 
         # Apply split indices if provided
