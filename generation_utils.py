@@ -1227,7 +1227,7 @@ def visualize_embedding_similarity(
     # text_token_embedding: [D], image_token_embeddings: [N, D] -> similarity_scores: [N]
     similarity_scores = torch.nn.functional.cosine_similarity(
         image_token_embeddings, text_token_embedding.unsqueeze(0), dim=1
-    )
+    ).clamp(min=-1.0, max=1.0)
 
     # 2. Reshape into a 2D grid
     num_patches = image_token_embeddings.shape[0]
