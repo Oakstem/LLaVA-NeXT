@@ -131,18 +131,24 @@ def format_dataset_reference(dataset: DatasetMetrics) -> str:
 
 
 def load_adapter_suffix(result_path: Path) -> Optional[str]:
-    config_path = result_path.parent / "evaluation_config.json"
-    if not result_path.parent.stem.startswith("eval_") and "baseline" not in result_path.parent.stem:
-        config_path = result_path.parent.parent / "evaluation_config.json"
-    if not config_path.is_file():
-        return None
+    config_paths = [
+        result_path.parent / "evaluation_config.json",
+        result_path.parent.parent / "evaluation_config.json",
+    ]
+    adapter_value = None
+    for config_path in config_paths:
+        if not config_path.is_file():
+            continue
 
-    try:
-        config = json.loads(config_path.read_text())
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse {config_path}: {exc}") from exc
+        try:
+            config = json.loads(config_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Failed to parse {config_path}: {exc}") from exc
 
-    adapter_value = config.get("adapter_path")
+        adapter_value = config.get("adapter_path")
+        if adapter_value and isinstance(adapter_value, str):
+            break
+
     if not adapter_value or not isinstance(adapter_value, str):
         return None
 
