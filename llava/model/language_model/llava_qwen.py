@@ -109,9 +109,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             reference_input_ids = reference_input_ids.unsqueeze(0)
 
         tokens_indexing: Dict[str, List[torch.Tensor]] = {"image": [], "text": []}
-        for row in reference_input_ids:
-            image_inds = (row == IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
-            text_inds = (row != IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+        for im_sample_ids in reference_input_ids:
+            image_inds = (im_sample_ids == IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
+            text_inds = (im_sample_ids != IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).flatten()
             tokens_indexing["image"].append(image_inds)
             tokens_indexing["text"].append(text_inds)
 
@@ -741,13 +741,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
     @staticmethod
     def _build_roi_focus_span_mask(
-        labels_row: torch.Tensor,
+        labels_im_sample: torch.Tensor,
         focus_start: int,
         device: torch.device,
     ) -> torch.Tensor:
-        span_mask = labels_row >= 0
+        span_mask = labels_im_sample >= 0
         if focus_start > 0:
-            token_positions = torch.arange(labels_row.shape[0], device=device)
+            token_positions = torch.arange(labels_im_sample.shape[0], device=device)
             span_mask = span_mask & (token_positions >= focus_start)
         return span_mask
 
@@ -764,9 +764,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     def _build_roi_candidate_embeddings(
         self,
         sample_image_features: torch.Tensor,
-        row_boxes: torch.Tensor,
-        row_valid: torch.Tensor,
-        row_is_positive: torch.Tensor,
+        sample_boxes: torch.Tensor,
+        sample_valid: torch.Tensor,
+        sample_is_positive: torch.Tensor,
         grid_side: int,
         base_token_count: int,
     ) -> Tuple[List[torch.Tensor], List[bool], List[int]]:
@@ -774,13 +774,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         candidate_positive_flags: List[bool] = []
         candidate_source_slots: List[int] = []
 
-        for cand_idx in range(row_boxes.shape[0]):
-            if not bool(row_valid[cand_idx].item()):
+        for cand_idx in range(sample_boxes.shape[0]):
+            if not bool(sample_valid[cand_idx].item()):
                 continue
-            x1 = float(torch.clamp(row_boxes[cand_idx][0], 0.0, 1.0).item())
-            y1 = float(torch.clamp(row_boxes[cand_idx][1], 0.0, 1.0).item())
-            x2 = float(torch.clamp(row_boxes[cand_idx][2], 0.0, 1.0).item())
-            y2 = float(torch.clamp(row_boxes[cand_idx][3], 0.0, 1.0).item())
+            x1 = float(torch.clamp(sample_boxes[cand_idx][0], 0.0, 1.0).item())
+            y1 = float(torch.clamp(sample_boxes[cand_idx][1], 0.0, 1.0).item())
+            x2 = float(torch.clamp(sample_boxes[cand_idx][2], 0.0, 1.0).item())
+            y2 = float(torch.clamp(sample_boxes[cand_idx][3], 0.0, 1.0).item())
             bbox_patch_indices = build_bbox_patch_indices(x1, y1, x2, y2, grid_side)
             if not bbox_patch_indices:
                 continue
@@ -798,17 +798,17 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             pos_proj = self.roi_position_mlp(pos_tensor).squeeze(0)
             fused_embed = F.normalize(vision_proj + pos_proj, dim=-1)
             candidate_embeds.append(fused_embed)
-            candidate_positive_flags.append(bool(row_is_positive[cand_idx].item()))
+            candidate_positive_flags.append(bool(sample_is_positive[cand_idx].item()))
             candidate_source_slots.append(int(cand_idx))
 
         return candidate_embeds, candidate_positive_flags, candidate_source_slots
 
-    def _compute_roi_candidate_row_objective(
+    def _compute_roi_candidate_image_objective(
         self,
         candidate_tensor: torch.Tensor,
         positive_mask: torch.Tensor,
         candidate_source_slots: List[int],
-        row_slot_count: int,
+        candidate_slot_count: int,
         text_proj: torch.Tensor,
         temperature: float,
         oof_enabled: bool,
@@ -820,7 +820,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         has_neg = bool((~positive_mask).any().item())
         cosine_scores = candidate_tensor @ text_proj
         slot_scores = torch.full(
-            (row_slot_count,),
+            (candidate_slot_count,),
             float("nan"),
             device=cosine_scores.device,
             dtype=torch.float32,
@@ -836,20 +836,20 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             pred_candidate_slot = -1
             if candidate_source_slots:
                 pred_candidate_slot = int(candidate_source_slots[int(torch.argmax(logits).item())])
-            row_oof_scores = None
+            oof_scores = None
             if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
-                row_oof_scores = torch.clamp(candidate_tensor @ oof_text_projs.t(), min=-1.0, max=1.0).max(dim=0).values
-            row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
-            row_top1 = positive_mask[torch.argmax(logits)].float()
+                oof_scores = torch.clamp(candidate_tensor @ oof_text_projs.t(), min=-1.0, max=1.0).max(dim=0).values
+            image_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[positive_mask], dim=0)
+            image_top1 = positive_mask[torch.argmax(logits)].float()
             return {
                 "has_pos": True,
                 "has_pos_and_neg": True,
                 "true_oof_supervised": False,
                 "pred_candidate_slot": pred_candidate_slot,
                 "slot_scores": slot_scores,
-                "row_oof_scores": row_oof_scores,
-                "row_loss": row_loss,
-                "row_top1": row_top1,
+                "oof_scores": oof_scores,
+                "image_loss": image_loss,
+                "image_top1": image_top1,
             }
 
         # Sub-step B: optional true-OOF supervision (OOF text as positives, candidate boxes as negatives).
@@ -868,9 +868,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         candidate_logits = cosine_scores / temperature
         oof_logits = oof_scores / temperature
         logits = torch.cat([oof_logits, candidate_logits], dim=0)
-        row_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(oof_logits, dim=0)
+        image_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(oof_logits, dim=0)
         top_index = int(torch.argmax(logits).item())
-        row_top1 = logits.new_tensor(float(top_index < int(oof_logits.shape[0])))
+        image_top1 = logits.new_tensor(float(top_index < int(oof_logits.shape[0])))
         pred_candidate_slot = -1
         if top_index >= int(oof_logits.shape[0]) and candidate_source_slots:
             best_candidate_local = top_index - int(oof_logits.shape[0])
@@ -882,9 +882,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             "true_oof_supervised": True,
             "pred_candidate_slot": pred_candidate_slot,
             "slot_scores": slot_scores,
-            "row_oof_scores": torch.clamp(oof_scores, min=-1.0, max=1.0),
-            "row_loss": row_loss,
-            "row_top1": row_top1,
+            "oof_scores": torch.clamp(oof_scores, min=-1.0, max=1.0),
+            "image_loss": image_loss,
+            "image_top1": image_top1,
         }
 
     def _apply_roi_candidate_path(
@@ -920,54 +920,54 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         )
         if roi_gaze_valid is not None:
             batch_limit_candidate = min(batch_limit_candidate, roi_gaze_valid.shape[0])
-        row_losses: List[torch.Tensor] = []
-        row_top1: List[torch.Tensor] = []
+        image_losses: List[torch.Tensor] = []
+        image_top1: List[torch.Tensor] = []
         candidate_count_total = 0
         candidate_text_bank: List[torch.Tensor] = []
         candidate_oof_anchors: List[torch.Tensor] = []
         candidate_oof_targets: List[int] = []
-        rows_focus_found = 0
-        rows_span_valid = 0
-        rows_image_valid = 0
-        rows_with_candidates = 0
-        rows_with_pos = 0
-        rows_with_pos_and_neg = 0
-        rows_true_oof_supervised = 0
+        samples_focus_found = 0
+        samples_span_valid = 0
+        samples_image_valid = 0
+        samples_with_candidates = 0
+        samples_with_pos = 0
+        samples_with_pos_and_neg = 0
+        samples_true_oof_supervised = 0
 
-        # Sub-step 2: build row-level candidate/text representations and row-level objectives.
-        for row_idx in range(batch_limit_candidate):
-            focus_start = locate_focus_start_index(labels[row_idx], phrase_sequences)
+        # Sub-step 2: build image-level candidate/text representations and image-level objectives.
+        for im_idx in range(batch_limit_candidate):
+            focus_start = locate_focus_start_index(labels[im_idx], phrase_sequences)
             if focus_start is None:
                 continue
-            rows_focus_found += 1
-            span_mask = self._build_roi_focus_span_mask(labels[row_idx], focus_start, labels.device)
+            samples_focus_found += 1
+            span_mask = self._build_roi_focus_span_mask(labels[im_idx], focus_start, labels.device)
             if not span_mask.any():
                 continue
-            rows_span_valid += 1
-            text_embed = hidden_last[row_idx][span_mask].mean(dim=0)
+            samples_span_valid += 1
+            text_embed = hidden_last[im_idx][span_mask].mean(dim=0)
 
-            sample_image_features = image_features[row_idx]
+            sample_image_features = image_features[im_idx]
             if not torch.is_tensor(sample_image_features) or sample_image_features.ndim != 2:
                 continue
-            rows_image_valid += 1
+            samples_image_valid += 1
             grid_side, base_token_count = self._resolve_roi_grid_side(sample_image_features, default_grid_side)
             if base_token_count <= 0:
                 continue
 
-            row_boxes = roi_candidate_boxes[row_idx]
-            row_is_positive = roi_candidate_is_positive[row_idx].bool()
-            row_valid = roi_candidate_valid[row_idx].bool()
+            sample_boxes = roi_candidate_boxes[im_idx]
+            sample_is_positive = roi_candidate_is_positive[im_idx].bool()
+            sample_valid = roi_candidate_valid[im_idx].bool()
             candidate_embeds, candidate_positive_flags, candidate_source_slots = self._build_roi_candidate_embeddings(
                 sample_image_features=sample_image_features,
-                row_boxes=row_boxes,
-                row_valid=row_valid,
-                row_is_positive=row_is_positive,
+                sample_boxes=sample_boxes,
+                sample_valid=sample_valid,
+                sample_is_positive=sample_is_positive,
                 grid_side=grid_side,
                 base_token_count=base_token_count,
             )
 
             if candidate_embeds:
-                rows_with_candidates += 1
+                samples_with_candidates += 1
             if not candidate_embeds:
                 continue
 
@@ -975,62 +975,62 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             has_pos = bool(positive_mask.any().item())
             has_neg = bool((~positive_mask).any().item())
             if has_pos:
-                rows_with_pos += 1
+                samples_with_pos += 1
             if has_pos and has_neg:
-                rows_with_pos_and_neg += 1
+                samples_with_pos_and_neg += 1
 
             candidate_tensor = torch.stack(candidate_embeds, dim=0)
             text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
-            row_obj = self._compute_roi_candidate_row_objective(
+            image_obj = self._compute_roi_candidate_image_objective(
                 candidate_tensor=candidate_tensor,
                 positive_mask=positive_mask,
                 candidate_source_slots=candidate_source_slots,
-                row_slot_count=int(row_boxes.shape[0]),
+                candidate_slot_count=int(sample_boxes.shape[0]),
                 text_proj=text_proj,
                 temperature=temperature,
                 oof_enabled=oof_enabled,
                 oof_text_projs=oof_text_projs,
                 use_true_oof_frames=use_true_oof_frames,
-                is_true_oof=(roi_gaze_valid is not None and not bool(roi_gaze_valid[row_idx].item())),
+                is_true_oof=(roi_gaze_valid is not None and not bool(roi_gaze_valid[im_idx].item())),
             )
-            if row_obj is None:
+            if image_obj is None:
                 continue
 
-            if bool(row_obj["true_oof_supervised"]):
-                rows_true_oof_supervised += 1
+            if bool(image_obj["true_oof_supervised"]):
+                samples_true_oof_supervised += 1
             preview_buffer.append(
-                row_idx,
-                int(row_obj["pred_candidate_slot"]),
-                row_obj["slot_scores"],
-                oof_scores=row_obj["row_oof_scores"],
+                im_idx,
+                int(image_obj["pred_candidate_slot"]),
+                image_obj["slot_scores"],
+                oof_scores=image_obj["oof_scores"],
             )
-            row_losses.append(row_obj["row_loss"])
-            row_top1.append(row_obj["row_top1"])
+            image_losses.append(image_obj["image_loss"])
+            image_top1.append(image_obj["image_top1"])
             candidate_count_total += int(candidate_tensor.shape[0])
             candidate_text_bank.append(text_proj)
             text_index = len(candidate_text_bank) - 1
-            if bool(row_obj["has_pos"]) and oof_enabled and roi_gaze_valid is not None and bool(roi_gaze_valid[row_idx].item()):
+            if bool(image_obj["has_pos"]) and oof_enabled and roi_gaze_valid is not None and bool(roi_gaze_valid[im_idx].item()):
                 positive_anchor = F.normalize(candidate_tensor[positive_mask].mean(dim=0), dim=-1)
                 candidate_oof_anchors.append(positive_anchor)
                 candidate_oof_targets.append(text_index)
 
-        # Sub-step 3: aggregate row losses, optionally add OOF-anchor term, and write final stats.
-        if row_losses or (oof_enabled and len(candidate_oof_anchors) > 0):
+        # Sub-step 3: aggregate image losses, optionally add OOF-anchor term, and write final stats.
+        if image_losses or (oof_enabled and len(candidate_oof_anchors) > 0):
             stats_device = outputs.loss.device
             nce_loss = (
-                torch.stack(row_losses).mean()
-                if row_losses
+                torch.stack(image_losses).mean()
+                if image_losses
                 else torch.zeros((), device=hidden_last.device, dtype=torch.float32)
             )
             top1_acc = (
-                torch.stack(row_top1).mean()
-                if row_top1
+                torch.stack(image_top1).mean()
+                if image_top1
                 else torch.zeros((), device=hidden_last.device, dtype=torch.float32)
             )
             total_roi_loss = nce_loss
             oof_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
             top1_with_oof = top1_acc
-            oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
+            oof_sample_count = torch.zeros((), device=hidden_last.device, dtype=torch.long)
             if oof_enabled and len(candidate_oof_anchors) > 0 and oof_text_projs is not None:
                 text_bank = torch.cat([torch.stack(candidate_text_bank, dim=0), oof_text_projs], dim=0)
                 anchor_batch = torch.stack(candidate_oof_anchors, dim=0)
@@ -1038,7 +1038,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 oof_logits = (anchor_batch @ text_bank.t()) / temperature
                 oof_loss = F.cross_entropy(oof_logits, targets_oof)
                 top1_with_oof = (oof_logits.argmax(dim=-1) == targets_oof).float().mean()
-                oof_rows = torch.tensor(len(candidate_oof_targets), device=hidden_last.device, dtype=torch.long)
+                oof_sample_count = torch.tensor(len(candidate_oof_targets), device=hidden_last.device, dtype=torch.long)
                 total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
 
             outputs.loss = outputs.loss + outputs.loss.new_tensor(effective_weight) * total_roi_loss.to(
@@ -1046,7 +1046,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dtype=outputs.loss.dtype,
             )
             (
-                preview_row_index_tensor,
+                preview_image_index_tensor,
                 preview_pred_slot_tensor,
                 preview_candidate_slot_score_tensor,
                 preview_oof_score_tensor,
@@ -1057,24 +1057,24 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 "top1_with_oof": top1_with_oof.detach(),
                 "pairs": torch.tensor(candidate_count_total, device=stats_device, dtype=torch.long),
                 "lambda": torch.tensor(effective_weight, device=stats_device, dtype=torch.float32),
-                "preview_row_indices": preview_row_index_tensor,
+                "preview_image_indices": preview_image_index_tensor,
                 "preview_pred_candidate_slots": preview_pred_slot_tensor,
                 "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
                 "preview_oof_scores": preview_oof_score_tensor,
             }
             if oof_enabled:
                 self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
-                self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
+                self._roi_contrastive_stats["oof_samples"] = oof_sample_count.detach().to(device=stats_device, dtype=torch.long)
             if debug_this_step:
                 roi_debug_log(
                     step=self._roi_contrastive_step,
                     debug_steps=debug_steps,
                     message=(
-                        f"candidate_path: rows_total={batch_limit_candidate}, focus={rows_focus_found}, span={rows_span_valid}, "
-                        f"image={rows_image_valid}, has_cands={rows_with_candidates}, has_pos={rows_with_pos}, "
-                        f"has_pos_neg={rows_with_pos_and_neg}, true_oof_rows={rows_true_oof_supervised}, "
-                        f"row_losses={len(row_losses)}, pairs={candidate_count_total}, "
-                        f"oof_rows={int(oof_rows.item())}, nce={float(nce_loss.item()):.6f}, oof={float(oof_loss.item()):.6f}"
+                        f"candidate_path: samples_total={batch_limit_candidate}, focus={samples_focus_found}, span={samples_span_valid}, "
+                        f"images_valid={samples_image_valid}, has_cands={samples_with_candidates}, has_pos={samples_with_pos}, "
+                        f"has_pos_neg={samples_with_pos_and_neg}, true_oof_samples={samples_true_oof_supervised}, "
+                        f"image_losses={len(image_losses)}, pairs={candidate_count_total}, "
+                        f"oof_samples={int(oof_sample_count.item())}, nce={float(nce_loss.item()):.6f}, oof={float(oof_loss.item()):.6f}"
                     ),
                 )
             return True
@@ -1084,10 +1084,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 step=self._roi_contrastive_step,
                 debug_steps=debug_steps,
                 message=(
-                    f"candidate_path_skipped: rows_total={batch_limit_candidate}, focus={rows_focus_found}, span={rows_span_valid}, "
-                    f"image={rows_image_valid}, has_cands={rows_with_candidates}, has_pos={rows_with_pos}, "
-                    f"has_pos_neg={rows_with_pos_and_neg}, true_oof_rows={rows_true_oof_supervised}, "
-                    f"row_losses={len(row_losses)}"
+                    f"candidate_path_skipped: samples_total={batch_limit_candidate}, focus={samples_focus_found}, span={samples_span_valid}, "
+                    f"images_valid={samples_image_valid}, has_cands={samples_with_candidates}, has_pos={samples_with_pos}, "
+                    f"has_pos_neg={samples_with_pos_and_neg}, true_oof_samples={samples_true_oof_supervised}, "
+                    f"image_losses={len(image_losses)}"
                 ),
             )
         return False
@@ -1220,27 +1220,27 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         text_embeddings: List[torch.Tensor] = []
         vision_embeddings: List[torch.Tensor] = []
 
-        for row_idx in range(batch_limit):
-            if not bool(roi_gaze_valid[row_idx].item()):
+        for im_idx in range(batch_limit):
+            if not bool(roi_gaze_valid[im_idx].item()):
                 continue
 
-            focus_start = locate_focus_start_index(labels[row_idx], phrase_sequences)
+            focus_start = locate_focus_start_index(labels[im_idx], phrase_sequences)
             if focus_start is None:
                 continue
-            span_mask = self._build_roi_focus_span_mask(labels[row_idx], focus_start, labels.device)
+            span_mask = self._build_roi_focus_span_mask(labels[im_idx], focus_start, labels.device)
             if not span_mask.any():
                 continue
-            text_embed = hidden_last[row_idx][span_mask].mean(dim=0)
+            text_embed = hidden_last[im_idx][span_mask].mean(dim=0)
 
-            sample_image_features = image_features[row_idx]
+            sample_image_features = image_features[im_idx]
             if not torch.is_tensor(sample_image_features) or sample_image_features.ndim != 2:
                 continue
             grid_side, base_token_count = self._resolve_roi_grid_side(sample_image_features, default_grid_side)
             if base_token_count <= 0:
                 continue
 
-            x_norm = float(torch.clamp(roi_gaze_xy[row_idx][0], 0.0, 1.0).item())
-            y_norm = float(torch.clamp(roi_gaze_xy[row_idx][1], 0.0, 1.0).item())
+            x_norm = float(torch.clamp(roi_gaze_xy[im_idx][0], 0.0, 1.0).item())
+            y_norm = float(torch.clamp(roi_gaze_xy[im_idx][1], 0.0, 1.0).item())
             radius = max(1, int(round(radius_ratio * grid_side)))
             roi_indices = build_circular_roi_patch_indices(x_norm, y_norm, grid_side, radius)
             if not roi_indices:
@@ -1258,7 +1258,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         stats_device = outputs.loss.device
         if pair_count < 1:
             (
-                preview_row_index_tensor,
+                preview_image_index_tensor,
                 preview_pred_slot_tensor,
                 preview_candidate_slot_score_tensor,
                 preview_oof_score_tensor,
@@ -1269,14 +1269,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 "top1_with_oof": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
                 "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
-                "preview_row_indices": preview_row_index_tensor,
+                "preview_image_indices": preview_image_index_tensor,
                 "preview_pred_candidate_slots": preview_pred_slot_tensor,
                 "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
                 "preview_oof_scores": preview_oof_score_tensor,
             }
             if oof_enabled:
                 self._roi_contrastive_stats["oof_loss"] = torch.zeros((), device=stats_device, dtype=torch.float32)
-                self._roi_contrastive_stats["oof_rows"] = torch.zeros((), device=stats_device, dtype=torch.long)
+                self._roi_contrastive_stats["oof_samples"] = torch.zeros((), device=stats_device, dtype=torch.long)
             return outputs
 
         if pair_count < 2 and not self._roi_contrastive_warned_small_pair_count:
@@ -1304,7 +1304,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         total_roi_loss = nce_loss
         oof_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
         top1_with_oof = top1_acc
-        oof_rows = torch.zeros((), device=hidden_last.device, dtype=torch.long)
+        oof_sample_count = torch.zeros((), device=hidden_last.device, dtype=torch.long)
         has_oof_term = False
         if oof_enabled and oof_text_projs is not None:
             text_bank = torch.cat([text_proj, oof_text_projs], dim=0)
@@ -1312,7 +1312,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             oof_targets = torch.arange(pair_count, device=oof_logits.device, dtype=torch.long)
             oof_loss = F.cross_entropy(oof_logits, oof_targets)
             top1_with_oof = (oof_logits.argmax(dim=-1) == oof_targets).float().mean()
-            oof_rows = torch.tensor(pair_count, device=hidden_last.device, dtype=torch.long)
+            oof_sample_count = torch.tensor(pair_count, device=hidden_last.device, dtype=torch.long)
             total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
             has_oof_term = True
 
@@ -1325,7 +1325,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             )
 
         (
-            preview_row_index_tensor,
+            preview_image_index_tensor,
             preview_pred_slot_tensor,
             preview_candidate_slot_score_tensor,
             preview_oof_score_tensor,
@@ -1336,14 +1336,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             "top1_with_oof": top1_with_oof.detach(),
             "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
             "lambda": torch.tensor(lambda_value, device=stats_device, dtype=torch.float32),
-            "preview_row_indices": preview_row_index_tensor,
+            "preview_image_indices": preview_image_index_tensor,
             "preview_pred_candidate_slots": preview_pred_slot_tensor,
             "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
             "preview_oof_scores": preview_oof_score_tensor,
         }
         if oof_enabled:
             self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
-            self._roi_contrastive_stats["oof_rows"] = oof_rows.detach().to(device=stats_device, dtype=torch.long)
+            self._roi_contrastive_stats["oof_samples"] = oof_sample_count.detach().to(device=stats_device, dtype=torch.long)
         if debug_this_step:
             roi_debug_log(
                 step=self._roi_contrastive_step,
@@ -1402,7 +1402,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             mask[:, image_token_indices] = 0.
             # mask[image_token_indices, :] = 0.
 
-        # Modify the last row for specific attention if ids_to_attend is provided
+        # Modify the last query position for specific attention if ids_to_attend is provided
         if ids_to_attend and seq_len > 0:
             last_token_idx = seq_len - 1
             # mask[last_token_idx, :] = float("0")  # Disallow all by default for the last token

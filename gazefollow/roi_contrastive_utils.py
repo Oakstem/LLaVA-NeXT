@@ -27,21 +27,21 @@ class ROIContrastivePreviewBuffer:
 
     def __init__(self, preview_samples: int):
         self.preview_samples = max(1, int(preview_samples))
-        self.row_indices: List[int] = []
+        self.sample_indices: List[int] = []
         self.pred_candidate_slots: List[int] = []
         self.candidate_slot_scores: List[torch.Tensor] = []
         self.oof_scores: List[torch.Tensor] = []
 
     def append(
         self,
-        row_index: int,
+        sample_index: int,
         pred_candidate_slot: int,
         candidate_slot_scores: torch.Tensor,
         oof_scores: Optional[torch.Tensor] = None,
     ) -> None:
-        if len(self.row_indices) >= self.preview_samples:
+        if len(self.sample_indices) >= self.preview_samples:
             return
-        self.row_indices.append(int(row_index))
+        self.sample_indices.append(int(sample_index))
         self.pred_candidate_slots.append(int(pred_candidate_slot))
         if candidate_slot_scores.ndim == 1:
             self.candidate_slot_scores.append(candidate_slot_scores.detach().float())
@@ -53,15 +53,15 @@ class ROIContrastivePreviewBuffer:
             self.oof_scores.append(torch.empty((0,), dtype=torch.float32))
 
     def to_tensors(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        row_index_tensor = torch.full((self.preview_samples,), -1, device=device, dtype=torch.long)
+        sample_index_tensor = torch.full((self.preview_samples,), -1, device=device, dtype=torch.long)
         pred_candidate_slot_tensor = torch.full((self.preview_samples,), -1, device=device, dtype=torch.long)
 
         max_candidate_slots = 0
         for slot_scores in self.candidate_slot_scores:
             max_candidate_slots = max(max_candidate_slots, int(slot_scores.numel()))
         max_oof_scores = 0
-        for row_oof_scores in self.oof_scores:
-            max_oof_scores = max(max_oof_scores, int(row_oof_scores.numel()))
+        for sample_oof_scores in self.oof_scores:
+            max_oof_scores = max(max_oof_scores, int(sample_oof_scores.numel()))
 
         candidate_slot_score_tensor = torch.full(
             (self.preview_samples, max_candidate_slots),
@@ -76,9 +76,9 @@ class ROIContrastivePreviewBuffer:
             dtype=torch.float32,
         )
 
-        limit = min(self.preview_samples, len(self.row_indices))
+        limit = min(self.preview_samples, len(self.sample_indices))
         for idx in range(limit):
-            row_index_tensor[idx] = int(self.row_indices[idx])
+            sample_index_tensor[idx] = int(self.sample_indices[idx])
             pred_candidate_slot_tensor[idx] = int(self.pred_candidate_slots[idx])
             if idx < len(self.candidate_slot_scores):
                 slot_scores = self.candidate_slot_scores[idx]
@@ -87,13 +87,13 @@ class ROIContrastivePreviewBuffer:
                         device=device, dtype=torch.float32
                     )
             if idx < len(self.oof_scores):
-                row_oof_scores = self.oof_scores[idx]
-                if row_oof_scores.numel() > 0:
-                    oof_score_tensor[idx, : int(row_oof_scores.numel())] = row_oof_scores.to(
+                sample_oof_scores = self.oof_scores[idx]
+                if sample_oof_scores.numel() > 0:
+                    oof_score_tensor[idx, : int(sample_oof_scores.numel())] = sample_oof_scores.to(
                         device=device, dtype=torch.float32
                     )
         return (
-            row_index_tensor,
+            sample_index_tensor,
             pred_candidate_slot_tensor,
             candidate_slot_score_tensor,
             oof_score_tensor,
@@ -377,10 +377,10 @@ def _normalize_candidate_bbox(
     return [x1n, y1n, x2n, y2n]
 
 
-def _row_lookup_keys(row: Dict[str, Any]) -> List[str]:
+def _csv_entry_lookup_keys(csv_entry: Dict[str, Any]) -> List[str]:
     keys: List[str] = []
     for key_name in ("sample_id", "image_key", "image_path"):
-        value = row.get(key_name)
+        value = csv_entry.get(key_name)
         if value is None:
             continue
         text = str(value).strip()
@@ -439,12 +439,12 @@ def load_roi_candidate_lookup(
     lookup: Dict[str, Dict[str, Any]] = {}
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        for row in reader:
-            image_width = _safe_float(row.get("gt_width"))
-            image_height = _safe_float(row.get("gt_height"))
+        for csv_entry in reader:
+            image_width = _safe_float(csv_entry.get("gt_width"))
+            image_height = _safe_float(csv_entry.get("gt_height"))
             if image_width is None or image_height is None or image_width <= 0 or image_height <= 0:
                 continue
-            negatives_json = str(row.get("negative_detections_json") or "[]")
+            negatives_json = str(csv_entry.get("negative_detections_json") or "[]")
             try:
                 negatives_raw = json.loads(negatives_json)
             except json.JSONDecodeError:
@@ -453,7 +453,7 @@ def load_roi_candidate_lookup(
                 continue
             negatives_raw = [det for det in negatives_raw if isinstance(det, dict)]
 
-            removed_json = str(row.get("removed_positive_json") or "[]")
+            removed_json = str(csv_entry.get("removed_positive_json") or "[]")
             try:
                 removed_raw = json.loads(removed_json)
             except json.JSONDecodeError:
@@ -464,8 +464,8 @@ def load_roi_candidate_lookup(
 
             negatives_norm: List[List[float]] = []
             seen_neg: set = set()
-            gt_x = _safe_float(row.get("gt_x"))
-            gt_y = _safe_float(row.get("gt_y"))
+            gt_x = _safe_float(csv_entry.get("gt_x"))
+            gt_y = _safe_float(csv_entry.get("gt_y"))
             if (
                 recompute_positives
                 and gt_x is not None
@@ -494,7 +494,7 @@ def load_roi_candidate_lookup(
                 seen_neg.add(key)
                 negatives_norm.append(norm_bbox)
 
-            in_out_raw = row.get("in_out")
+            in_out_raw = csv_entry.get("in_out")
             in_out = None
             if in_out_raw is not None and str(in_out_raw).strip() != "":
                 try:
@@ -512,7 +512,7 @@ def load_roi_candidate_lookup(
                 "gt_height": image_height,
                 "in_out": in_out,
             }
-            for key in _row_lookup_keys(row):
+            for key in _csv_entry_lookup_keys(csv_entry):
                 lookup[key] = entry
     return lookup
 
