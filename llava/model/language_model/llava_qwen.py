@@ -981,6 +981,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
             candidate_tensor = torch.stack(candidate_embeds, dim=0)
             text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
+            is_true_oof = roi_gaze_valid is not None and not bool(roi_gaze_valid[im_idx].item())
             image_obj = self._compute_roi_candidate_image_objective(
                 candidate_tensor=candidate_tensor,
                 positive_mask=positive_mask,
@@ -991,9 +992,42 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 oof_enabled=oof_enabled,
                 oof_text_projs=oof_text_projs,
                 use_true_oof_frames=use_true_oof_frames,
-                is_true_oof=(roi_gaze_valid is not None and not bool(roi_gaze_valid[im_idx].item())),
+                is_true_oof=is_true_oof,
             )
             if image_obj is None:
+                if is_true_oof:
+                    cosine_scores = candidate_tensor @ text_proj
+                    slot_scores = torch.full(
+                        (int(sample_boxes.shape[0]),),
+                        float("nan"),
+                        device=cosine_scores.device,
+                        dtype=torch.float32,
+                    )
+                    for local_candidate_idx, source_slot_idx in enumerate(candidate_source_slots):
+                        slot_scores[int(source_slot_idx)] = torch.clamp(
+                            cosine_scores[local_candidate_idx], min=-1.0, max=1.0
+                        ).detach().float()
+
+                    pred_candidate_slot = -1
+                    if candidate_source_slots and cosine_scores.numel() > 0:
+                        best_candidate_local = int(torch.argmax(cosine_scores).item())
+                        pred_candidate_slot = int(candidate_source_slots[best_candidate_local])
+
+                    oof_scores = None
+                    if oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0:
+                        oof_scores = torch.clamp(oof_text_projs @ text_proj, min=-1.0, max=1.0).detach().float()
+                        if cosine_scores.numel() > 0 and oof_scores.numel() > 0:
+                            best_candidate = float(torch.max(torch.clamp(cosine_scores, min=-1.0, max=1.0)).item())
+                            best_oof = float(torch.max(oof_scores).item())
+                            if best_oof >= best_candidate:
+                                pred_candidate_slot = -1
+
+                    preview_buffer.append(
+                        im_idx,
+                        pred_candidate_slot,
+                        slot_scores,
+                        oof_scores=oof_scores,
+                    )
                 continue
 
             if bool(image_obj["true_oof_supervised"]):

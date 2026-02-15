@@ -142,7 +142,7 @@ def resolve_image_path(sample: Dict[str, Any], images_dir: Path) -> Optional[Pat
             return joined
         if joined.suffix:
             continue
-        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        for ext in (".jpg",):
             alt = joined.with_suffix(ext)
             if alt.exists():
                 return alt

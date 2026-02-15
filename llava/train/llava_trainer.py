@@ -1068,15 +1068,19 @@ class LLaVATrainer(Trainer):
                 if score_val != score_val or score_val in (float("inf"), float("-inf")):
                     continue
                 label = configured_oof_labels[oof_idx] if oof_idx < len(configured_oof_labels) else f"oof_{oof_idx}"
-                color = (255, 255, 255)
-                if gt_is_oof:
+                is_pred_line = pred_is_oof and oof_idx == pred_oof_idx
+                if gt_is_oof and is_pred_line:
+                    color = (255, 165, 0)
+                elif gt_is_oof:
                     color = (0, 255, 80)
-                if pred_is_oof and oof_idx == pred_oof_idx:
+                elif is_pred_line:
                     color = (255, 64, 64)
+                else:
+                    color = (255, 255, 255)
                 tags: List[str] = []
                 if gt_is_oof:
                     tags.append("GT")
-                if pred_is_oof and oof_idx == pred_oof_idx:
+                if is_pred_line:
                     tags.append("pred")
                 line_text = f"OOF[{oof_idx}] {label}:{score_val:.2f}"
                 if tags:
