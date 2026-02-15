@@ -121,6 +121,7 @@ class GazeEvaluationState:
     roi_top1_values: List[float] = field(default_factory=list)
     roi_top1_with_oof_values: List[float] = field(default_factory=list)
     roi_overlay_payload_buffer: List[Dict[str, Any]] = field(default_factory=list)
+    roi_seen_samples: int = 0
 
 
 class JsonConversationDataset:
@@ -1605,14 +1606,45 @@ def main():
             model.config.roi_contrastive_enable = True
             print("Enabled model.config.roi_contrastive_enable for eval ROI preview metrics.")
         model.config.roi_contrastive_use_true_oof_frames = True
+        model.config.roi_contrastive_preview_samples = max(1, int(args.roi_overlay_log_interval))
         if not getattr(model.config, "roi_contrastive_phrase_token_ids", None):
             roi_phrase = str(getattr(model.config, "roi_contrastive_phrase", "looking at") or "looking at")
             roi_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, roi_phrase)
             if roi_phrase_token_ids:
                 model.config.roi_contrastive_phrase_token_ids = roi_phrase_token_ids
                 print(f"Initialized roi_contrastive_phrase_token_ids from phrase '{roi_phrase}'.")
-        if not hasattr(model.config, "roi_contrastive_preview_samples"):
-            model.config.roi_contrastive_preview_samples = max(1, int(args.roi_overlay_log_interval))
+        model.config.roi_contrastive_oof_enable = True
+        configured_oof_text = str(
+            getattr(model.config, "roi_contrastive_oof_text", "looking at someone or something outside the frame")
+            or "looking at someone or something outside the frame"
+        ).strip()
+        extra_oof_raw = str(getattr(model.config, "roi_contrastive_oof_extra_texts", "") or "")
+        oof_phrases: List[str] = []
+        if configured_oof_text:
+            oof_phrases.append(configured_oof_text)
+        if extra_oof_raw:
+            for phrase in extra_oof_raw.split("||"):
+                phrase = phrase.strip()
+                if phrase:
+                    oof_phrases.append(phrase)
+        dedup_oof_phrases: List[str] = []
+        seen_oof_phrase: Set[str] = set()
+        for phrase in oof_phrases:
+            if phrase in seen_oof_phrase:
+                continue
+            seen_oof_phrase.add(phrase)
+            dedup_oof_phrases.append(phrase)
+        oof_token_id_sequences: List[List[int]] = []
+        for phrase in dedup_oof_phrases:
+            token_variants = build_focus_phrase_token_ids(tokenizer, phrase)
+            if token_variants:
+                oof_token_id_sequences.append(token_variants[0])
+        if oof_token_id_sequences:
+            model.config.roi_contrastive_oof_texts = dedup_oof_phrases
+            model.config.roi_contrastive_oof_token_id_sequences = oof_token_id_sequences
+            model.config.roi_contrastive_oof_token_ids = oof_token_id_sequences[0]
+        else:
+            print("Warning: OOF enabled for eval but tokenizer produced no OOF token ids.")
         # Keep evaluation LM loss unchanged while still collecting ROI preview metrics.
         model.config.roi_contrastive_weight = 0.0
 
@@ -1732,7 +1764,7 @@ def main():
         buffer = evaluation_state.roi_overlay_payload_buffer
         if not buffer:
             return
-        if not force and (roi_overlay_log_interval <= 0 or len(buffer) < roi_overlay_log_interval):
+        if not force and len(buffer) < roi_overlay_log_interval:
             return
         wandb_run_instance = ensure_wandb_run()
         if wandb_run_instance is None:
@@ -1760,6 +1792,7 @@ def main():
             roi_overlay_logging_streamed = True
 
     def handle_sample_output(sample_output: EvaluationSampleOutput) -> None:
+        evaluation_state.roi_seen_samples += 1
         process_sample_with_qwen_grounding(
             sample_output,
             args=args,
@@ -1785,7 +1818,8 @@ def main():
                         "step": len(evaluation_state.roi_top1_values),
                     }
                 )
-                flush_roi_overlays()
+        if roi_overlay_log_interval > 0 and evaluation_state.roi_seen_samples % roi_overlay_log_interval == 0:
+            flush_roi_overlays(force=True)
         if generate_model_results:
             flush_generation_rows()
 
