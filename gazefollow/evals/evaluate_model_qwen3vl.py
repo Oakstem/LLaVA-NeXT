@@ -1604,6 +1604,7 @@ def main():
         if not bool(getattr(model.config, "roi_contrastive_enable", False)):
             model.config.roi_contrastive_enable = True
             print("Enabled model.config.roi_contrastive_enable for eval ROI preview metrics.")
+        model.config.roi_contrastive_use_true_oof_frames = True
         if not getattr(model.config, "roi_contrastive_phrase_token_ids", None):
             roi_phrase = str(getattr(model.config, "roi_contrastive_phrase", "looking at") or "looking at")
             roi_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, roi_phrase)
