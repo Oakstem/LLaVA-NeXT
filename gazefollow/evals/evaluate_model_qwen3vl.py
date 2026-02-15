@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 # Ensure project root is importable before local dependencies
@@ -54,6 +54,13 @@ from gazefollow.evals.metric_utils import (
     flatten_recomputed_metrics,
     summarize_metrics,
 )
+from gazefollow.roi_contrastive_utils import (
+    build_roi_candidate_metadata,
+    build_roi_gaze_metadata,
+    find_roi_candidate_entry,
+    load_roi_candidate_lookup,
+)
+from gazefollow.roi_overlay_render import draw_labeled_norm_box, draw_overlay_text_lines
 
 from generation_utils import (
     enable_inference_optimizations,
@@ -99,6 +106,7 @@ class EvaluationSampleOutput:
     image_size: Tuple[int, int]
     loss: Optional[float]
     predicted_in_out: Optional[int] = None
+    roi_eval: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -110,6 +118,9 @@ class GazeEvaluationState:
     dataset_updated: bool = False
     combined_cache: Optional[Dict[str, Dict[str, str]]] = None
     generation_rows_buffer: List[Dict[str, Any]] = field(default_factory=list)
+    roi_top1_values: List[float] = field(default_factory=list)
+    roi_top1_with_oof_values: List[float] = field(default_factory=list)
+    roi_overlay_payload_buffer: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class JsonConversationDataset:
@@ -225,6 +236,36 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_TRAIN_CSV,
         help="Optional CSV file that provides precomputed in/out labels (via add_in_out_labels.py).",
+    )
+    parser.add_argument(
+        "--roi-negatives-csv",
+        type=str,
+        default=None,
+        help="Optional ROI negatives CSV (e.g. stage1b negatives) used to compute ROI/OOF top1 preview metrics.",
+    )
+    parser.add_argument(
+        "--roi-max-positives",
+        type=int,
+        default=1,
+        help="Maximum positive ROI candidates per sample when building eval ROI metadata.",
+    )
+    parser.add_argument(
+        "--roi-max-negatives",
+        type=int,
+        default=8,
+        help="Maximum negative ROI candidates per sample when building eval ROI metadata.",
+    )
+    parser.add_argument(
+        "--roi-positive-radius-ratio",
+        type=float,
+        default=0.08,
+        help="Radius ratio around GT gaze point used for eval ROI positive box construction.",
+    )
+    parser.add_argument(
+        "--roi-overlay-log-interval",
+        type=int,
+        default=25,
+        help="Number of ROI preview samples between wandb overlay logs (<=0 disables periodic ROI overlay logging).",
     )
     parser.add_argument("--disable-optimizations", action="store_true", help="Skip enabling CUDA optimizations.")
     parser.add_argument("--verbose", action="store_true", default=True, help="Print detailed progress information.")
@@ -409,6 +450,214 @@ def select_best_qwen_detection(
     return detections_list[0] if detections_list else None
 
 
+def _build_single_sample_roi_payload(
+    sample: Dict[str, Any],
+    roi_candidate_lookup: Dict[str, Dict[str, Any]],
+    roi_max_positives: int,
+    roi_max_negatives: int,
+    roi_positive_radius_ratio: float,
+) -> Optional[Dict[str, torch.Tensor]]:
+    if not roi_candidate_lookup:
+        return None
+    roi_candidate_slots = max(0, int(roi_max_positives)) + max(0, int(roi_max_negatives))
+    if roi_candidate_slots <= 0:
+        return None
+
+    roi_entry = find_roi_candidate_entry(sample, roi_candidate_lookup)
+    roi_gaze_xy, roi_gaze_valid = build_roi_gaze_metadata(sample, roi_entry=roi_entry)
+    roi_boxes, roi_is_positive, roi_valid = build_roi_candidate_metadata(
+        sample_dict=sample,
+        roi_candidate_lookup=roi_candidate_lookup,
+        roi_max_positives=max(0, int(roi_max_positives)),
+        roi_max_negatives=max(0, int(roi_max_negatives)),
+        roi_candidate_slots=roi_candidate_slots,
+        roi_positive_radius_ratio=float(roi_positive_radius_ratio),
+        roi_entry=roi_entry,
+    )
+    if int(roi_valid.sum().item()) <= 0:
+        return None
+
+    return {
+        "roi_gaze_xy": roi_gaze_xy,
+        "roi_gaze_valid": roi_gaze_valid.bool(),
+        "roi_candidate_boxes": roi_boxes,
+        "roi_candidate_is_positive": roi_is_positive.bool(),
+        "roi_candidate_valid": roi_valid.bool(),
+    }
+
+
+def _extract_single_sample_roi_eval(
+    roi_stats: Optional[Dict[str, Any]],
+    roi_payload: Dict[str, torch.Tensor],
+) -> Optional[Dict[str, Any]]:
+    if not roi_stats:
+        return None
+    top1 = roi_stats.get("top1")
+    top1_with_oof = roi_stats.get("top1_with_oof")
+    preview_image_indices = roi_stats.get("preview_image_indices")
+    preview_pred_candidate_slots = roi_stats.get("preview_pred_candidate_slots")
+    preview_candidate_slot_scores = roi_stats.get("preview_candidate_slot_scores")
+    preview_oof_scores = roi_stats.get("preview_oof_scores")
+
+    if not torch.is_tensor(top1) or not torch.is_tensor(top1_with_oof):
+        return None
+    if not torch.is_tensor(preview_image_indices) or not torch.is_tensor(preview_pred_candidate_slots):
+        return None
+
+    selected_preview_idx = -1
+    limit = min(int(preview_image_indices.shape[0]), int(preview_pred_candidate_slots.shape[0]))
+    for local_idx in range(limit):
+        if int(preview_image_indices[local_idx].item()) >= 0:
+            selected_preview_idx = local_idx
+            break
+    if selected_preview_idx < 0:
+        return None
+
+    pred_candidate_slot = int(preview_pred_candidate_slots[selected_preview_idx].item())
+    candidate_slot_scores: List[float] = []
+    if torch.is_tensor(preview_candidate_slot_scores) and selected_preview_idx < int(preview_candidate_slot_scores.shape[0]):
+        row = preview_candidate_slot_scores[selected_preview_idx]
+        candidate_slot_scores = [float(val) for val in row.detach().cpu().tolist()]
+
+    oof_scores: List[float] = []
+    if torch.is_tensor(preview_oof_scores) and selected_preview_idx < int(preview_oof_scores.shape[0]):
+        row = preview_oof_scores[selected_preview_idx]
+        oof_scores = [float(val) for val in row.detach().cpu().tolist()]
+
+    roi_boxes = roi_payload["roi_candidate_boxes"].detach().cpu().tolist()
+    roi_pos = [bool(v) for v in roi_payload["roi_candidate_is_positive"].detach().cpu().tolist()]
+    roi_valid = [bool(v) for v in roi_payload["roi_candidate_valid"].detach().cpu().tolist()]
+    roi_gaze_xy = [float(v) for v in roi_payload["roi_gaze_xy"].detach().cpu().tolist()]
+    roi_gaze_valid = bool(roi_payload["roi_gaze_valid"].item())
+
+    return {
+        "top1": float(top1.detach().float().item()),
+        "top1_with_oof": float(top1_with_oof.detach().float().item()),
+        "pred_candidate_slot": pred_candidate_slot,
+        "candidate_slot_scores": candidate_slot_scores,
+        "oof_scores": oof_scores,
+        "roi_candidate_boxes": roi_boxes,
+        "roi_candidate_is_positive": roi_pos,
+        "roi_candidate_valid": roi_valid,
+        "roi_gaze_xy": roi_gaze_xy,
+        "roi_gaze_valid": roi_gaze_valid,
+    }
+
+
+def _build_roi_overlay_wandb_image(
+    *,
+    sample_output: EvaluationSampleOutput,
+    roi_eval: Dict[str, Any],
+    configured_oof_labels: List[str],
+    wandb_module: Any,
+    global_step: int,
+) -> Optional[Any]:
+    try:
+        image = Image.open(sample_output.image_path).convert("RGB")
+    except Exception:
+        return None
+
+    draw = ImageDraw.Draw(image)
+    image_w, image_h = image.size
+    boxes = roi_eval.get("roi_candidate_boxes", [])
+    positives = roi_eval.get("roi_candidate_is_positive", [])
+    valids = roi_eval.get("roi_candidate_valid", [])
+    pred_slot = int(roi_eval.get("pred_candidate_slot", -1))
+    slot_scores = roi_eval.get("candidate_slot_scores", [])
+
+    for cand_idx, box_vals in enumerate(boxes):
+        if cand_idx >= len(valids) or not bool(valids[cand_idx]):
+            continue
+        if not isinstance(box_vals, list) or len(box_vals) != 4:
+            continue
+        box_tensor = torch.tensor(box_vals, dtype=torch.float32)
+        is_gt = cand_idx < len(positives) and bool(positives[cand_idx])
+        is_pred = pred_slot >= 0 and cand_idx == pred_slot
+        if is_pred:
+            color = (255, 64, 64)
+            line_width = 4
+        elif is_gt:
+            color = (0, 255, 80)
+            line_width = 3
+        else:
+            color = (255, 214, 10)
+            line_width = 2
+        label_parts = [f"cand_{cand_idx}"]
+        if cand_idx < len(slot_scores):
+            score_val = float(slot_scores[cand_idx])
+            if math.isfinite(score_val):
+                label_parts.append(f"s={score_val:.3f}")
+        if is_gt:
+            label_parts.append("GT")
+        if is_pred:
+            label_parts.append("pred")
+        draw_labeled_norm_box(
+            draw,
+            box_tensor,
+            image_w,
+            image_h,
+            color=color,
+            width=line_width,
+            label="|".join(label_parts),
+        )
+
+    gaze_xy = roi_eval.get("roi_gaze_xy")
+    gaze_valid = bool(roi_eval.get("roi_gaze_valid", False))
+    if isinstance(gaze_xy, list) and len(gaze_xy) == 2 and gaze_valid:
+        gx = int(max(0, min(image_w - 1, round(float(gaze_xy[0]) * image_w))))
+        gy = int(max(0, min(image_h - 1, round(float(gaze_xy[1]) * image_h))))
+        r = 6
+        draw.ellipse([gx - r, gy - r, gx + r, gy + r], outline=(0, 255, 255), width=3)
+
+    gt_is_oof = not gaze_valid
+    oof_scores = roi_eval.get("oof_scores", [])
+    pred_is_oof = pred_slot < 0 and len(oof_scores) > 0
+    pred_oof_idx = -1
+    if pred_is_oof:
+        best_score = float("-inf")
+        for oof_idx, raw_score in enumerate(oof_scores):
+            score_val = float(raw_score)
+            if not math.isfinite(score_val):
+                continue
+            if score_val > best_score:
+                best_score = score_val
+                pred_oof_idx = oof_idx
+
+    oof_lines: List[Dict[str, Any]] = []
+    for oof_idx, raw_score in enumerate(oof_scores):
+        score_val = float(raw_score)
+        if not math.isfinite(score_val):
+            continue
+        label = configured_oof_labels[oof_idx] if oof_idx < len(configured_oof_labels) else f"oof_{oof_idx}"
+        is_pred_line = pred_is_oof and oof_idx == pred_oof_idx
+        if gt_is_oof and is_pred_line:
+            color = (255, 165, 0)
+        elif gt_is_oof:
+            color = (0, 255, 80)
+        elif is_pred_line:
+            color = (255, 64, 64)
+        else:
+            color = (255, 255, 255)
+        tags: List[str] = []
+        if gt_is_oof:
+            tags.append("GT")
+        if is_pred_line:
+            tags.append("pred")
+        line_text = f"OOF[{oof_idx}] {label}:{score_val:.2f}"
+        if tags:
+            line_text += f" ({','.join(tags)})"
+        oof_lines.append({"text": line_text, "color": color})
+    draw_overlay_text_lines(draw, oof_lines, text_x=8, text_y=8)
+
+    caption = (
+        f"step={global_step} sample={sample_output.sample_id} "
+        f"top1={float(roi_eval.get('top1', 0.0)):.3f} "
+        f"top1_with_oof={float(roi_eval.get('top1_with_oof', 0.0)):.3f} "
+        f"pred_slot={pred_slot}"
+    )
+    return wandb_module.Image(image, caption=caption)
+
+
 def process_sample_with_qwen_grounding(
     output: EvaluationSampleOutput,
     *,
@@ -512,6 +761,10 @@ def process_sample_with_qwen_grounding(
         }
     if gt_in_out_value is not None:
         prediction_entry["gt_in_out"] = gt_in_out_value
+    if output.roi_eval is not None:
+        prediction_entry["roi_top1"] = output.roi_eval.get("top1")
+        prediction_entry["roi_top1_with_oof"] = output.roi_eval.get("top1_with_oof")
+        prediction_entry["roi_pred_candidate_slot"] = output.roi_eval.get("pred_candidate_slot")
     state.predictions_output.append(prediction_entry)
 
     if generate_model_results:
@@ -632,6 +885,10 @@ def process_sample_with_qwen_grounding(
             }
         if gt_in_out_value is not None:
             model_entry["gt_in_out"] = gt_in_out_value
+        if output.roi_eval is not None:
+            model_entry["roi_top1"] = output.roi_eval.get("top1")
+            model_entry["roi_top1_with_oof"] = output.roi_eval.get("top1_with_oof")
+            model_entry["roi_pred_candidate_slot"] = output.roi_eval.get("pred_candidate_slot")
         state.model_generation_records.append(model_entry)
         new_rows = format_generation_sample(model_entry)
         if new_rows:
@@ -682,7 +939,8 @@ def compute_ground_truth_loss(
     focus_loss_after_phrase: bool = False,
     focus_loss_phrase_token_ids: Optional[List[List[int]]] = None,
     focus_loss_missing_value: Optional[float] = None,
-) -> Optional[float]:
+    roi_payload: Optional[Dict[str, torch.Tensor]] = None,
+) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
     """Teacher-force the ground truth response to compute language modeling loss."""
     conv = conv_templates[conv_template].copy()
     conv.tokenizer = tokenizer
@@ -752,14 +1010,41 @@ def compute_ground_truth_loss(
         if focus_loss_missing_value is not None:
             model_kwargs["focus_loss_missing_value"] = focus_loss_missing_value
 
-    with torch.no_grad():
-        outputs = model(**model_kwargs)
+    roi_eval: Optional[Dict[str, Any]] = None
+    train_mode_changed = False
+    if roi_payload is not None:
+        model_kwargs.update(
+            {
+                "roi_gaze_xy": roi_payload["roi_gaze_xy"].unsqueeze(0).to(model.device, dtype=torch.float32),
+                "roi_gaze_valid": roi_payload["roi_gaze_valid"].unsqueeze(0).to(model.device).bool(),
+                "roi_candidate_boxes": roi_payload["roi_candidate_boxes"].unsqueeze(0).to(model.device, dtype=torch.float32),
+                "roi_candidate_is_positive": roi_payload["roi_candidate_is_positive"].unsqueeze(0).to(model.device).bool(),
+                "roi_candidate_valid": roi_payload["roi_candidate_valid"].unsqueeze(0).to(model.device).bool(),
+            }
+        )
+
+    if roi_payload is not None and not model.training:
+        model.train()
+        train_mode_changed = True
+    try:
+        with torch.no_grad():
+            outputs = model(**model_kwargs)
+    finally:
+        if train_mode_changed:
+            model.eval()
+
+    if roi_payload is not None:
+        pop_stats_fn = getattr(model, "pop_roi_contrastive_stats", None)
+        if not callable(pop_stats_fn) and hasattr(model, "module"):
+            pop_stats_fn = getattr(model.module, "pop_roi_contrastive_stats", None)
+        if callable(pop_stats_fn):
+            roi_eval = _extract_single_sample_roi_eval(pop_stats_fn(), roi_payload)
 
     loss_tensor = getattr(outputs, "loss", None)
     if loss_tensor is None:
-        return None
+        return None, roi_eval
 
-    return loss_tensor.detach().to("cpu", dtype=torch.float32).item()
+    return loss_tensor.detach().to("cpu", dtype=torch.float32).item(), roi_eval
 
 
 def generate_response(
@@ -963,6 +1248,10 @@ def evaluate_dataset_for_training(
     generation_params: Optional[Dict[str, Any]] = None,
     return_outputs: bool = False,
     qwen_grounding: Optional[Callable[[EvaluationSampleOutput], None]] = None,
+    roi_candidate_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+    roi_max_positives: int = 1,
+    roi_max_negatives: int = 8,
+    roi_positive_radius_ratio: float = 0.08,
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], List[EvaluationSampleOutput], List[Dict[str, Any]]]]:
     """
     Custom evaluation function for training-time evaluation.
@@ -1115,8 +1404,18 @@ def evaluate_dataset_for_training(
             predicted_in_out = infer_predicted_in_out(prediction)
 
             sample_loss: Optional[float] = None
+            roi_eval: Optional[Dict[str, Any]] = None
+            roi_payload = None
+            if roi_candidate_lookup:
+                roi_payload = _build_single_sample_roi_payload(
+                    sample=sample,
+                    roi_candidate_lookup=roi_candidate_lookup,
+                    roi_max_positives=roi_max_positives,
+                    roi_max_negatives=roi_max_negatives,
+                    roi_positive_radius_ratio=roi_positive_radius_ratio,
+                )
             if not no_loss:
-                loss = compute_ground_truth_loss(
+                loss, roi_eval = compute_ground_truth_loss(
                     prompt_text=prompt_used,
                     ground_truth=ground_truth,
                     tokenizer=tokenizer,
@@ -1127,6 +1426,7 @@ def evaluate_dataset_for_training(
                     focus_loss_after_phrase=focus_loss_after_looking,
                     focus_loss_phrase_token_ids=focus_phrase_token_ids or None,
                     focus_loss_missing_value=focus_loss_threshold,
+                    roi_payload=roi_payload,
                 )
                 if loss is not None and math.isfinite(loss):
                     losses.append(loss)
@@ -1146,6 +1446,7 @@ def evaluate_dataset_for_training(
                     image_size=image_size,
                     loss=sample_loss,
                     predicted_in_out=predicted_in_out,
+                    roi_eval=roi_eval,
                 )
                 if return_outputs:
                     successful_outputs.append(sample_output)
@@ -1237,8 +1538,10 @@ def main():
         args.in_out_labels_csv = 'gazefollow/data/test2_combined_description_results.csv'
 
     table_log_interval = max(args.table_log_interval, 0)
+    roi_overlay_log_interval = max(args.roi_overlay_log_interval, 0)
     progress_log_path = Path(args.table_log_file) if args.table_log_file else output_dir / "generation_progress.jsonl"
     table_logging_streamed = False
+    roi_overlay_logging_streamed = False
     wandb_module = None
     wandb_run = None
     wandb_disabled_reason: Optional[str] = None
@@ -1274,10 +1577,16 @@ def main():
         "generation_kwargs": generation_kwargs,
         "limit": args.limit,
         "table_log_interval": table_log_interval,
+        "roi_overlay_log_interval": roi_overlay_log_interval,
         "table_log_file": str(progress_log_path),
     }
     if args.in_out_labels_csv:
         base_wandb_config["in_out_labels_csv"] = args.in_out_labels_csv
+    if args.roi_negatives_csv:
+        base_wandb_config["roi_negatives_csv"] = args.roi_negatives_csv
+        base_wandb_config["roi_max_positives"] = args.roi_max_positives
+        base_wandb_config["roi_max_negatives"] = args.roi_max_negatives
+        base_wandb_config["roi_positive_radius_ratio"] = args.roi_positive_radius_ratio
 
     if args.focus_loss_after_looking:
         focus_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, args.focus_loss_phrase)
@@ -1290,6 +1599,10 @@ def main():
             model.config.focus_loss_after_phrase = True
             model.config.focus_loss_phrase_token_ids = focus_phrase_token_ids
             model.config.focus_loss_missing_value = args.focus_loss_threshold
+
+    if args.roi_negatives_csv and not bool(getattr(model.config, "roi_contrastive_enable", False)):
+        model.config.roi_contrastive_enable = True
+        print("Enabled model.config.roi_contrastive_enable for eval ROI preview metrics.")
 
     print("\n2. Loading dataset...")
     dataset_samples = load_dataset(args.dataset_json, args.limit)
@@ -1306,6 +1619,14 @@ def main():
         in_out_lookup = load_in_out_lookup(Path(args.in_out_labels_csv))
         if args.verbose:
             print(f"Loaded in/out labels from {args.in_out_labels_csv} (entries={len(in_out_lookup)})")
+
+    roi_candidate_lookup: Dict[str, Dict[str, Any]] = {}
+    if args.roi_negatives_csv:
+        roi_candidate_lookup = load_roi_candidate_lookup(Path(args.roi_negatives_csv))
+        print(
+            f"Loaded ROI negatives from {args.roi_negatives_csv} "
+            f"(keys={len(roi_candidate_lookup)}, slots={max(0, args.roi_max_positives) + max(0, args.roi_max_negatives)})"
+        )
 
 
     gaze_device_map = args.gaze_device or "auto"
@@ -1388,6 +1709,44 @@ def main():
             wandb_run_instance.log({"generation_results": table}, commit=False)
             table_logging_streamed = True
 
+    configured_oof_labels = list(getattr(getattr(model, "config", None), "roi_contrastive_oof_texts", []) or [])
+
+    def flush_roi_overlays(force: bool = False) -> None:
+        nonlocal roi_overlay_logging_streamed
+        if roi_overlay_log_interval <= 0:
+            if force:
+                evaluation_state.roi_overlay_payload_buffer.clear()
+            return
+        buffer = evaluation_state.roi_overlay_payload_buffer
+        if not buffer:
+            return
+        if not force and (roi_overlay_log_interval <= 0 or len(buffer) < roi_overlay_log_interval):
+            return
+        wandb_run_instance = ensure_wandb_run()
+        if wandb_run_instance is None:
+            buffer.clear()
+            return
+        overlays: List[Any] = []
+        for payload in buffer:
+            sample_output = payload.get("sample_output")
+            roi_eval_payload = payload.get("roi_eval")
+            global_step = int(payload.get("step", 0))
+            if not isinstance(sample_output, EvaluationSampleOutput) or not isinstance(roi_eval_payload, dict):
+                continue
+            overlay = _build_roi_overlay_wandb_image(
+                sample_output=sample_output,
+                roi_eval=roi_eval_payload,
+                configured_oof_labels=configured_oof_labels,
+                wandb_module=wandb_module,
+                global_step=global_step,
+            )
+            if overlay is not None:
+                overlays.append(overlay)
+        buffer.clear()
+        if overlays:
+            wandb_run_instance.log({"roi_contrastive/preview_overlays": overlays}, commit=False)
+            roi_overlay_logging_streamed = True
+
     def handle_sample_output(sample_output: EvaluationSampleOutput) -> None:
         process_sample_with_qwen_grounding(
             sample_output,
@@ -1399,6 +1758,22 @@ def main():
             generate_model_results=generate_model_results,
             gaze_device_map=gaze_device_map,
         )
+        if sample_output.roi_eval is not None:
+            top1 = sample_output.roi_eval.get("top1")
+            top1_with_oof = sample_output.roi_eval.get("top1_with_oof")
+            if isinstance(top1, (int, float)) and math.isfinite(float(top1)):
+                evaluation_state.roi_top1_values.append(float(top1))
+            if isinstance(top1_with_oof, (int, float)) and math.isfinite(float(top1_with_oof)):
+                evaluation_state.roi_top1_with_oof_values.append(float(top1_with_oof))
+            if roi_overlay_log_interval > 0:
+                evaluation_state.roi_overlay_payload_buffer.append(
+                    {
+                        "sample_output": sample_output,
+                        "roi_eval": sample_output.roi_eval,
+                        "step": len(evaluation_state.roi_top1_values),
+                    }
+                )
+                flush_roi_overlays()
         if generate_model_results:
             flush_generation_rows()
 
@@ -1421,6 +1796,10 @@ def main():
         generation_params=generation_kwargs,
         return_outputs=True,
         qwen_grounding=handle_sample_output,
+        roi_candidate_lookup=roi_candidate_lookup,
+        roi_max_positives=args.roi_max_positives,
+        roi_max_negatives=args.roi_max_negatives,
+        roi_positive_radius_ratio=args.roi_positive_radius_ratio,
     )
     evaluation_time = time.time() - start_time
 
@@ -1458,6 +1837,14 @@ def main():
                 "samples_with_loss": len(loss_values),
             }
         )
+    if evaluation_state.roi_top1_values:
+        final_metrics["roi_contrastive/top1"] = sum(evaluation_state.roi_top1_values) / len(evaluation_state.roi_top1_values)
+        final_metrics["roi_contrastive/top1_samples"] = len(evaluation_state.roi_top1_values)
+    if evaluation_state.roi_top1_with_oof_values:
+        roi_oof_top1 = sum(evaluation_state.roi_top1_with_oof_values) / len(evaluation_state.roi_top1_with_oof_values)
+        final_metrics["roi_contrastive/top1_with_oof"] = roi_oof_top1
+        final_metrics["roi_contrastive/oof_top1"] = roi_oof_top1
+        final_metrics["roi_contrastive/top1_with_oof_samples"] = len(evaluation_state.roi_top1_with_oof_values)
 
     if generate_model_results:
         final_metrics["model_generation_samples"] = len(model_generation_records)
@@ -1505,6 +1892,10 @@ def main():
     if loss_values:
         print(f"  Average loss: {final_metrics['average_loss']:.6f}")
         print(f"  Loss range: {min(loss_values):.6f} - {max(loss_values):.6f}")
+    if evaluation_state.roi_top1_values:
+        print(f"  ROI top1: {final_metrics['roi_contrastive/top1']:.4f}")
+    if evaluation_state.roi_top1_with_oof_values:
+        print(f"  ROI top1_with_oof: {final_metrics['roi_contrastive/top1_with_oof']:.4f}")
     if metric_summary:
         l2_block = (metric_summary.get("gaze_metrics") or {}).get("gaze_l2_error") or {}
         l2_mean = l2_block.get("mean")
@@ -1567,12 +1958,19 @@ def main():
     if args.in_out_labels_csv:
         config["in_out_labels_csv"] = args.in_out_labels_csv
     config["table_log_interval"] = table_log_interval
+    config["roi_overlay_log_interval"] = roi_overlay_log_interval
     config["table_log_file"] = str(progress_log_path)
+    if args.roi_negatives_csv:
+        config["roi_negatives_csv"] = args.roi_negatives_csv
+        config["roi_max_positives"] = args.roi_max_positives
+        config["roi_max_negatives"] = args.roi_max_negatives
+        config["roi_positive_radius_ratio"] = args.roi_positive_radius_ratio
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     print(f"Evaluation configuration saved to: {config_file}")
 
     flush_generation_rows(force=True)
+    flush_roi_overlays(force=True)
 
     if missing_in_out_samples:
         print(f"\n⚠️  Missing in_out labels for {len(missing_in_out_samples)} samples.")
@@ -1618,6 +2016,8 @@ def main():
                                 table.add_data(*(row.get(column) for column in GENERATION_TABLE_COLUMNS))
                             wandb_run_instance.log({"generation_results": table}, commit=False)
                             table_logging_streamed = True
+                    if not roi_overlay_logging_streamed:
+                        flush_roi_overlays(force=True)
                     wandb_logged = True
                 finally:
                     try:

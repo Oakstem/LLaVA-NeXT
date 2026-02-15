@@ -59,6 +59,13 @@ GAZE_MAX_NEW_TOKENS="${GAZE_MAX_NEW_TOKENS:-192}"
 GAZE_TEMPERATURE="${GAZE_TEMPERATURE:-0.0}"
 GAZE_IOU_RADIUS_RATIO="${GAZE_IOU_RADIUS_RATIO:-0.05}"
 
+# ROI preview eval options (used only when ROI_NEGATIVES_CSV is provided)
+ROI_NEGATIVES_CSV="${ROI_NEGATIVES_CSV:-}"
+ROI_MAX_POSITIVES="${ROI_MAX_POSITIVES:-1}"
+ROI_MAX_NEGATIVES="${ROI_MAX_NEGATIVES:-8}"
+ROI_POSITIVE_RADIUS_RATIO="${ROI_POSITIVE_RADIUS_RATIO:-0.08}"
+ROI_OVERLAY_LOG_INTERVAL="${ROI_OVERLAY_LOG_INTERVAL:-25}"
+
 # Run selection
 RUN_SELECTION_LIMIT="${RUN_SELECTION_LIMIT:-10}"
 CHECKPOINT_STEP="${CHECKPOINT_STEP:-9000}"
@@ -164,6 +171,14 @@ ARGS+=("--gaze-iou-radius-ratio" "$GAZE_IOU_RADIUS_RATIO")
 
 if [ -n "$GAZE_DEVICE" ]; then
     ARGS+=("--gaze-device" "$GAZE_DEVICE")
+fi
+
+if [ -n "$ROI_NEGATIVES_CSV" ]; then
+    ARGS+=("--roi-negatives-csv" "$ROI_NEGATIVES_CSV")
+    ARGS+=("--roi-max-positives" "$ROI_MAX_POSITIVES")
+    ARGS+=("--roi-max-negatives" "$ROI_MAX_NEGATIVES")
+    ARGS+=("--roi-positive-radius-ratio" "$ROI_POSITIVE_RADIUS_RATIO")
+    ARGS+=("--roi-overlay-log-interval" "$ROI_OVERLAY_LOG_INTERVAL")
 fi
 
 if [ "$WANDB" = "true" ]; then
