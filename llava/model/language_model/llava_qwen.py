@@ -732,7 +732,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             if oof_hidden.ndim != 3 or oof_hidden.shape[1] == 0:
                 continue
             oof_text_embed = oof_hidden[0].mean(dim=0)
-            oof_proj = F.normalize(self.roi_text_projector(oof_text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
+            text_proj_dtype = self.roi_text_projector.weight.dtype
+            text_proj_device = self.roi_text_projector.weight.device
+            oof_proj = F.normalize(
+                self.roi_text_projector(
+                    oof_text_embed.to(device=text_proj_device, dtype=text_proj_dtype).unsqueeze(0)
+                ),
+                dim=-1,
+            ).squeeze(0)
             oof_proj_list.append(oof_proj.to(device=device))
 
         if not oof_proj_list:
@@ -792,7 +799,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 continue
 
             vision_embed = sample_image_features.index_select(0, bbox_indices_tensor).mean(dim=0)
-            vision_proj = self.roi_vision_projector(vision_embed.float().unsqueeze(0)).squeeze(0)
+            vision_proj_dtype = self.roi_vision_projector.weight.dtype
+            vision_proj_device = self.roi_vision_projector.weight.device
+            vision_proj = self.roi_vision_projector(
+                vision_embed.to(device=vision_proj_device, dtype=vision_proj_dtype).unsqueeze(0)
+            ).squeeze(0)
             pos_vector = build_roi_position_vector(x1, y1, x2, y2)
             pos_tensor = torch.tensor(pos_vector, device=vision_proj.device, dtype=vision_proj.dtype).unsqueeze(0)
             pos_proj = self.roi_position_mlp(pos_tensor).squeeze(0)
@@ -980,7 +991,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 samples_with_pos_and_neg += 1
 
             candidate_tensor = torch.stack(candidate_embeds, dim=0)
-            text_proj = F.normalize(self.roi_text_projector(text_embed.float().unsqueeze(0)), dim=-1).squeeze(0)
+            text_proj_dtype = self.roi_text_projector.weight.dtype
+            text_proj_device = self.roi_text_projector.weight.device
+            text_proj = F.normalize(
+                self.roi_text_projector(text_embed.to(device=text_proj_device, dtype=text_proj_dtype).unsqueeze(0)),
+                dim=-1,
+            ).squeeze(0)
             is_true_oof = roi_gaze_valid is not None and not bool(roi_gaze_valid[im_idx].item())
             image_obj = self._compute_roi_candidate_image_objective(
                 candidate_tensor=candidate_tensor,
@@ -1323,8 +1339,24 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
         text_batch = torch.stack(text_embeddings, dim=0)
         vision_batch = torch.stack(vision_embeddings, dim=0)
-        text_proj = F.normalize(self.roi_text_projector(text_batch.float()), dim=-1)
-        vision_proj = F.normalize(self.roi_vision_projector(vision_batch.float()), dim=-1)
+        text_proj = F.normalize(
+            self.roi_text_projector(
+                text_batch.to(
+                    device=self.roi_text_projector.weight.device,
+                    dtype=self.roi_text_projector.weight.dtype,
+                )
+            ),
+            dim=-1,
+        )
+        vision_proj = F.normalize(
+            self.roi_vision_projector(
+                vision_batch.to(
+                    device=self.roi_vision_projector.weight.device,
+                    dtype=self.roi_vision_projector.weight.dtype,
+                )
+            ),
+            dim=-1,
+        )
         similarity = (vision_proj @ text_proj.t()) / temperature
         nce_loss = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
         top1_acc = torch.zeros((), device=hidden_last.device, dtype=torch.float32)
