@@ -1600,9 +1600,20 @@ def main():
             model.config.focus_loss_phrase_token_ids = focus_phrase_token_ids
             model.config.focus_loss_missing_value = args.focus_loss_threshold
 
-    if args.roi_negatives_csv and not bool(getattr(model.config, "roi_contrastive_enable", False)):
-        model.config.roi_contrastive_enable = True
-        print("Enabled model.config.roi_contrastive_enable for eval ROI preview metrics.")
+    if args.roi_negatives_csv:
+        if not bool(getattr(model.config, "roi_contrastive_enable", False)):
+            model.config.roi_contrastive_enable = True
+            print("Enabled model.config.roi_contrastive_enable for eval ROI preview metrics.")
+        if not getattr(model.config, "roi_contrastive_phrase_token_ids", None):
+            roi_phrase = str(getattr(model.config, "roi_contrastive_phrase", "looking at") or "looking at")
+            roi_phrase_token_ids = build_focus_phrase_token_ids(tokenizer, roi_phrase)
+            if roi_phrase_token_ids:
+                model.config.roi_contrastive_phrase_token_ids = roi_phrase_token_ids
+                print(f"Initialized roi_contrastive_phrase_token_ids from phrase '{roi_phrase}'.")
+        if not hasattr(model.config, "roi_contrastive_preview_samples"):
+            model.config.roi_contrastive_preview_samples = max(1, int(args.roi_overlay_log_interval))
+        # Keep evaluation LM loss unchanged while still collecting ROI preview metrics.
+        model.config.roi_contrastive_weight = 0.0
 
     print("\n2. Loading dataset...")
     dataset_samples = load_dataset(args.dataset_json, args.limit)
