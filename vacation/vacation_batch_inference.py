@@ -504,39 +504,48 @@ def run_inference_on_frame(
     prompt: str,
     args: argparse.Namespace,
     conv_name: str,
+    include_image: bool = True,
 ) -> str:
     """Run inference on a single frame, return the response."""
-    # Prepare image
-    image_tensor, image_size = prepare_image_tensor(str(frame_path), image_processor, model)
+    image_tensor = None
+    image_size = None
+    if include_image:
+        image_tensor, image_size = prepare_image_tensor(str(frame_path), image_processor, model)
     
     # Build conversation
     conv = conv_templates[conv_name].copy()
     conv.tokenizer = tokenizer
     
-    # Add image token to prompt
-    user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt}"
+    # Add image token only when visual input is enabled
+    user_content = f"{DEFAULT_IMAGE_TOKEN}\n{prompt}" if include_image else prompt
     conv.append_message(conv.roles[0], user_content)
     conv.append_message(conv.roles[1], None)
     prompt_for_tokenizer = conv.get_prompt()
     
-    # Tokenize
-    input_ids = tokenizer_image_token(
-        prompt_for_tokenizer,
-        tokenizer,
-        IMAGE_TOKEN_INDEX,
-        return_tensors="pt",
-    ).unsqueeze(0).to(model.device)
+    if include_image:
+        input_ids = tokenizer_image_token(
+            prompt_for_tokenizer,
+            tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        ).unsqueeze(0).to(model.device)
+    else:
+        input_ids = tokenizer(
+            prompt_for_tokenizer,
+            return_tensors="pt",
+        ).input_ids.to(model.device)
     
     # Build generation kwargs
     gen_kwargs = {
         "inputs": input_ids,
-        "images": image_tensor,
-        "image_sizes": [list(image_size)],
         "do_sample": args.temperature > 0,
         "max_new_tokens": args.max_new_tokens,
         "use_cache": True,
         "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
     }
+    if include_image:
+        gen_kwargs["images"] = image_tensor
+        gen_kwargs["image_sizes"] = [list(image_size)]
     
     if args.temperature > 0:
         gen_kwargs["temperature"] = args.temperature
@@ -594,6 +603,7 @@ def run_two_step_inference_on_frame(
                 combined_prompt,
                 args,
                 conv_name,
+                include_image=False,
             )
     else:
         response_b = run_inference_on_frame(
@@ -604,6 +614,7 @@ def run_two_step_inference_on_frame(
             combined_prompt,
             args,
             conv_name,
+            include_image=False,
         )
 
     return response_a, response_b, combined_prompt
@@ -647,6 +658,7 @@ def main():
     annotations_path = Path(fix_wsl_paths(args.annotations_file))
     frames_dir = Path(fix_wsl_paths(args.frames_dir))
     output_path = Path(fix_wsl_paths(args.output_json))
+    adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
     
     # Validate paths
     if not annotations_path.exists():
@@ -666,7 +678,7 @@ def main():
         load_4bit=args.load_4bit,
         load_8bit=args.load_8bit,
         model_base=args.model_base,
-        adapter_path=fix_wsl_paths(args.adapter_path) if args.adapter_path else None,
+        adapter_path=adapter_path,
     )
     aspect_ratio = getattr(getattr(model, "config", None), "image_aspect_ratio", None)
     print(f"INFO: image_aspect_ratio in checkpoint: {aspect_ratio}")
@@ -697,14 +709,23 @@ def main():
         openai_client = OpenAI()
     
     # Build config for output
+    second_step_uses_adapter = None
+    if args.two_step_inference:
+        second_step_uses_adapter = bool(adapter_path) and (
+            args.second_step_keep_adapter or not hasattr(model, "disable_adapter")
+        )
+
     config = {
         "prompt": args.prompt,
         "two_step_inference": args.two_step_inference,
         "prompt_a": args.prompt_a if args.two_step_inference else None,
         "prompt_b": args.prompt_b if args.two_step_inference else None,
         "second_separator": args.second_separator if args.two_step_inference else None,
+        "second_step_uses_image": False if args.two_step_inference else None,
         "second_step_keep_adapter": args.second_step_keep_adapter if args.two_step_inference else None,
+        "second_step_uses_adapter": second_step_uses_adapter,
         "model_path": args.model_path,
+        "adapter_path": adapter_path,
         "frames_dir": str(frames_dir),
         "annotations_file": str(annotations_path),
         "skip_step": args.skip_step,
