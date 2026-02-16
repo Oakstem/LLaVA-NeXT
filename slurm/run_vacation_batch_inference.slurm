@@ -45,6 +45,7 @@ TEMPERATURE="${TEMPERATURE:-0.0}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
 TWO_STEP_INFERENCE="${TWO_STEP_INFERENCE:-true}"
 SECOND_STEP_KEEP_ADAPTER="${SECOND_STEP_KEEP_ADAPTER:-false}"
+SECOND_STEP_USES_IMAGE="${SECOND_STEP_USES_IMAGE:-false}"
 
 # GPT extraction parameters
 ENABLE_GPT_EXTRACTION="${ENABLE_GPT_EXTRACTION:-false}"
@@ -82,6 +83,7 @@ echo "Temperature: $TEMPERATURE"
 echo "Disable Optimizations: $DISABLE_OPTIMIZATIONS"
 echo "Two-Step Inference: $TWO_STEP_INFERENCE"
 echo "Second Step Keep Adapter: $SECOND_STEP_KEEP_ADAPTER"
+echo "Second Step Uses Image: $SECOND_STEP_USES_IMAGE"
 echo "Enable GPT Extraction: $ENABLE_GPT_EXTRACTION"
 echo "GPT Model: $GPT_MODEL"
 echo "=========================================="
@@ -177,6 +179,9 @@ if [ "$TWO_STEP_INFERENCE" = "true" ]; then
 fi
 if [ "$SECOND_STEP_KEEP_ADAPTER" = "true" ]; then
     ARGS+=("--second-step-keep-adapter")
+fi
+if [ "$SECOND_STEP_USES_IMAGE" = "true" ]; then
+    ARGS+=("--second-step-uses-image")
 fi
 
 # Add GPT extraction options

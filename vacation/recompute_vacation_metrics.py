@@ -144,12 +144,31 @@ def compute_metrics(results: list[dict]) -> dict:
     }
 
 
-def _load_results(path: Path) -> list[dict] | None:
+def _load_payload(path: Path) -> dict:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    results = payload.get("results")
-    if isinstance(results, list):
-        return results
-    return None
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _extract_run_config(payload: dict) -> dict:
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        config = {}
+
+    keep_adapter_key = "keep_adapter" if "keep_adapter" in config else "second_step_keep_adapter"
+    keep_adapter = config.get(keep_adapter_key) if keep_adapter_key in config else None
+
+    return {
+        "temperature": config.get("temperature"),
+        "keep_adapter": (keep_adapter is True) if keep_adapter is not None else None,
+        "second_step_uses_image": (config.get("second_step_uses_image") is True)
+        if "second_step_uses_image" in config
+        else None,
+        "gpt_extraction_enabled": (config.get("gpt_extraction_enabled") is True)
+        if "gpt_extraction_enabled" in config
+        else None,
+    }
 
 
 def _iter_result_files(results_dir: Path) -> list[Path]:
@@ -204,13 +223,16 @@ def main() -> None:
     }
 
     for json_path in _iter_result_files(results_dir):
-        results = _load_results(json_path)
-        if results is None:
+        payload = _load_payload(json_path)
+        results = payload.get("results")
+        if not isinstance(results, list):
             continue
         metrics = compute_metrics(results)
+        run_config = _extract_run_config(payload)
         rows.append(
             {
                 "results_file": str(json_path),
+                **run_config,
                 **metrics,
             }
         )
@@ -224,36 +246,6 @@ def main() -> None:
         aggregate["accuracy_skipped_missing_pred"] += metrics["accuracy_skipped_missing_pred"]
         aggregate["response_length_sum"] += metrics["avg_response_length"] * metrics["response_count"]
         aggregate["response_count"] += metrics["response_count"]
-
-    if rows:
-        total_extractions = aggregate["total_extractions"]
-        evaluated = aggregate["accuracy_evaluated_frames"]
-        response_count = aggregate["response_count"]
-        rows.append(
-            {
-                "results_file": "ALL",
-                "total_results": aggregate["total_results"],
-                "total_extractions": total_extractions,
-                "valid_social_interaction_label_percent": (
-                    aggregate["valid_labels"] / total_extractions
-                    if total_extractions
-                    else 0.0
-                ),
-                "accuracy_vs_atomic_attribute_combo": (
-                    aggregate["accuracy_correct_nb"] / evaluated if evaluated else 0.0
-                ),
-                "accuracy_evaluated_frames": evaluated,
-                "accuracy_correct_nb": aggregate["accuracy_correct_nb"],
-                "accuracy_skipped_missing_gt": aggregate["accuracy_skipped_missing_gt"],
-                "accuracy_skipped_missing_pred": aggregate["accuracy_skipped_missing_pred"],
-                "avg_response_length": (
-                    aggregate["response_length_sum"] / response_count
-                    if response_count
-                    else 0.0
-                ),
-                "response_count": response_count,
-            }
-        )
 
     write_csv(rows, output_csv)
     print(f"Wrote {len(rows)} rows to {output_csv}")

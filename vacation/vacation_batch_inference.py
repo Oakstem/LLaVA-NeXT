@@ -178,6 +178,14 @@ def parse_args() -> argparse.Namespace:
             "Default behavior disables adapters in step 2 when --adapter-path is set."
         ),
     )
+    parser.add_argument(
+        "--second-step-uses-image",
+        action="store_true",
+        help=(
+            "In two-step inference, include the image again in step 2. "
+            "Default behavior uses text-only step 2."
+        ),
+    )
     
     # Frame selection arguments
     parser.add_argument(
@@ -603,7 +611,7 @@ def run_two_step_inference_on_frame(
                 combined_prompt,
                 args,
                 conv_name,
-                include_image=False,
+                include_image=args.second_step_uses_image,
             )
     else:
         response_b = run_inference_on_frame(
@@ -614,7 +622,7 @@ def run_two_step_inference_on_frame(
             combined_prompt,
             args,
             conv_name,
-            include_image=False,
+            include_image=args.second_step_uses_image,
         )
 
     return response_a, response_b, combined_prompt
@@ -721,7 +729,7 @@ def main():
         "prompt_a": args.prompt_a if args.two_step_inference else None,
         "prompt_b": args.prompt_b if args.two_step_inference else None,
         "second_separator": args.second_separator if args.two_step_inference else None,
-        "second_step_uses_image": False if args.two_step_inference else None,
+        "second_step_uses_image": args.second_step_uses_image if args.two_step_inference else None,
         "second_step_keep_adapter": args.second_step_keep_adapter if args.two_step_inference else None,
         "second_step_uses_adapter": second_step_uses_adapter,
         "model_path": args.model_path,
@@ -794,6 +802,8 @@ def main():
         print("Using two-step prompts:")
         print(f"Prompt A:\n{args.prompt_a}\n")
         print(f"Prompt B:\n{args.prompt_b}\n")
+        step2_image_mode = "enabled" if args.second_step_uses_image else "disabled"
+        print(f"Step 2 image input: {step2_image_mode}\n")
         if args.adapter_path:
             step2_mode = "enabled" if args.second_step_keep_adapter else "disabled"
             print(f"Step 2 adapters: {step2_mode}\n")
