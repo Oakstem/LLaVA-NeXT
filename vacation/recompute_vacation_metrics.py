@@ -171,6 +171,24 @@ def _extract_run_config(payload: dict) -> dict:
     }
 
 
+def _extract_prompt_columns(payload: dict) -> dict:
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        return {"prompt_step1": None, "prompt_step2": None}
+
+    two_step = config.get("two_step_inference") is True
+    if two_step:
+        return {
+            "prompt_step1": config.get("prompt_a"),
+            "prompt_step2": config.get("prompt_b"),
+        }
+
+    return {
+        "prompt_step1": config.get("prompt"),
+        "prompt_step2": None,
+    }
+
+
 def _iter_result_files(results_dir: Path) -> list[Path]:
     return sorted(p for p in results_dir.rglob("*.json") if p.is_file())
 
@@ -229,11 +247,13 @@ def main() -> None:
             continue
         metrics = compute_metrics(results)
         run_config = _extract_run_config(payload)
+        prompt_columns = _extract_prompt_columns(payload)
         rows.append(
             {
                 "results_file": str(json_path),
                 **run_config,
                 **metrics,
+                **prompt_columns,
             }
         )
 
