@@ -77,42 +77,45 @@ Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
 If only one person is described as looking at another, it is NonCommmunicative."""
 
-# PROMPT_A = """Describe each person briefly and say what they are looking at (person, object, or off-screen)."""
-PROMPT_A = """You are an expert vision assistant.
-Step 1 - Caption
-• Provide one concise sentence that broadly describes the entire scene.
-• Begin the line with: Caption:
-Step 2 - Foreground people & gaze
-1. Detect every person whose height is at least 5% of the image (foreground).
-2. List them from left to right and number sequentially starting at 1.
-For each person output exactly one line in this format:
-Person {N}: {short description}, looking at {target | outside the frame | uncertain}
-Output format (no extra lines, no prose other than what is specified):
--------------------------------------------------
-Caption: {your one-sentence scene description}
-Person 1: {short description}, looking at ...
-Person 2: {short description}, looking at ...
-...
--------------------------------------------------
-Additional rules
-• Keep the phrase "looking at" unchanged.
-• {short description} must be 6 words or fewer (e.g., "man in red jacket").
-• If no foreground person is detected, write exactly: No foreground people detected.
-• If gaze cannot be determined, use "uncertain".
-• Do not output your reasoning or any extra text."""
+PROMPT_A = """For each person, provide a brief description and specify what they are looking at: another person, an object, or off-screen."""
+# PROMPT_A = """You are an expert vision assistant.
+# Step 1 - Caption
+# • Provide one concise sentence that broadly describes the entire scene.
+# • Begin the line with: Caption:
+# Step 2 - Foreground people & gaze
+# 1. Detect every person whose height is at least 5% of the image (foreground).
+# 2. List them from left to right and number sequentially starting at 1.
+# 3. Write the total number of people detected.
+# For each person output exactly one line in this format:
+# Person {N}: {short description}, looking at {target | outside the frame | uncertain}
+# Output format (no extra lines, no prose other than what is specified):
+# -------------------------------------------------
+# Caption: {your one-sentence scene description}
+# Person 1: {short description}, looking at ...
+# Person 2: {short description}, looking at ...
+# ...
+# Total people detected: {number}
+# -------------------------------------------------
+# Additional rules
+# • Keep the phrase "looking at" unchanged.
+# • {short description} must be 6 words or fewer (e.g., "man in red jacket").
+# • If no foreground person is detected, write exactly: No foreground people detected.
+# • If gaze cannot be determined, use "uncertain".
+# • Do not output your reasoning or any extra text."""
 
 PROMPT_B = """Based on the provided gaze information, choose exactly one social interaction label:
 MutualGaze: at least two people are looking at each other (A looks at B and B looks at A).
 SharedObjectAttention: at least two people are looking at the same external object or place (not a person), including one person following another person's reference to that external target.
 OneSidedGaze: one person looks at another person but the other looks away or elsewhere (not reciprocated).
-NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze. for example, if people are looking at something or someone off-screen.
+NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze. for example, if people are looking at something or someone off-screen, or when theres only one person in the image.
 None: if no gaze-looking information is provided.
 
 Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
 If only one person is described as looking at another, it is NonCommmunicative.
 If all people are looking at something or someone off-screen, or at the camera, label as NonCommmunicative.
-If no gaze information is given, label as None."""
+If no gaze information is given, label as None.
+Single person in the image will ALWAYS result in NonCommmunicative."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,8 +139,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-json",
         type=str,
-        default=f"vacation_general_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        default=(
+            f"vacation_results/single_image/"
+            f"vacation_general_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        ),
         help="Path to output JSON file",
+    )
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        default=None,
+        help="Run inference on a single image path instead of annotation/frame batch mode.",
     )
     parser.add_argument(
         "--prompt",
@@ -663,16 +675,21 @@ def main():
     args = parse_args()
     
     # Resolve paths
+    image_path = Path(fix_wsl_paths(args.image_path)) if args.image_path else None
     annotations_path = Path(fix_wsl_paths(args.annotations_file))
     frames_dir = Path(fix_wsl_paths(args.frames_dir))
     output_path = Path(fix_wsl_paths(args.output_json))
     adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
     
     # Validate paths
-    if not annotations_path.exists():
-        raise FileNotFoundError(f"Annotations file not found: {annotations_path}")
-    if not frames_dir.exists():
-        raise FileNotFoundError(f"Frames directory not found: {frames_dir}")
+    if image_path is not None:
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+    else:
+        if not annotations_path.exists():
+            raise FileNotFoundError(f"Annotations file not found: {annotations_path}")
+        if not frames_dir.exists():
+            raise FileNotFoundError(f"Frames directory not found: {frames_dir}")
     
     # Enable optimizations
     if not args.disable_optimizations:
@@ -734,6 +751,7 @@ def main():
         "second_step_uses_adapter": second_step_uses_adapter,
         "model_path": args.model_path,
         "adapter_path": adapter_path,
+        "image_path": str(image_path) if image_path is not None else None,
         "frames_dir": str(frames_dir),
         "annotations_file": str(annotations_path),
         "skip_step": args.skip_step,
@@ -742,6 +760,71 @@ def main():
         "gpt_extraction_enabled": args.enable_gpt_extraction,
         "gpt_model": args.gpt_model if args.enable_gpt_extraction else None,
     }
+
+    if image_path is not None:
+        if args.two_step_inference:
+            print("Using two-step prompts:")
+            print(f"Prompt A:\n{args.prompt_a}\n")
+            print(f"Prompt B:\n{args.prompt_b}\n")
+            step2_image_mode = "enabled" if args.second_step_uses_image else "disabled"
+            print(f"Step 2 image input: {step2_image_mode}\n")
+            if args.adapter_path:
+                step2_mode = "enabled" if args.second_step_keep_adapter else "disabled"
+                print(f"Step 2 adapters: {step2_mode}\n")
+        else:
+            print(f"Using prompt:\n{args.prompt}\n")
+
+        if args.two_step_inference:
+            response_a, response_b, combined_prompt = run_two_step_inference_on_frame(
+                model,
+                tokenizer,
+                image_processor,
+                image_path,
+                args.prompt_a,
+                args.prompt_b,
+                args,
+                conv_name,
+            )
+            response = response_b
+            print("\nSingle-image Step 1 response:")
+            print(response_a)
+            print("\nSingle-image Step 2 response:")
+            print(response_b)
+        else:
+            response = run_inference_on_frame(
+                model,
+                tokenizer,
+                image_processor,
+                image_path,
+                args.prompt,
+                args,
+                conv_name,
+            )
+            response_a = None
+            combined_prompt = None
+            print("\nSingle-image response:")
+            print(response)
+
+        result_entry = {
+            "video_id": None,
+            "frame_id": None,
+            "image_path": str(image_path),
+            "atomic_attribute_combo_GT": None,
+            "atomic_attribute_combo_GT_multi": [],
+            "response": response,
+            "response_step1": response_a if args.two_step_inference else None,
+            "combined_prompt": combined_prompt if args.two_step_inference else None,
+            "annotations": [],
+            "atomic_attributes": [],
+        }
+        if openai_client is not None:
+            extracted = extract_gaze_info_with_gpt(openai_client, response, args.gpt_model)
+            result_entry["extracted_gaze_info"] = extracted
+
+        print(f"\nSaving final results to {output_path}...")
+        save_checkpoint(output_path, config, [result_entry], None)
+        print("Done! Processed 1 image.")
+        return
     
     # Resume logic
     results = []
