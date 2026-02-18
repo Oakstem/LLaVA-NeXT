@@ -78,6 +78,34 @@ Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
 If only one person is described as looking at another, it is NonCommmunicative."""
 
 PROMPT_A = """For each person, provide a brief description and specify what they are looking at: another person, an object, or off-screen."""
+PROMPT_A = """Identify all visible people in the image.
+For each person:
+Assign a unique ID (e.g., Person_1, Person_2).
+Briefly describe their appearance (clothing, position, distinguishing features).
+Estimate their gaze direction.
+Identify what they are looking at: another person (use ID), an object (name it), or off-screen.
+If uncertain, state the uncertainty.
+Return your answer strictly in the following JSON format:
+{
+  "people": [
+    {
+      "id": "Person_1",
+      "description": "",
+      "gaze_direction": "",
+      "gaze_target_type": "person | object | off_screen | unclear",
+      "gaze_target": "",
+      "uncertainty": ""
+    }
+  ]
+}
+"""
+# gaze_target_type must be exactly one of the following values:
+# "person" (if looking at another identified person — use their ID)
+# "object" (if looking at a visible object — name it)
+# "off_screen" (if looking outside the image frame)
+# "unclear" (if gaze cannot be reliably determined)
+# Do not list multiple options. Choose only one value.
+# """
 # PROMPT_A = """You are an expert vision assistant.
 # Step 1 - Caption
 # • Provide one concise sentence that broadly describes the entire scene.
@@ -117,6 +145,24 @@ If all people are looking at something or someone off-screen, or at the camera, 
 If no gaze information is given, label as None.
 Single person in the image will ALWAYS result in NonCommmunicative."""
 
+# PROMPT_B = """Task: Assign exactly one Vacation gaze label:
+# MutualGaze, SharedObjectAttention, OneSidedGaze, NonCommmunicative, None
+# Use ONLY the Step 1 result (people + gaze targets). Ignore scene/story/context.
+# Decision rules (apply in this exact order; first match wins):
+# MutualGaze — two people look at each other (A looks at B AND B looks at A).
+# SharedObjectAttention — at least two people look at the same visible object (same described object).
+# OneSidedGaze — someone looks at another person, but it’s not reciprocated.
+# NonCommmunicative — people are present but no mutual/shared/one-sided person-looking; gazes are toward objects, off-screen, or unclear.
+# None — no people detected, OR gaze can’t be determined for everyone (all “unclear” with no usable targets).
+# Output format (exactly):
+# First line: Label: <ONE_LABEL>
+# Then 2–4 bullet points explaining which rule triggered and the supporting gaze relations (use Person IDs).
+# Don’ts:
+# Do not output multiple labels.
+# Do not hedge with “between X and Y”.
+# If you’re unsure about “same object”, choose NonCommmunicative unless the match is very clear.
+# Input (Step 1 JSON):
+# """
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
