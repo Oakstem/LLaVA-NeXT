@@ -189,6 +189,13 @@ def _extract_prompt_columns(payload: dict) -> dict:
     }
 
 
+def _extract_adapter_name(json_path: Path) -> str | None:
+    # Extract adapter name from the JSON file path
+    name = json_path.name.replace(".json", "")
+    return name
+
+
+
 def _iter_result_files(results_dir: Path) -> list[Path]:
     return sorted(p for p in results_dir.rglob("*.json") if p.is_file())
 
@@ -248,9 +255,11 @@ def main() -> None:
         metrics = compute_metrics(results)
         run_config = _extract_run_config(payload)
         prompt_columns = _extract_prompt_columns(payload)
+        adapter_name = _extract_adapter_name(json_path)
         rows.append(
             {
                 "results_file": str(json_path),
+                "adapter_name": adapter_name,
                 **run_config,
                 **metrics,
                 **prompt_columns,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime
 import json
 import sys
 from dataclasses import dataclass, field
@@ -480,8 +481,9 @@ def write_metrics_csv(path: Path, datasets: Iterable[DatasetMetrics]) -> None:
 def main() -> int:
     args = parse_args()
     files = find_localization_files(args.root)
-    output_json_path = args.output_json or (args.root / "localization_top_diffs.json")
-    output_csv_path = args.output_csv or (args.root / "localization_total_metrics.csv")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_json_path = args.output_json or (args.root / f"localization_top_diffs_{timestamp}.json")
+    output_csv_path = args.output_csv or (args.root / f"localization_total_metrics_{timestamp}.csv")
 
     print(f"Found {len(files)} localization result file(s) under {args.root}")
 
@@ -547,6 +549,7 @@ def main() -> int:
 
     summary = {
         "root": str(args.root),
+        "generated_at": timestamp,
         "top_k": args.top_k,
         "intersection_size": len(intersection),
         "baseline": {"path": str(baseline.path)} if baseline is not None else None,
