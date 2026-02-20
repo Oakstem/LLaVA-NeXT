@@ -16,7 +16,7 @@ import json
 import random
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
@@ -44,8 +44,17 @@ from llava.mm_utils import get_model_name_from_path
 from llava.conversation import conv_templates
 from llava.mm_utils import tokenizer_image_token
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from gazefollow.evals.log_wandb_evaluations import (
+    DEFAULT_PROJECT,
+    build_run_name_from_adapter,
+    split_metrics,
+)
 from vacation.gpt_extraction import extract_gaze_info_with_gpt
-from vacation.extraction_metrics_utils import compute_extraction_metrics
+from vacation.recompute_vacation_metrics import (
+    _extract_prompt_columns,
+    _extract_run_config,
+    compute_metrics,
+)
 from openai import OpenAI
 
 
@@ -362,6 +371,37 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="gpt-5-nano",
         help="OpenAI model to use for GPT extraction (default: gpt-5-nano)",
+    )
+
+    # W&B arguments
+    parser.add_argument(
+        "--log-to-wandb",
+        action="store_true",
+        default=True,
+        help="Log Vacation results to Weights & Biases.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default=DEFAULT_PROJECT,
+        help="Weights & Biases project name to use when logging.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        default=None,
+        help="Optional Weights & Biases entity/organization name.",
+    )
+    parser.add_argument(
+        "--wandb-run-id",
+        type=str,
+        default=None,
+        help="Optional existing W&B run id to resume and update.",
+    )
+    parser.add_argument(
+        "--wandb-resume",
+        type=str,
+        default="allow",
+        choices=["allow", "must", "never", "auto"],
+        help="W&B resume mode used when --wandb-run-id is provided.",
     )
     
     return parser.parse_args()
@@ -717,6 +757,24 @@ def save_checkpoint(output_path: Path, config: dict, results: list, metrics: Opt
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def build_wandb_metric_row(output_path: Path, config: dict, metrics: dict) -> Dict[str, Any]:
+    payload = {"config": config}
+    row: Dict[str, Any] = {
+        "results_file": str(output_path),
+        "adapter_name": output_path.stem,
+    }
+    row.update(_extract_run_config(payload))
+    row.update(metrics)
+    row.update(_extract_prompt_columns(payload))
+    return row
+
+
+def _normalize_wandb_path(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return str(value).replace("\\", "/").rstrip("/")
+
+
 def main():
     args = parse_args()
     
@@ -726,6 +784,12 @@ def main():
     frames_dir = Path(fix_wsl_paths(args.frames_dir))
     output_path = Path(fix_wsl_paths(args.output_json))
     adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
+    wandb_run_name = build_run_name_from_adapter(adapter_path or args.model_path)
+    wandb_run_id = args.wandb_run_id
+    wandb_module = None
+    wandb_run = None
+    wandb_disabled_reason = None
+    existing = {}
     
     # Validate paths
     if image_path is not None:
@@ -805,7 +869,134 @@ def main():
         "temperature": args.temperature,
         "gpt_extraction_enabled": args.enable_gpt_extraction,
         "gpt_model": args.gpt_model if args.enable_gpt_extraction else None,
+        "wandb_project": args.wandb_project if args.log_to_wandb else None,
+        "wandb_entity": args.wandb_entity if args.log_to_wandb else None,
+        "wandb_run_name": wandb_run_name if args.log_to_wandb else None,
+        "wandb_run_id": wandb_run_id if args.log_to_wandb else None,
+        "wandb_resume": args.wandb_resume if args.log_to_wandb else None,
     }
+
+    base_wandb_config: Dict[str, Any] = {
+        "model_path": args.model_path,
+        "model_base": args.model_base,
+        "adapter_path": adapter_path,
+        "annotations_file": str(annotations_path),
+        "frames_dir": str(frames_dir),
+        "output_json": str(output_path),
+        "skip_step": args.skip_step,
+        "max_new_tokens": args.max_new_tokens,
+        "temperature": args.temperature,
+        "two_step_inference": args.two_step_inference,
+        "gpt_extraction_enabled": args.enable_gpt_extraction,
+    }
+
+    def infer_wandb_run_id() -> Optional[str]:
+        if not args.log_to_wandb:
+            return None
+        if wandb_run_id:
+            return wandb_run_id
+
+        try:
+            import wandb as wandb_lib
+        except ImportError:
+            return None
+
+        entity = args.wandb_entity or wandb_lib.api.default_entity
+        if not entity:
+            return None
+
+        api = wandb_lib.Api()
+        api_path = f"{entity}/{args.wandb_project}"
+        inferred_name = wandb_run_name
+        model_path_norm = _normalize_wandb_path(adapter_path or args.model_path)
+
+        runs = list(api.runs(api_path, filters={"display_name": inferred_name}))
+        if not runs:
+            runs = list(api.runs(api_path, filters={"name": inferred_name}))
+        if not runs:
+            return None
+
+        exact_config_matches = []
+        for run in runs:
+            cfg_adapter = _normalize_wandb_path(run.config.get("adapter_path"))
+            cfg_model = _normalize_wandb_path(run.config.get("model_path"))
+            if model_path_norm and model_path_norm in {cfg_adapter, cfg_model}:
+                exact_config_matches.append(run)
+
+        candidates = exact_config_matches or runs
+        candidates.sort(key=lambda run: getattr(run, "updated_at", "") or "")
+        selected = candidates[-1]
+        return str(selected.id)
+
+    def ensure_wandb_run() -> Optional[Any]:
+        nonlocal wandb_module, wandb_run, wandb_disabled_reason, wandb_run_id
+        if not args.log_to_wandb:
+            if wandb_disabled_reason is None:
+                wandb_disabled_reason = "wandb logging disabled"
+            return None
+        if wandb_disabled_reason is not None:
+            return None
+        if wandb_module is None:
+            try:
+                import wandb as wandb_lib
+            except ImportError as exc:
+                wandb_disabled_reason = f"wandb import failed: {exc}"
+                print(f"\n⚠️  wandb logging skipped: {exc}")
+                return None
+            wandb_module = wandb_lib
+        if wandb_run is None:
+            if wandb_run_id is None:
+                inferred_run_id = infer_wandb_run_id()
+                if inferred_run_id:
+                    wandb_run_id = inferred_run_id
+                    config["wandb_run_id"] = wandb_run_id
+                    print(f"Inferred wandb run id: {wandb_run_id}")
+            init_kwargs: Dict[str, Any] = {
+                "project": args.wandb_project,
+                "config": dict(base_wandb_config),
+            }
+            if args.wandb_entity:
+                init_kwargs["entity"] = args.wandb_entity
+            if wandb_run_id:
+                init_kwargs["id"] = wandb_run_id
+                init_kwargs["resume"] = args.wandb_resume
+            else:
+                init_kwargs["name"] = wandb_run_name
+            wandb_run = wandb_module.init(**init_kwargs)
+            if getattr(wandb_run, "id", None):
+                wandb_run_id = str(wandb_run.id)
+                config["wandb_run_id"] = wandb_run_id
+        return wandb_run
+
+    def log_metrics_to_wandb(metrics: dict, total_results: int) -> None:
+        nonlocal wandb_run
+        run = ensure_wandb_run()
+        if run is None:
+            return
+
+        row = build_wandb_metric_row(output_path, config, metrics)
+        prefixed_row = {f"vacation/{key}": value for key, value in row.items()}
+        scalar_metrics, non_scalar_metrics = split_metrics(prefixed_row)
+        config_updates = {
+            **non_scalar_metrics,
+            "vacation/output_json": str(output_path),
+            "vacation/wandb_run_id": wandb_run_id,
+        }
+        try:
+            run.config.update(config_updates, allow_val_change=True)
+            run.log(scalar_metrics or {"vacation/_placeholder": total_results})
+            print(
+                f"\n✅ Logged Vacation metrics to wandb run id={wandb_run_id} "
+                f"(project={args.wandb_project})"
+            )
+        except Exception as exc:
+            print(f"\n⚠️  Failed to log Vacation metrics to wandb: {exc}")
+        finally:
+            try:
+                run.finish()
+            except Exception:
+                pass
+            wandb_run = None
 
     if image_path is not None:
         if args.two_step_inference:
@@ -867,8 +1058,12 @@ def main():
             extracted = extract_gaze_info_with_gpt(openai_client, response, args.gpt_model)
             result_entry["extracted_gaze_info"] = extracted
 
+        metrics = compute_metrics([result_entry])
+        if args.log_to_wandb:
+            log_metrics_to_wandb(metrics, total_results=1)
+
         print(f"\nSaving final results to {output_path}...")
-        save_checkpoint(output_path, config, [result_entry], None)
+        save_checkpoint(output_path, config, [result_entry], metrics)
         print("Done! Processed 1 image.")
         return
     
@@ -882,6 +1077,15 @@ def main():
         results = existing.get("results", [])
         processed_keys = {(r["video_id"], r["frame_id"]) for r in results}
         print(f"Found {len(processed_keys)} already processed frames")
+        existing_config = existing.get("config")
+        if (
+            isinstance(existing_config, dict)
+            and not wandb_run_id
+            and existing_config.get("wandb_run_id")
+        ):
+            wandb_run_id = str(existing_config["wandb_run_id"])
+            config["wandb_run_id"] = wandb_run_id
+            print(f"Reusing wandb run id from existing output: {wandb_run_id}")
     
     # Filter out already processed frames
     selected_frames = selected_frames[
@@ -912,18 +1116,17 @@ def main():
     if len(selected_frames) == 0:
         print("All frames already processed!")
         if results:
-            metrics = None
-            if any(isinstance(r.get("extracted_gaze_info"), dict) for r in results):
-                metrics = compute_extraction_metrics(results)
+            metrics = compute_metrics(results)
+            if args.log_to_wandb:
+                log_metrics_to_wandb(metrics, total_results=len(results))
             save_checkpoint(output_path, config, results, metrics)
-            if metrics is not None:
-                print(
-                    "Metrics: valid_social_interaction_label_percent="
-                    f"{metrics['valid_social_interaction_label_percent']:.4f}, "
-                    "accuracy_vs_atomic_attribute_combo="
-                    f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
-                    f"(evaluated={metrics['accuracy_evaluated_frames']})"
-                )
+            print(
+                "Metrics: valid_social_interaction_label_percent="
+                f"{metrics['valid_social_interaction_label_percent']:.4f}, "
+                "accuracy_vs_atomic_attribute_combo="
+                f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
+                f"(evaluated={metrics['accuracy_evaluated_frames']})"
+            )
         return
     
     # Process frames
@@ -1011,25 +1214,22 @@ def main():
         # Checkpoint
         if (idx + 1) % args.checkpoint_interval == 0:
             print(f"\nSaving checkpoint at {idx + 1} frames...")
-            metrics = None
-            if any(isinstance(r.get("extracted_gaze_info"), dict) for r in results):
-                metrics = compute_extraction_metrics(results)
+            metrics = compute_metrics(results)
             save_checkpoint(output_path, config, results, metrics)
     
     # Final save
     print(f"\nSaving final results to {output_path}...")
-    metrics = None
-    if any(isinstance(r.get("extracted_gaze_info"), dict) for r in results):
-        metrics = compute_extraction_metrics(results)
+    metrics = compute_metrics(results)
+    if args.log_to_wandb:
+        log_metrics_to_wandb(metrics, total_results=len(results))
     save_checkpoint(output_path, config, results, metrics)
-    if metrics is not None:
-        print(
-            "Metrics: valid_social_interaction_label_percent="
-            f"{metrics['valid_social_interaction_label_percent']:.4f}, "
-            "accuracy_vs_atomic_attribute_combo="
-            f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
-            f"(evaluated={metrics['accuracy_evaluated_frames']})"
-        )
+    print(
+        "Metrics: valid_social_interaction_label_percent="
+        f"{metrics['valid_social_interaction_label_percent']:.4f}, "
+        "accuracy_vs_atomic_attribute_combo="
+        f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
+        f"(evaluated={metrics['accuracy_evaluated_frames']})"
+    )
     print(f"Done! Processed {len(results)} frames total.")
 
 
