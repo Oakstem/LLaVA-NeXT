@@ -116,12 +116,14 @@ class DatasetMetrics:
     true_negatives: int = 0
     recall: Optional[float] = None
     precision: Optional[float] = None
+    accuracy: Optional[float] = None
     valid_ids: Set[str] = field(default_factory=set)
     normalized_errors: Dict[str, float] = field(default_factory=dict)
     gaze_targets: Dict[str, Optional[str]] = field(default_factory=dict)
     in_out_labels: Dict[str, Optional[int]] = field(default_factory=dict)
     missing_intersection_errors: int = 0
     intersection_mean_error: Optional[float] = None
+    intersection_size: int = 0
     mean_normalized_error: Optional[float] = None
 
 
@@ -176,7 +178,7 @@ def load_dataset_metrics(path: Path) -> DatasetMetrics:
 
     for index, entry in enumerate(entries):
         sample_id = entry.get("id") or entry.get("image_path") or f"index_{index}"
-        gt_in_out_flag = entry.get("gt_in_out")
+        gt_in_out_flag = normalize_in_out(entry.get("gt_in_out"))
 
         detection = entry.get("gaze_detections") or {}
         person = detection.get("person_1") or {}
@@ -185,9 +187,11 @@ def load_dataset_metrics(path: Path) -> DatasetMetrics:
         gaze_target = person.get("gaze_target")
 
         dataset.in_out_labels[str(sample_id)] = gt_in_out_flag
-        inferred_in_out = entry.get("pred_in_out")
+        inferred_in_out = normalize_in_out(entry.get("pred_in_out"))
         if inferred_in_out is None:
-            inferred_in_out = infer_in_out_from_phrase(gaze_target)
+            inferred_in_out = normalize_in_out(infer_in_out_from_phrase(gaze_target))
+        if inferred_in_out is None:
+            inferred_in_out = 1 if coords_valid else 0
         if inferred_in_out == 0:
             person["gaze_coordinates"] = None
             person["gaze_normalized_l2_error"] = None
@@ -240,6 +244,11 @@ def load_dataset_metrics(path: Path) -> DatasetMetrics:
     dataset.precision = (
         dataset.true_positives / precision_denominator if precision_denominator else None
     )
+    dataset.accuracy = (
+        (dataset.true_positives + dataset.true_negatives) / dataset.total_samples
+        if dataset.total_samples
+        else None
+    )
 
     return dataset
 
@@ -254,6 +263,7 @@ def compute_intersection_metrics(
     intersection = set.intersection(*(ds.valid_ids for ds in datasets)) if datasets else set()
 
     for ds in datasets:
+        ds.intersection_size = len(intersection)
         errors = [
             ds.normalized_errors[sample_id]
             for sample_id in intersection
@@ -311,8 +321,10 @@ def print_top_table(top_results: List[DatasetMetrics], baseline: Optional[Datase
     header = (
         f"{'adapter_path':40} "
         f"{'intersection_normalized_l2':>26} "
+        f"{'intersection_size':>18} "
         f"{'recall':>8} "
         f"{'precision':>10} "
+        f"{'accuracy':>10} "
         f"{'normalized_l2':>15}"
     )
     print("Top localization results (intersection_mean_gaze_normalized_l2_error):")
@@ -323,8 +335,10 @@ def print_top_table(top_results: List[DatasetMetrics], baseline: Optional[Datase
         print(
             f"{adapter_display:40.40} "
             f"{format_float(ds.intersection_mean_error):>26} "
+            f"{ds.intersection_size:>18} "
             f"{format_float(ds.recall):>8} "
             f"{format_float(ds.precision):>10} "
+            f"{format_float(ds.accuracy):>10} "
             f"{format_float(ds.mean_normalized_error):>15}"
         )
     print()
@@ -450,7 +464,9 @@ def write_metrics_csv(path: Path, datasets: Iterable[DatasetMetrics]) -> None:
         "false_negatives",
         "recall",
         "precision",
+        "accuracy",
         "valid_gaze_samples",
+        "intersection_size",
         "intersection_mean_gaze_normalized_l2_error",
         "missing_intersection_errors",
         "mean_gaze_normalized_l2_error",
@@ -470,7 +486,9 @@ def write_metrics_csv(path: Path, datasets: Iterable[DatasetMetrics]) -> None:
                     "false_negatives": ds.false_negatives,
                     "recall": ds.recall,
                     "precision": ds.precision,
+                    "accuracy": ds.accuracy,
                     "valid_gaze_samples": len(ds.valid_ids),
+                    "intersection_size": ds.intersection_size,
                     "intersection_mean_gaze_normalized_l2_error": ds.intersection_mean_error,
                     "missing_intersection_errors": ds.missing_intersection_errors,
                     "mean_gaze_normalized_l2_error": ds.mean_normalized_error,
@@ -510,9 +528,11 @@ def main() -> int:
         print(f"  false_negatives (in_out=1 & missing gaze): {ds.false_negatives}")
         print(f"  false_positives (in_out=0 & gaze present): {ds.false_positives}")
         print(f"  valid_gaze_samples: {len(ds.valid_ids)}")
+        print(f"  intersection_size: {ds.intersection_size}")
         print(
             f"  intersection_mean_gaze_normalized_l2_error: {format_float(ds.intersection_mean_error)}"
         )
+        print(f"  accuracy: {format_float(ds.accuracy)}")
         if ds.missing_intersection_errors:
             print(
                 f"  missing_intersection_errors: {ds.missing_intersection_errors} sample(s) without gaze_normalized_l2_error"
@@ -525,9 +545,11 @@ def main() -> int:
             "total_samples": ds.total_samples,
             "recall": ds.recall,
             "precision": ds.precision,
+            "accuracy": ds.accuracy,
             "false_negatives": ds.false_negatives,
             "false_positives": ds.false_positives,
             "valid_gaze_samples": len(ds.valid_ids),
+            "intersection_size": ds.intersection_size,
             "intersection_mean_gaze_normalized_l2_error": ds.intersection_mean_error,
             "missing_intersection_errors": ds.missing_intersection_errors,
             "mean_gaze_normalized_l2_error": ds.mean_normalized_error,
@@ -558,8 +580,10 @@ def main() -> int:
                 "path": str(ds.path),
                 "adapter_path": "baseline" if baseline is not None and ds is baseline else ds.adapter_path,
                 "intersection_normalized_l2": ds.intersection_mean_error,
+                "intersection_size": ds.intersection_size,
                 "recall": ds.recall,
                 "precision": ds.precision,
+                "accuracy": ds.accuracy,
                 "normalized_l2": ds.mean_normalized_error,
             }
             for ds in top_table_results
