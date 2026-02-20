@@ -47,13 +47,16 @@ from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from gazefollow.evals.log_wandb_evaluations import (
     DEFAULT_PROJECT,
     build_run_name_from_adapter,
-    split_metrics,
 )
 from vacation.gpt_extraction import extract_gaze_info_with_gpt
 from vacation.recompute_vacation_metrics import (
     _extract_prompt_columns,
     _extract_run_config,
     compute_metrics,
+)
+from vacation.wandb_utils import (
+    infer_wandb_run_id,
+    log_prefixed_metrics_to_wandb,
 )
 from openai import OpenAI
 
@@ -769,12 +772,6 @@ def build_wandb_metric_row(output_path: Path, config: dict, metrics: dict) -> Di
     return row
 
 
-def _normalize_wandb_path(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    return str(value).replace("\\", "/").rstrip("/")
-
-
 def main():
     args = parse_args()
     
@@ -786,9 +783,6 @@ def main():
     adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
     wandb_run_name = build_run_name_from_adapter(adapter_path or args.model_path)
     wandb_run_id = args.wandb_run_id
-    wandb_module = None
-    wandb_run = None
-    wandb_disabled_reason = None
     existing = {}
     
     # Validate paths
@@ -889,114 +883,56 @@ def main():
         "two_step_inference": args.two_step_inference,
         "gpt_extraction_enabled": args.enable_gpt_extraction,
     }
-
-    def infer_wandb_run_id() -> Optional[str]:
-        if not args.log_to_wandb:
-            return None
-        if wandb_run_id:
-            return wandb_run_id
-
-        try:
-            import wandb as wandb_lib
-        except ImportError:
-            return None
-
-        entity = args.wandb_entity or wandb_lib.api.default_entity
-        if not entity:
-            return None
-
-        api = wandb_lib.Api()
-        api_path = f"{entity}/{args.wandb_project}"
-        inferred_name = wandb_run_name
-        model_path_norm = _normalize_wandb_path(adapter_path or args.model_path)
-
-        runs = list(api.runs(api_path, filters={"display_name": inferred_name}))
-        if not runs:
-            runs = list(api.runs(api_path, filters={"name": inferred_name}))
-        if not runs:
-            return None
-
-        exact_config_matches = []
-        for run in runs:
-            cfg_adapter = _normalize_wandb_path(run.config.get("adapter_path"))
-            cfg_model = _normalize_wandb_path(run.config.get("model_path"))
-            if model_path_norm and model_path_norm in {cfg_adapter, cfg_model}:
-                exact_config_matches.append(run)
-
-        candidates = exact_config_matches or runs
-        candidates.sort(key=lambda run: getattr(run, "updated_at", "") or "")
-        selected = candidates[-1]
-        return str(selected.id)
-
-    def ensure_wandb_run() -> Optional[Any]:
-        nonlocal wandb_module, wandb_run, wandb_disabled_reason, wandb_run_id
-        if not args.log_to_wandb:
-            if wandb_disabled_reason is None:
-                wandb_disabled_reason = "wandb logging disabled"
-            return None
-        if wandb_disabled_reason is not None:
-            return None
-        if wandb_module is None:
-            try:
-                import wandb as wandb_lib
-            except ImportError as exc:
-                wandb_disabled_reason = f"wandb import failed: {exc}"
-                print(f"\n⚠️  wandb logging skipped: {exc}")
-                return None
-            wandb_module = wandb_lib
-        if wandb_run is None:
-            if wandb_run_id is None:
-                inferred_run_id = infer_wandb_run_id()
-                if inferred_run_id:
-                    wandb_run_id = inferred_run_id
-                    config["wandb_run_id"] = wandb_run_id
-                    print(f"Inferred wandb run id: {wandb_run_id}")
-            init_kwargs: Dict[str, Any] = {
-                "project": args.wandb_project,
-                "config": dict(base_wandb_config),
-            }
-            if args.wandb_entity:
-                init_kwargs["entity"] = args.wandb_entity
-            if wandb_run_id:
-                init_kwargs["id"] = wandb_run_id
-                init_kwargs["resume"] = args.wandb_resume
-            else:
-                init_kwargs["name"] = wandb_run_name
-            wandb_run = wandb_module.init(**init_kwargs)
-            if getattr(wandb_run, "id", None):
-                wandb_run_id = str(wandb_run.id)
-                config["wandb_run_id"] = wandb_run_id
-        return wandb_run
+    if args.log_to_wandb:
+        print(
+            f"W&B logging enabled (project={args.wandb_project}, "
+            f"entity={args.wandb_entity or 'default'}, run_name={wandb_run_name})"
+        )
+    else:
+        print("W&B logging disabled.")
 
     def log_metrics_to_wandb(metrics: dict, total_results: int) -> None:
-        nonlocal wandb_run
-        run = ensure_wandb_run()
-        if run is None:
-            return
-
+        nonlocal wandb_run_id
+        if wandb_run_id is None:
+            inferred_id, inferred_entity = infer_wandb_run_id(
+                wandb_project=args.wandb_project,
+                wandb_entity=args.wandb_entity,
+                inferred_run_name=wandb_run_name,
+                model_path=adapter_path or args.model_path,
+            )
+            if inferred_id:
+                wandb_run_id = inferred_id
+                config["wandb_run_id"] = wandb_run_id
+                print(f"Inferred wandb run id: {wandb_run_id}")
+            if inferred_entity and args.wandb_entity is None:
+                args.wandb_entity = inferred_entity
+                config["wandb_entity"] = inferred_entity
         row = build_wandb_metric_row(output_path, config, metrics)
-        prefixed_row = {f"vacation/{key}": value for key, value in row.items()}
-        scalar_metrics, non_scalar_metrics = split_metrics(prefixed_row)
-        config_updates = {
-            **non_scalar_metrics,
+        updated_run_id, error = log_prefixed_metrics_to_wandb(
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            wandb_run_name=wandb_run_name,
+            wandb_run_id=wandb_run_id,
+            wandb_resume=args.wandb_resume,
+            base_wandb_config=base_wandb_config,
+            metric_row=row,
+            metric_prefix="vacation",
+            total_results=total_results,
+            extra_config_updates={
             "vacation/output_json": str(output_path),
             "vacation/wandb_run_id": wandb_run_id,
-        }
-        try:
-            run.config.update(config_updates, allow_val_change=True)
-            run.log(scalar_metrics or {"vacation/_placeholder": total_results})
+            },
+        )
+        if updated_run_id:
+            wandb_run_id = updated_run_id
+            config["wandb_run_id"] = updated_run_id
+        if error:
+            print(f"\n⚠️  Failed to log Vacation metrics to wandb: {error}")
+        else:
             print(
                 f"\n✅ Logged Vacation metrics to wandb run id={wandb_run_id} "
                 f"(project={args.wandb_project})"
             )
-        except Exception as exc:
-            print(f"\n⚠️  Failed to log Vacation metrics to wandb: {exc}")
-        finally:
-            try:
-                run.finish()
-            except Exception:
-                pass
-            wandb_run = None
 
     if image_path is not None:
         if args.two_step_inference:
@@ -1127,6 +1063,8 @@ def main():
                 f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
                 f"(evaluated={metrics['accuracy_evaluated_frames']})"
             )
+        elif args.log_to_wandb:
+            print("W&B logging skipped: no results available to log.")
         return
     
     # Process frames
