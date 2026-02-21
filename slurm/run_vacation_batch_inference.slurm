@@ -44,8 +44,9 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 DISABLE_OPTIMIZATIONS="${DISABLE_OPTIMIZATIONS:-false}"
 TWO_STEP_INFERENCE="${TWO_STEP_INFERENCE:-true}"
-SECOND_STEP_KEEP_ADAPTER="${SECOND_STEP_KEEP_ADAPTER:-false}"
-SECOND_STEP_USES_IMAGE="${SECOND_STEP_USES_IMAGE:-false}"
+STEP2_KEEP_ADAPTER="${STEP2_KEEP_ADAPTER:-false}"
+STEP2_USES_IMAGE="${STEP2_USES_IMAGE:-false}"
+STEP2_TEMPERATURE="${STEP2_TEMPERATURE:-}"
 
 # GPT extraction parameters
 ENABLE_GPT_EXTRACTION="${ENABLE_GPT_EXTRACTION:-false}"
@@ -82,8 +83,9 @@ echo "Max New Tokens: $MAX_NEW_TOKENS"
 echo "Temperature: $TEMPERATURE"
 echo "Disable Optimizations: $DISABLE_OPTIMIZATIONS"
 echo "Two-Step Inference: $TWO_STEP_INFERENCE"
-echo "Second Step Keep Adapter: $SECOND_STEP_KEEP_ADAPTER"
-echo "Second Step Uses Image: $SECOND_STEP_USES_IMAGE"
+echo "Step2 Keep Adapter: $STEP2_KEEP_ADAPTER"
+echo "Step2 Uses Image: $STEP2_USES_IMAGE"
+echo "Step2 Temperature: ${STEP2_TEMPERATURE:-<default --temperature>}"
 echo "Enable GPT Extraction: $ENABLE_GPT_EXTRACTION"
 echo "GPT Model: $GPT_MODEL"
 echo "=========================================="
@@ -177,11 +179,14 @@ fi
 if [ "$TWO_STEP_INFERENCE" = "true" ]; then
     ARGS+=("--two-step-inference")
 fi
-if [ "$SECOND_STEP_KEEP_ADAPTER" = "true" ]; then
-    ARGS+=("--second-step-keep-adapter")
+if [ "$STEP2_KEEP_ADAPTER" = "true" ]; then
+    ARGS+=("--step2-keep-adapter")
 fi
-if [ "$SECOND_STEP_USES_IMAGE" = "true" ]; then
-    ARGS+=("--second-step-uses-image")
+if [ "$STEP2_USES_IMAGE" = "true" ]; then
+    ARGS+=("--step2-uses-image")
+fi
+if [ -n "$STEP2_TEMPERATURE" ]; then
+    ARGS+=("--step2-temperature" "$STEP2_TEMPERATURE")
 fi
 
 # Add GPT extraction options
