@@ -89,28 +89,36 @@ Rules:
 Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
 If only one person is described as looking at another, it is NonCommmunicative."""
 
-PROMPT_A = """For each person, provide a brief description and specify what they are looking at: another person, an object, or off-screen."""
-PROMPT_A = """Identify all visible people in the image.
-For each person:
-Assign a unique ID (e.g., Person_1, Person_2).
-Briefly describe their appearance (clothing, position, distinguishing features).
-Estimate their gaze direction.
-Identify what they are looking at: another person (use ID), an object (name it), or off-screen.
-If uncertain, state the uncertainty.
-Return your answer strictly in the following JSON format:
-{
-  "people": [
-    {
-      "id": "Person_1",
-      "description": "",
-      "gaze_direction": "",
-      "gaze_target_type": "person | object | off_screen | unclear",
-      "gaze_target": "",
-      "uncertainty": ""
-    }
-  ]
-}
-"""
+PROMPT_A = """Describe the scene in free wording with focus on people and gaze.
+
+Include:
+1. How many people are visible in the image.
+2. A brief description of each visible person.
+3. For each person, where they are looking (another person, an object/place, off-screen, the camera, or unclear).
+
+Keep the response concise but ensure all visible people are covered.
+Do not assign any interaction label (no MutualGaze, SharedObjectAttention, OneSidedGaze, NonCommmunicative, or None)."""
+# PROMPT_A = """Identify all visible people in the image.
+# For each person:
+# Assign a unique ID (e.g., Person_1, Person_2).
+# Briefly describe their appearance (clothing, position, distinguishing features).
+# Estimate their gaze direction.
+# Identify what they are looking at: another person (use ID), an object (name it), or off-screen.
+# If uncertain, state the uncertainty.
+# Return your answer strictly in the following JSON format:
+# {
+#   "people": [
+#     {
+#       "id": "Person_1",
+#       "description": "",
+#       "gaze_direction": "",
+#       "gaze_target_type": "person | object | off_screen | unclear",
+#       "gaze_target": "",
+#       "uncertainty": ""
+#     }
+#   ]
+# }
+# """
 # gaze_target_type must be exactly one of the following values:
 # "person" (if looking at another identified person — use their ID)
 # "object" (if looking at a visible object — name it)
@@ -143,19 +151,27 @@ Return your answer strictly in the following JSON format:
 # • If gaze cannot be determined, use "uncertain".
 # • Do not output your reasoning or any extra text."""
 
-PROMPT_B = """Based on the provided gaze information, choose exactly one social interaction label:
-MutualGaze: at least two people are looking at each other (A looks at B and B looks at A).
-SharedObjectAttention: at least two people are looking at the same external object or place (not a person), including one person following another person's reference to that external target.
-OneSidedGaze: one person looks at another person but the other looks away or elsewhere (not reciprocated).
-NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze. for example, if people are looking at something or someone off-screen, or when theres only one person in the image.
-None: if no gaze-looking information is provided.
+PROMPT_B = """Given Step-1 gaze facts, choose exactly one label and briefly justify it from the listed person-to-target relations.
 
-Rules:
-Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
-If only one person is described as looking at another, it is NonCommmunicative.
-If all people are looking at something or someone off-screen, or at the camera, label as NonCommmunicative.
-If no gaze information is given, label as None.
-Single person in the image will ALWAYS result in NonCommmunicative."""
+Labels:
+MutualGaze: at least two people look at each other (A->B and B->A).
+SharedObjectAttention: at least two people look at the same external object/place (not a person), including follow/reference toward that same external target.
+OneSidedGaze: someone looks at another person, but reciprocity is absent.
+NonCommmunicative: no clear interpersonal gaze interaction (off-screen/camera/object-only/unclear), or single-person scene.
+None: no usable gaze-looking information is provided.
+
+Decision rules:
+1. Do not guess MutualGaze; require explicit reciprocity.
+2. If only one person looks at another person and it is not reciprocated, use OneSidedGaze.
+3. If all gaze targets are off-screen/camera/unclear, use NonCommmunicative.
+4. If only one person is present, always use NonCommmunicative.
+5. If no usable gaze info exists, use None.
+
+Output format (strict):
+Label: <MutualGaze|SharedObjectAttention|OneSidedGaze|NonCommmunicative|None>
+Reason:
+- <1 short bullet citing key gaze relation(s), e.g., P1->P2 and P2->P1>
+- <optional 2nd short bullet for tie-break/rule applied>"""
 
 # PROMPT_B = """Task: Assign exactly one Vacation gaze label:
 # MutualGaze, SharedObjectAttention, OneSidedGaze, NonCommmunicative, None
@@ -235,12 +251,14 @@ def parse_args() -> argparse.Namespace:
         help="Second prompt appended after the first response for two-step inference.",
     )
     parser.add_argument(
+        "--step2-separator",
         "--second-separator",
         type=str,
         default=" \n",
         help="Separator placed between response A and prompt B in two-step inference.",
     )
     parser.add_argument(
+        "--step2-keep-adapter",
         "--second-step-keep-adapter",
         action="store_true",
         help=(
@@ -249,11 +267,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--step2-uses-image",
         "--second-step-uses-image",
         action="store_true",
         help=(
             "In two-step inference, include the image again in step 2. "
             "Default behavior uses text-only step 2."
+        ),
+    )
+    parser.add_argument(
+        "--step2-temperature",
+        "--second-step-temperature",
+        type=float,
+        default=None,
+        help=(
+            "Optional temperature override for step 2 in two-step inference. "
+            "If not set, step 2 uses --temperature."
         ),
     )
     
@@ -614,6 +643,7 @@ def run_inference_on_frame(
     args: argparse.Namespace,
     conv_name: str,
     include_image: bool = True,
+    temperature_override: Optional[float] = None,
 ) -> str:
     """Run inference on a single frame, return the response."""
     image_tensor = None
@@ -644,10 +674,14 @@ def run_inference_on_frame(
             return_tensors="pt",
         ).input_ids.to(model.device)
     
+    effective_temperature = (
+        args.temperature if temperature_override is None else temperature_override
+    )
+
     # Build generation kwargs
     gen_kwargs = {
         "inputs": input_ids,
-        "do_sample": args.temperature > 0,
+        "do_sample": effective_temperature > 0,
         "max_new_tokens": args.max_new_tokens,
         "use_cache": True,
         "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
@@ -656,8 +690,8 @@ def run_inference_on_frame(
         gen_kwargs["images"] = image_tensor
         gen_kwargs["image_sizes"] = [list(image_size)]
     
-    if args.temperature > 0:
-        gen_kwargs["temperature"] = args.temperature
+    if effective_temperature > 0:
+        gen_kwargs["temperature"] = effective_temperature
     
     # Generate
     with torch.inference_mode():
@@ -696,12 +730,12 @@ def run_two_step_inference_on_frame(
     )
     if response_a.strip() and not response_a.strip().endswith("."):
         response_a = response_a.strip() + "."
-    combined_prompt = f"{response_a}{args.second_separator}{prompt_b}".strip()
+    combined_prompt = f"{response_a}{args.step2_separator}{prompt_b}".strip()
 
     if (
         hasattr(model, "disable_adapter")
         and args.adapter_path
-        and not args.second_step_keep_adapter
+        and not args.step2_keep_adapter
     ):
         with model.disable_adapter():
             response_b = run_inference_on_frame(
@@ -712,7 +746,8 @@ def run_two_step_inference_on_frame(
                 combined_prompt,
                 args,
                 conv_name,
-                include_image=args.second_step_uses_image,
+                include_image=args.step2_uses_image,
+                temperature_override=args.step2_temperature,
             )
     else:
         response_b = run_inference_on_frame(
@@ -723,7 +758,8 @@ def run_two_step_inference_on_frame(
             combined_prompt,
             args,
             conv_name,
-            include_image=args.second_step_uses_image,
+            include_image=args.step2_uses_image,
+            temperature_override=args.step2_temperature,
         )
 
     return response_a, response_b, combined_prompt
@@ -784,6 +820,7 @@ def main():
     wandb_run_name = build_run_name_from_adapter(adapter_path or args.model_path)
     wandb_run_id = args.wandb_run_id
     existing = {}
+    log_to_wandb = bool(args.log_to_wandb and image_path is None)
     
     # Validate paths
     if image_path is not None:
@@ -841,7 +878,7 @@ def main():
     second_step_uses_adapter = None
     if args.two_step_inference:
         second_step_uses_adapter = bool(adapter_path) and (
-            args.second_step_keep_adapter or not hasattr(model, "disable_adapter")
+            args.step2_keep_adapter or not hasattr(model, "disable_adapter")
         )
 
     config = {
@@ -849,9 +886,10 @@ def main():
         "two_step_inference": args.two_step_inference,
         "prompt_a": args.prompt_a if args.two_step_inference else None,
         "prompt_b": args.prompt_b if args.two_step_inference else None,
-        "second_separator": args.second_separator if args.two_step_inference else None,
-        "second_step_uses_image": args.second_step_uses_image if args.two_step_inference else None,
-        "second_step_keep_adapter": args.second_step_keep_adapter if args.two_step_inference else None,
+        "second_separator": args.step2_separator if args.two_step_inference else None,
+        "second_step_uses_image": args.step2_uses_image if args.two_step_inference else None,
+        "second_step_keep_adapter": args.step2_keep_adapter if args.two_step_inference else None,
+        "second_step_temperature": args.step2_temperature if args.two_step_inference else None,
         "second_step_uses_adapter": second_step_uses_adapter,
         "model_path": args.model_path,
         "adapter_path": adapter_path,
@@ -863,11 +901,11 @@ def main():
         "temperature": args.temperature,
         "gpt_extraction_enabled": args.enable_gpt_extraction,
         "gpt_model": args.gpt_model if args.enable_gpt_extraction else None,
-        "wandb_project": args.wandb_project if args.log_to_wandb else None,
-        "wandb_entity": args.wandb_entity if args.log_to_wandb else None,
-        "wandb_run_name": wandb_run_name if args.log_to_wandb else None,
-        "wandb_run_id": wandb_run_id if args.log_to_wandb else None,
-        "wandb_resume": args.wandb_resume if args.log_to_wandb else None,
+        "wandb_project": args.wandb_project if log_to_wandb else None,
+        "wandb_entity": args.wandb_entity if log_to_wandb else None,
+        "wandb_run_name": wandb_run_name if log_to_wandb else None,
+        "wandb_run_id": wandb_run_id if log_to_wandb else None,
+        "wandb_resume": args.wandb_resume if log_to_wandb else None,
     }
 
     base_wandb_config: Dict[str, Any] = {
@@ -880,10 +918,13 @@ def main():
         "skip_step": args.skip_step,
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
+        "second_step_temperature": args.step2_temperature,
         "two_step_inference": args.two_step_inference,
         "gpt_extraction_enabled": args.enable_gpt_extraction,
     }
-    if args.log_to_wandb:
+    if args.log_to_wandb and image_path is not None:
+        print("W&B logging disabled for single-image inference mode.")
+    if log_to_wandb:
         print(
             f"W&B logging enabled (project={args.wandb_project}, "
             f"entity={args.wandb_entity or 'default'}, run_name={wandb_run_name})"
@@ -939,10 +980,12 @@ def main():
             print("Using two-step prompts:")
             print(f"Prompt A:\n{args.prompt_a}\n")
             print(f"Prompt B:\n{args.prompt_b}\n")
-            step2_image_mode = "enabled" if args.second_step_uses_image else "disabled"
+            step2_image_mode = "enabled" if args.step2_uses_image else "disabled"
             print(f"Step 2 image input: {step2_image_mode}\n")
+            if args.step2_temperature is not None:
+                print(f"Step 2 temperature override: {args.step2_temperature}\n")
             if args.adapter_path:
-                step2_mode = "enabled" if args.second_step_keep_adapter else "disabled"
+                step2_mode = "enabled" if args.step2_keep_adapter else "disabled"
                 print(f"Step 2 adapters: {step2_mode}\n")
         else:
             print(f"Using prompt:\n{args.prompt}\n")
@@ -995,7 +1038,7 @@ def main():
             result_entry["extracted_gaze_info"] = extracted
 
         metrics = compute_metrics([result_entry])
-        if args.log_to_wandb:
+        if log_to_wandb:
             log_metrics_to_wandb(metrics, total_results=1)
 
         print(f"\nSaving final results to {output_path}...")
@@ -1053,7 +1096,7 @@ def main():
         print("All frames already processed!")
         if results:
             metrics = compute_metrics(results)
-            if args.log_to_wandb:
+            if log_to_wandb:
                 log_metrics_to_wandb(metrics, total_results=len(results))
             save_checkpoint(output_path, config, results, metrics)
             print(
@@ -1063,7 +1106,7 @@ def main():
                 f"{metrics['accuracy_vs_atomic_attribute_combo']:.4f} "
                 f"(evaluated={metrics['accuracy_evaluated_frames']})"
             )
-        elif args.log_to_wandb:
+        elif log_to_wandb:
             print("W&B logging skipped: no results available to log.")
         return
     
@@ -1072,10 +1115,12 @@ def main():
         print("Using two-step prompts:")
         print(f"Prompt A:\n{args.prompt_a}\n")
         print(f"Prompt B:\n{args.prompt_b}\n")
-        step2_image_mode = "enabled" if args.second_step_uses_image else "disabled"
+        step2_image_mode = "enabled" if args.step2_uses_image else "disabled"
         print(f"Step 2 image input: {step2_image_mode}\n")
+        if args.step2_temperature is not None:
+            print(f"Step 2 temperature override: {args.step2_temperature}\n")
         if args.adapter_path:
-            step2_mode = "enabled" if args.second_step_keep_adapter else "disabled"
+            step2_mode = "enabled" if args.step2_keep_adapter else "disabled"
             print(f"Step 2 adapters: {step2_mode}\n")
     else:
         print(f"Using prompt:\n{args.prompt}\n")
@@ -1158,7 +1203,7 @@ def main():
     # Final save
     print(f"\nSaving final results to {output_path}...")
     metrics = compute_metrics(results)
-    if args.log_to_wandb:
+    if log_to_wandb:
         log_metrics_to_wandb(metrics, total_results=len(results))
     save_checkpoint(output_path, config, results, metrics)
     print(
