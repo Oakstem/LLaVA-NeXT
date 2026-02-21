@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
+import sys
 import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+# Ensure project root is importable
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from gazefollow.evals.log_wandb_evaluations import (
     DEFAULT_PROJECT,
