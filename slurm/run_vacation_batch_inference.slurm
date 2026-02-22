@@ -27,6 +27,7 @@ fi
 QUANTIZATION="${QUANTIZATION:-}"  # Options: 4bit, 8bit, none
 
 # Batch inference parameters
+IMAGE_PATH="${IMAGE_PATH:-}"
 ANNOTATIONS_FILE="${ANNOTATIONS_FILE:-datasets/Vacation/test_annotations.csv}"
 FRAMES_DIR="${FRAMES_DIR:-datasets/Vacation/frames}"
 OUTPUT_JSON="${OUTPUT_JSON:-vacation_results/llava_vacation_general_results_20260114_101635_checkpoint-5000_$(date +%Y%m%d_%H%M%S).json}"
@@ -69,8 +70,14 @@ echo "Model Base: $MODEL_BASE"
 echo "Adapter Path: $ADAPTER_PATH"
 echo "Attention Implementation: $ATTN_IMPLEMENTATION"
 echo "Quantization: $QUANTIZATION"
-echo "Annotations File: $ANNOTATIONS_FILE"
-echo "Frames Dir: $FRAMES_DIR"
+if [ -n "$IMAGE_PATH" ]; then
+    echo "Mode: Single image"
+    echo "Image Path: $IMAGE_PATH"
+else
+    echo "Mode: Batch"
+    echo "Annotations File: $ANNOTATIONS_FILE"
+    echo "Frames Dir: $FRAMES_DIR"
+fi
 echo "Output JSON: $OUTPUT_JSON"
 echo "Skip Step: $SKIP_STEP"
 echo "Limit: $LIMIT"
@@ -119,35 +126,42 @@ cd /galitylab/students/alonmardi/projects/LLaVA-NeXT
 
 # Build command arguments
 ARGS=(
-    "--annotations-file" "$ANNOTATIONS_FILE"
-    "--frames-dir" "$FRAMES_DIR"
     "--output-json" "$OUTPUT_JSON"
-    "--skip-step" "$SKIP_STEP"
-    "--checkpoint-interval" "$CHECKPOINT_INTERVAL"
     "--model-path" "$MODEL_PATH"
     "--attn-implementation" "$ATTN_IMPLEMENTATION"
     "--max-new-tokens" "$MAX_NEW_TOKENS"
     "--temperature" "$TEMPERATURE"
 )
 
+if [ -n "$IMAGE_PATH" ]; then
+    ARGS+=("--image-path" "$IMAGE_PATH")
+else
+    ARGS+=(
+        "--annotations-file" "$ANNOTATIONS_FILE"
+        "--frames-dir" "$FRAMES_DIR"
+        "--skip-step" "$SKIP_STEP"
+        "--checkpoint-interval" "$CHECKPOINT_INTERVAL"
+    )
+fi
+
 # Add optional args
 if [ -n "$PROMPT" ]; then
     ARGS+=("--prompt" "$PROMPT")
 fi
 
-if [ -n "$LIMIT" ]; then
+if [ -z "$IMAGE_PATH" ] && [ -n "$LIMIT" ]; then
     ARGS+=("--limit" "$LIMIT")
 fi
 
-if [ "$RESUME" = "true" ]; then
+if [ -z "$IMAGE_PATH" ] && [ "$RESUME" = "true" ]; then
     ARGS+=("--resume")
 fi
 
-if [ "$RANDOMIZE" = "true" ]; then
+if [ -z "$IMAGE_PATH" ] && [ "$RANDOMIZE" = "true" ]; then
     ARGS+=("--randomize")
 fi
 
-if [ -n "$SEED" ]; then
+if [ -z "$IMAGE_PATH" ] && [ -n "$SEED" ]; then
     ARGS+=("--seed" "$SEED")
 fi
 

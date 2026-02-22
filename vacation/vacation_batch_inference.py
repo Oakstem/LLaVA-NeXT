@@ -429,6 +429,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional existing W&B run id to resume and update.",
     )
     parser.add_argument(
+        "--wandb-run-suffix",
+        type=str,
+        default=None,
+        help=(
+            "Optional suffix appended to W&B run name. "
+            "When provided, always starts a new run (no resume)."
+        ),
+    )
+    parser.add_argument(
         "--wandb-resume",
         type=str,
         default="allow",
@@ -818,9 +827,16 @@ def main():
     output_path = Path(fix_wsl_paths(args.output_json))
     adapter_path = fix_wsl_paths(args.adapter_path) if args.adapter_path else None
     wandb_run_name = build_run_name_from_adapter(adapter_path or args.model_path)
-    wandb_run_id = args.wandb_run_id
+    wandb_run_suffix = str(args.wandb_run_suffix).strip() if args.wandb_run_suffix else None
+    force_new_wandb_run = bool(wandb_run_suffix)
+    if wandb_run_suffix:
+        wandb_run_name = f"{wandb_run_name}-{wandb_run_suffix}"
+    wandb_run_id = args.wandb_run_id if not force_new_wandb_run else None
+    wandb_resume = "never" if force_new_wandb_run else args.wandb_resume
     existing = {}
     log_to_wandb = bool(args.log_to_wandb and image_path is None)
+    if force_new_wandb_run and args.wandb_run_id:
+        print("Ignoring --wandb-run-id because --wandb-run-suffix forces a new run.")
     
     # Validate paths
     if image_path is not None:
@@ -904,8 +920,9 @@ def main():
         "wandb_project": args.wandb_project if log_to_wandb else None,
         "wandb_entity": args.wandb_entity if log_to_wandb else None,
         "wandb_run_name": wandb_run_name if log_to_wandb else None,
+        "wandb_run_suffix": wandb_run_suffix if log_to_wandb else None,
         "wandb_run_id": wandb_run_id if log_to_wandb else None,
-        "wandb_resume": args.wandb_resume if log_to_wandb else None,
+        "wandb_resume": wandb_resume if log_to_wandb else None,
     }
 
     base_wandb_config: Dict[str, Any] = {
@@ -921,6 +938,9 @@ def main():
         "second_step_temperature": args.step2_temperature,
         "two_step_inference": args.two_step_inference,
         "gpt_extraction_enabled": args.enable_gpt_extraction,
+        "wandb_run_name": wandb_run_name,
+        "wandb_run_suffix": wandb_run_suffix,
+        "wandb_resume": wandb_resume,
     }
     if args.log_to_wandb and image_path is not None:
         print("W&B logging disabled for single-image inference mode.")
@@ -934,7 +954,7 @@ def main():
 
     def log_metrics_to_wandb(metrics: dict, total_results: int) -> None:
         nonlocal wandb_run_id
-        if wandb_run_id is None:
+        if wandb_run_id is None and not force_new_wandb_run:
             inferred_id, inferred_entity = infer_wandb_run_id(
                 wandb_project=args.wandb_project,
                 wandb_entity=args.wandb_entity,
@@ -954,7 +974,7 @@ def main():
             wandb_entity=args.wandb_entity,
             wandb_run_name=wandb_run_name,
             wandb_run_id=wandb_run_id,
-            wandb_resume=args.wandb_resume,
+            wandb_resume=wandb_resume,
             base_wandb_config=base_wandb_config,
             metric_row=row,
             metric_prefix="vacation",
@@ -1059,6 +1079,7 @@ def main():
         existing_config = existing.get("config")
         if (
             isinstance(existing_config, dict)
+            and not force_new_wandb_run
             and not wandb_run_id
             and existing_config.get("wandb_run_id")
         ):
