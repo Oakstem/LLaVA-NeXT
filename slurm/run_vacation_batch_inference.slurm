@@ -52,6 +52,7 @@ STEP2_TEMPERATURE="${STEP2_TEMPERATURE:-}"
 # GPT extraction parameters
 ENABLE_GPT_EXTRACTION="${ENABLE_GPT_EXTRACTION:-false}"
 GPT_MODEL="${GPT_MODEL:-gpt-5-nano}"
+WANDB_RUN_SUFFIX="${WANDB_RUN_SUFFIX:-}"
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
@@ -95,6 +96,7 @@ echo "Step2 Uses Image: $STEP2_USES_IMAGE"
 echo "Step2 Temperature: ${STEP2_TEMPERATURE:-<default --temperature>}"
 echo "Enable GPT Extraction: $ENABLE_GPT_EXTRACTION"
 echo "GPT Model: $GPT_MODEL"
+echo "W&B Run Suffix: ${WANDB_RUN_SUFFIX:-<none>}"
 echo "=========================================="
 
 # Load any required modules (uncomment and modify as needed)
@@ -206,6 +208,10 @@ fi
 # Add GPT extraction options
 if [ "$ENABLE_GPT_EXTRACTION" = "true" ]; then
     ARGS+=("--enable-gpt-extraction" "--gpt-model" "$GPT_MODEL")
+fi
+
+if [ -n "$WANDB_RUN_SUFFIX" ]; then
+    ARGS+=("--wandb-run-suffix" "$WANDB_RUN_SUFFIX")
 fi
 
 # Print the command that will be executed
