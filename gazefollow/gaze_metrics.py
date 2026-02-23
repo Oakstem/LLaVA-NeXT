@@ -30,12 +30,20 @@ def load_combined_description_cache(csv_path: Path = COMBINED_CSV_PATH_TRAIN) ->
         with open(csv_path, "r", encoding="utf-8") as csv_file:
             reader = csv.DictReader(csv_file)
             for row in reader:
-                rel_path = row.get("image_path.1")
+                rel_path = (
+                    row.get("image_path.1")
+                    or row.get("image_path")
+                    or row.get("image")
+                    or row.get("id")
+                )
                 if not rel_path:
                     continue
-                key = rel_path.strip()
+                key = str(rel_path).strip().replace("\\", "/")
+                if key.startswith("./"):
+                    key = key[2:]
                 if key:
-                    mapping[key] = row
+                    # Keep first annotation per image path when multiple rows exist.
+                    mapping.setdefault(key, row)
     else:
         print(f"Warning: Combined description CSV not found at {csv_path}")
 
