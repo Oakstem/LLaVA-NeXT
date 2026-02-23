@@ -67,6 +67,7 @@ class EvaluationConfig:
     wandb_run_name_suffix: str
     use_gpt_gaze_targets: bool
     in_out_labels_csv: Optional[Path]
+    ground_truth_csv: Optional[Path]
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "EvaluationConfig":
@@ -100,6 +101,7 @@ class EvaluationConfig:
             wandb_run_name_suffix=args.wandb_run_name_suffix,
             use_gpt_gaze_targets=args.use_gpt_gaze_targets,
             in_out_labels_csv=Path(args.in_out_labels_csv) if args.in_out_labels_csv else None,
+            ground_truth_csv=Path(args.ground_truth_csv) if getattr(args, "ground_truth_csv", None) else None,
         )
 
     def resolved_device_map(self) -> str:

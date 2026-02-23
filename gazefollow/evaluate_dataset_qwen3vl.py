@@ -196,6 +196,14 @@ def parse_args() -> argparse.Namespace:
         default=COMBINED_CSV_PATH_TRAIN,
         help="Optional CSV file produced by add_in_out_labels.py to supply in/out annotations.",
     )
+    parser.add_argument(
+        "--ground-truth-csv",
+        default=None,
+        help=(
+            "Optional CSV file containing gaze_x/gaze_y ground truth keyed by image path. "
+            "When unset, the evaluator chooses defaults and falls back across known Gazefollow CSVs."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -249,8 +257,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     images_dir = config.images_dir
     device_map = config.resolved_device_map()
     train_set_mode = "train" in config.dataset_json.name.lower() or 'val' in config.dataset_json.name.lower()
-    gt_csv_path = COMBINED_CSV_PATH_TRAIN if train_set_mode else COMBINED_CSV_PATH_TEST
-    config.in_out_labels_csv = COMBINED_CSV_PATH_TRAIN if train_set_mode else COMBINED_CSV_PATH_TEST
+    gt_csv_path = config.ground_truth_csv or (COMBINED_CSV_PATH_TRAIN if train_set_mode else COMBINED_CSV_PATH_TEST)
 
     print(f"Loading Qwen3-VL model '{config.gaze_model_id}' with device map '{device_map}'...")
     qwen_processor, qwen_model = load_qwen3vl_model(config.gaze_model_id, device_map=device_map)
@@ -260,7 +267,20 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     else:
         print("Using parsed ground truth text for gaze targets")
 
-    combined_cache = load_combined_description_cache(gt_csv_path)
+    gt_candidates: List[Path] = [gt_csv_path]
+    for extra_path in (
+        COMBINED_CSV_PATH_TRAIN,
+        COMBINED_CSV_PATH_TEST,
+        Path("gazefollow/data/train_annotations_release.csv"),
+        Path("gazefollow/data/test_annotations_release.csv"),
+    ):
+        if extra_path not in gt_candidates:
+            gt_candidates.append(extra_path)
+    gt_caches: List[Dict[str, Dict[str, str]]] = []
+    for candidate in gt_candidates:
+        cache = load_combined_description_cache(candidate)
+        if cache:
+            gt_caches.append(cache)
     in_out_lookup = load_in_out_lookup(config.in_out_labels_csv) if config.in_out_labels_csv else None
     if in_out_lookup is not None:
         print(f"Loaded in/out labels from {config.in_out_labels_csv} ({len(in_out_lookup)} entries)")
@@ -434,17 +454,9 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
             relative_image_path = str(image_path)
         relative_image_path = relative_image_path.replace("\\", "/")
 
-        mapping_ref = combined_cache if combined_cache is not None else {}
-        ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
-            sample,
-            relative_image_path,
-            width,
-            height,
-            mapping_ref,
-        )
-        if ground_truth_gaze is None and combined_cache is None:
-            combined_cache = load_combined_description_cache()
-            mapping_ref = combined_cache
+        ground_truth_gaze = None
+        gt_updated = False
+        for mapping_ref in gt_caches:
             ground_truth_gaze, gt_updated = ensure_ground_truth_gaze(
                 sample,
                 relative_image_path,
@@ -452,6 +464,8 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
                 height,
                 mapping_ref,
             )
+            if ground_truth_gaze is not None:
+                break
         if ground_truth_gaze is None:
             failure_record: FailureRecord = {
                 "id": sample_id,

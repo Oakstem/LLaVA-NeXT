@@ -33,6 +33,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_RUN_NAME_SUFFIX="${WANDB_RUN_NAME_SUFFIX:-}"
 USE_GPT_GAZE_TARGETS="${USE_GPT_GAZE_TARGETS:-false}"
 IN_OUT_LABELS_CSV="${IN_OUT_LABELS_CSV:-}"
+GROUND_TRUTH_CSV="${GROUND_TRUTH_CSV:-}"
 
 # Prepare directories
 mkdir -p logs
@@ -81,6 +82,9 @@ fi
 if [ -n "$IN_OUT_LABELS_CSV" ]; then
     echo "In/Out labels CSV: $IN_OUT_LABELS_CSV"
 fi
+if [ -n "$GROUND_TRUTH_CSV" ]; then
+    echo "Ground-truth CSV: $GROUND_TRUTH_CSV"
+fi
 echo "=========================================="
 
 # Validate inputs
@@ -94,11 +98,17 @@ if [ ! -d "$IMAGES_DIR" ]; then
     exit 1
 fi
 
-# Activate environment
-echo "Activating Python environment..."
-source /galitylab/students/alonmardi/.ground-uv/bin/activate
-which python
-python --version
+# Select approved Python environment
+if [ -x "/galitylab/students/alonmardi/llava/bin/python" ]; then
+    PYTHON_BIN="/galitylab/students/alonmardi/llava/bin/python"
+elif [ -x "/home/alonz/llava/bin/python" ]; then
+    PYTHON_BIN="/home/alonz/llava/bin/python"
+else
+    echo "ERROR: Could not find approved Python interpreter."
+    exit 1
+fi
+echo "Using Python: $PYTHON_BIN"
+"$PYTHON_BIN" --version
 
 echo ""
 echo "GPU Info:"
@@ -148,6 +158,9 @@ fi
 if [ -n "$IN_OUT_LABELS_CSV" ]; then
     ARGS+=("--in-out-labels-csv" "$IN_OUT_LABELS_CSV")
 fi
+if [ -n "$GROUND_TRUTH_CSV" ]; then
+    ARGS+=("--ground-truth-csv" "$GROUND_TRUTH_CSV")
+fi
 if [ -n "$RESUME_FROM" ]; then
     ARGS+=("--resume-from" "$RESUME_FROM")
 fi
@@ -171,12 +184,12 @@ fi
 
 echo "=========================================="
 echo "Running dataset evaluation command:"
-echo "python gazefollow/evaluate_dataset_qwen3vl.py ${ARGS[*]}"
+echo "$PYTHON_BIN gazefollow/evaluate_dataset_qwen3vl.py ${ARGS[*]}"
 echo "=========================================="
 
 start_time=$(date +%s)
 
-python gazefollow/evaluate_dataset_qwen3vl.py "${ARGS[@]}"
+"$PYTHON_BIN" gazefollow/evaluate_dataset_qwen3vl.py "${ARGS[@]}"
 exit_code=$?
 
 end_time=$(date +%s)
@@ -196,7 +209,7 @@ if [ $exit_code -eq 0 ]; then
         echo ""
         echo "Key Metrics:"
         export METRICS_PATH="$metrics_path"
-        python - <<'PY'
+        "$PYTHON_BIN" - <<'PY'
 import json
 import os
 
