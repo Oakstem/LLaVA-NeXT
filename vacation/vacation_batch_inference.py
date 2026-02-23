@@ -77,17 +77,39 @@ DEFAULT_FRAMES_DIR = "datasets/Vacation/frames"
 # Important constraint:
 # Joint attention never applies when the shared target is a person. If people are looking at each other, that is Mutual gaze, not Joint attention."""
 
-DEFAULT_PROMPT = """Describe each person briefly and say what they are looking at (person, object, or off-screen).
+DEFAULT_PROMPT = """Analyze the image in two steps.
 
-Then choose exactly one social interaction label:
-MutualGaze: at least two people are looking at each other (A looks at B and B looks at A).
-SharedObjectAttention: at least two people are looking at the same external object or place (not a person), including one person following another person's reference to that external target.
-OneSidedGaze: one person looks at another person but the other looks away or elsewhere (not reciprocated).
-NonCommmunicative: no clear gaze interaction or gaze is unclear; use this when people are not engaging through gaze.
+Step 1 - Gaze facts:
+1. State how many people are visible.
+2. Briefly describe each visible person.
+3. For each person, state what they are looking at: another person, an external object/place, off-screen, camera, or unclear.
 
-Rules:
-Do not guess MutualGaze. If reciprocity is not obvious, it is not MutualGaze.
-If only one person is described as looking at another, it is NonCommmunicative."""
+Step 2 - Label decision:
+Choose exactly one label using the Step 1 gaze facts.
+
+Labels:
+MutualGaze: at least two people look at each other (A->B and B->A).
+SharedObjectAttention: at least two people look at the same specific external object/place (not a person), including follow/reference to that same external target.
+OneSidedGaze: one person looks at another person, but reciprocity is absent.
+NonCommmunicative: no clear interpersonal gaze interaction (gaze mostly off-screen/camera/object-only/unclear), or only one person is present.
+None: no usable gaze-looking information is available.
+
+Decision rules:
+1. Do not guess MutualGaze; require explicit reciprocity.
+2. If one person looks at another and it is not reciprocated, use OneSidedGaze.
+3. Use SharedObjectAttention only when multiple people clearly attend to the same target instance (same object/place), not just similar object categories.
+4. If people look at different objects/places (e.g., each person looking at their own book/phone/newspaper), use NonCommmunicative.
+5. If all gaze targets are off-screen/camera/unclear, use NonCommmunicative.
+6. If only one person is present, use NonCommmunicative.
+7. Use None only when gaze info is not usable.
+
+Output format:
+- First provide Step 1 findings.
+- End with exactly these final lines:
+Label: <MutualGaze|SharedObjectAttention|OneSidedGaze|NonCommmunicative|None>
+Reasoning:
+- <short evidence bullet from gaze relations>
+- <optional short tie-break rule bullet>"""
 
 PROMPT_A = """Describe the scene in free wording with focus on people and gaze.
 
