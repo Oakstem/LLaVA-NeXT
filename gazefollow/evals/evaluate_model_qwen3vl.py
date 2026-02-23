@@ -114,6 +114,7 @@ class GazeEvaluationState:
     predictions_output: List[Dict[str, Any]] = field(default_factory=list)
     model_generation_records: List[Dict[str, Any]] = field(default_factory=list)
     missing_in_out_samples: Set[str] = field(default_factory=set)
+    skipped_in_out_minus_one_samples: Set[str] = field(default_factory=set)
     dataset_gt_updates: List[Dict[str, Any]] = field(default_factory=list)
     dataset_updated: bool = False
     combined_cache: Optional[Dict[str, Dict[str, str]]] = None
@@ -766,6 +767,37 @@ def process_sample_with_qwen_grounding(
         prediction_entry["roi_top1"] = output.roi_eval.get("top1")
         prediction_entry["roi_top1_with_oof"] = output.roi_eval.get("top1_with_oof")
         prediction_entry["roi_pred_candidate_slot"] = output.roi_eval.get("pred_candidate_slot")
+
+    if gt_in_out_value == -1 or predicted_in_out == -1:
+        prediction_entry["skipped"] = True
+        prediction_entry["excluded_reason"] = "in_out_minus_one"
+        prediction_entry["gt_in_out"] = None
+        prediction_entry["predicted_in_out"] = None
+        state.skipped_in_out_minus_one_samples.add(str(sample_id))
+        state.predictions_output.append(prediction_entry)
+        if generate_model_results:
+            model_entry: Dict[str, Any] = {
+                "id": sample_id,
+                "image_path": str(full_image_path),
+                "dataset_prompt": dataset_prompt,
+                "prompt_used": prompt_used,
+                "prompt_source": output.prompt_source,
+                "ground_truth": ground_truth,
+                "model_prediction": prediction_text,
+                "gaze_detections": {},
+                "was_skipped": True,
+                "excluded_reason": "in_out_minus_one",
+            }
+            if output.loss is not None:
+                model_entry["loss"] = output.loss
+            state.model_generation_records.append(model_entry)
+            new_rows = format_generation_sample(model_entry)
+            if new_rows:
+                state.generation_rows_buffer.extend(new_rows)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return
+
     state.predictions_output.append(prediction_entry)
 
     if generate_model_results:
@@ -1852,6 +1884,7 @@ def main():
     predictions_output = evaluation_state.predictions_output
     model_generation_records = evaluation_state.model_generation_records
     missing_in_out_samples = evaluation_state.missing_in_out_samples
+    skipped_in_out_minus_one_samples = evaluation_state.skipped_in_out_minus_one_samples
     dataset_gt_updates = evaluation_state.dataset_gt_updates
     dataset_updated = evaluation_state.dataset_updated
 
@@ -1894,6 +1927,7 @@ def main():
 
     if generate_model_results:
         final_metrics["model_generation_samples"] = len(model_generation_records)
+    final_metrics["skipped_in_out_minus_one"] = len(skipped_in_out_minus_one_samples)
 
     in_out_predictions: List[int] = []
     in_out_labels: List[int] = []
@@ -2020,6 +2054,8 @@ def main():
 
     if missing_in_out_samples:
         print(f"\n⚠️  Missing in_out labels for {len(missing_in_out_samples)} samples.")
+    if skipped_in_out_minus_one_samples:
+        print(f"\n⚠️  Skipped in_out=-1 for {len(skipped_in_out_minus_one_samples)} samples.")
 
     wandb_logged = False
     if args.log_to_wandb:

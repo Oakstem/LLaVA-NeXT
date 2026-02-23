@@ -265,6 +265,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     if in_out_lookup is not None:
         print(f"Loaded in/out labels from {config.in_out_labels_csv} ({len(in_out_lookup)} entries)")
     missing_in_out: Set[str] = set()
+    skipped_in_out_minus_one: Set[str] = set()
     in_out_counts = {0: 0, 1: 0}
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -519,6 +520,11 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
             descriptions=persons,
             use_model_prediction_offcamera=config.use_gpt_gaze_targets,
         )
+        if gt_in_out_value == -1 or pred_in_out_value == -1:
+            skipped_in_out_minus_one.add(str(sample_id))
+            close_image(image)
+            maybe_save_intermediate()
+            continue
         pred_in_out_value = 0 if pred_in_out_value is None else pred_in_out_value
         if pred_in_out_value is not None:
             in_out_counts[pred_in_out_value] = in_out_counts.get(pred_in_out_value, 0) + 1
@@ -670,6 +676,7 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     metrics["in_out_in_frame"] = in_out_counts[1]
     metrics["in_out_out_of_frame"] = in_out_counts[0]
     metrics["missing_in_out"] = len(missing_in_out)
+    metrics["skipped_in_out_minus_one"] = len(skipped_in_out_minus_one)
 
     if gaze_l2_errors:
         metrics["gaze_l2_error_mean"] = sum(gaze_l2_errors) / len(gaze_l2_errors)

@@ -218,16 +218,20 @@ def extract_score(detection: Dict[str, Any]) -> Optional[float]:
 
 
 def coerce_in_out_value(value: Any) -> Optional[int]:
-    """Normalize free-form in/out annotations to {0, 1}."""
+    """Normalize free-form in/out annotations to {-1, 0, 1}."""
     if value is None:
         return None
     if isinstance(value, bool):
         return int(value)
     if isinstance(value, int):
+        if value == -1:
+            return -1
         return 1 if value >= 1 else 0
     if isinstance(value, float):
         if math.isnan(value):
             return None
+        if value == -1.0:
+            return -1
         return 1 if value >= 0.5 else 0
     if isinstance(value, str):
         stripped = value.strip()
@@ -244,6 +248,8 @@ def coerce_in_out_value(value: Any) -> Optional[int]:
             return None
         if math.isnan(numeric):
             return None
+        if numeric == -1.0:
+            return -1
         return 1 if numeric >= 0.5 else 0
     return None
 

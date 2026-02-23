@@ -13,8 +13,10 @@ reflect the latest label resolution rules."""
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set
 
@@ -38,7 +40,11 @@ from gazefollow.evals.log_wandb_evaluations import (  # noqa: E402
     split_metrics,
 )
 from gazefollow.evals.metric_utils import filter_gaze_metrics, flatten_recomputed_metrics, summarize_metrics  # noqa: E402
-from gazefollow.qwen3vl_utils import coerce_in_out_value, resolve_in_out_label  # noqa: E402
+from gazefollow.qwen3vl_utils import (  # noqa: E402
+    coerce_in_out_value,
+    collect_in_out_lookup_keys,
+    resolve_in_out_label,
+)
 
 
 def parse_people(text: Optional[str]) -> List[PersonDescription]:
@@ -46,6 +52,73 @@ def parse_people(text: Optional[str]) -> List[PersonDescription]:
     if not people and text:
         people = parse_person_descriptions(f"Person 1: {text}")
     return people
+
+
+def truncate_float(value: float, digits: int) -> float:
+    scale = 10 ** digits
+    return math.trunc(value * scale) / scale
+
+
+def to_csv_value(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def write_recomputed_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+
+    fieldnames_set = set()
+    for row in rows:
+        fieldnames_set.update(row.keys())
+
+    preferred = [
+        "id",
+        "image",
+        "image_path",
+        "gt_in_out",
+        "pred_in_out",
+        "was_skipped",
+        "excluded_reason",
+    ]
+    remaining = sorted(name for name in fieldnames_set if name not in preferred)
+    fieldnames = [name for name in preferred if name in fieldnames_set] + remaining
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            out_row = {name: to_csv_value(row.get(name)) for name in fieldnames}
+            writer.writerow(out_row)
+
+
+def is_negative_one_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return float(value) == -1.0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return False
+        try:
+            return float(stripped) == -1.0
+        except ValueError:
+            return False
+    return False
+
+
+def has_gt_minus_one_label(entry: Mapping[str, Any], lookup: Mapping[str, Any]) -> bool:
+    if is_negative_one_value(entry.get("in_out")):
+        return True
+    for key in collect_in_out_lookup_keys(entry):
+        if is_negative_one_value(lookup.get(key)):
+            return True
+    return False
 
 
 def build_sample_lookup(entry: Mapping[str, Any]) -> Dict[str, Any]:
@@ -148,6 +221,7 @@ def main() -> None:
     binary_predictions: List[int] = []
     binary_labels: List[int] = []
     excluded_due_to_conflict = 0
+    excluded_due_to_in_out_minus_one = 0
     included_generations: List[Dict[str, Any]] = []
 
     for entry in generations_list:
@@ -155,9 +229,20 @@ def main() -> None:
             entry["gt_in_out"] = None
             entry["pred_in_out"] = None
             entry["excluded_reason"] = "conflicting_gt_in_out"
+            entry["was_skipped"] = True
             entry.pop("in_out", None)
             entry.pop("predicted_in_out", None)
             excluded_due_to_conflict += 1
+            continue
+
+        if has_gt_minus_one_label(entry, in_out_lookup):
+            entry["gt_in_out"] = None
+            entry["pred_in_out"] = None
+            entry["excluded_reason"] = "in_out_minus_one"
+            entry["was_skipped"] = True
+            entry.pop("in_out", None)
+            entry.pop("predicted_in_out", None)
+            excluded_due_to_in_out_minus_one += 1
             continue
 
         gt_flag, pred_flag = infer_in_out_flags(
@@ -165,8 +250,11 @@ def main() -> None:
             in_out_lookup,
             prediction_override=entry.get("model_prediction"),
         )
+
         entry["gt_in_out"] = gt_flag
         entry["pred_in_out"] = pred_flag
+        entry["excluded_reason"] = None
+        entry["was_skipped"] = False
         entry.pop("in_out", None)
         entry.pop("predicted_in_out", None)
 
@@ -184,13 +272,35 @@ def main() -> None:
     )
 
     summary = summarize_metrics(included_generations, binary_predictions, binary_labels, total_counts, filtered_counts)
+    confusion = summary.get("inout_confusion") if isinstance(summary, dict) else None
+    if isinstance(confusion, dict):
+        true_negatives = confusion.get("true_negatives")
+        false_positives = confusion.get("false_positives")
+        if isinstance(true_negatives, int) and isinstance(false_positives, int):
+            gt_zero_total = true_negatives + false_positives
+            summary["out_of_frame_detection_rate"] = f"{true_negatives}/{gt_zero_total}"
+            if gt_zero_total:
+                percent_value = truncate_float(100.0 * true_negatives / gt_zero_total, 2)
+                summary["out_of_frame_detection_rate_percent"] = f"{percent_value:.2f}%"
+            else:
+                summary["out_of_frame_detection_rate_percent"] = None
+        else:
+            summary["out_of_frame_detection_rate"] = None
+            summary["out_of_frame_detection_rate_percent"] = None
+    else:
+        summary["out_of_frame_detection_rate"] = None
+        summary["out_of_frame_detection_rate_percent"] = None
+
+    total_skipped = excluded_due_to_conflict + excluded_due_to_in_out_minus_one
     summary["excluded_due_to_conflicting_gt_in_out"] = excluded_due_to_conflict
+    summary["excluded_due_to_in_out_minus_one"] = excluded_due_to_in_out_minus_one
+    summary["excluded_total"] = total_skipped
     summary["total_generation_samples"] = len(generations_list)
     summary["samples_used_for_calculation"] = len(binary_labels)
     print(json.dumps(summary, indent=2))
     print(
         f"Samples used for calculation: {len(binary_labels)} / {len(generations_list)} "
-        f"(excluded conflicts: {excluded_due_to_conflict})"
+        f"(excluded total: {total_skipped}, conflicts: {excluded_due_to_conflict}, in_out=-1: {excluded_due_to_in_out_minus_one})"
     )
 
     output_dir = results_dir / "offline_recompute"
@@ -200,6 +310,11 @@ def main() -> None:
         json.dumps(generations_list, indent=2),
         encoding="utf-8",
     )
+    csv_path = output_dir / "model_generation_results_recomputed.csv"
+    try:
+        write_recomputed_csv(csv_path, generations_list)
+    except PermissionError as exc:
+        print(f"Warning: could not write CSV at {csv_path}: {exc}")
 
     if args.log_to_wandb:
         try:
