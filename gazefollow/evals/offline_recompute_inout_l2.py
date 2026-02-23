@@ -16,7 +16,7 @@ import argparse
 import sys
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,7 +26,10 @@ from gazefollow.auto_phrase_grounding.detect_gaze_targets import (  # noqa: E402
     PersonDescription,
     parse_person_descriptions,
 )
-from gazefollow.data_proc.add_in_out_labels import load_in_out_lookup  # noqa: E402
+from gazefollow.data_proc.add_in_out_labels import (  # noqa: E402
+    iter_normalized_keys,
+    load_in_out_lookup_with_conflicts,
+)
 from gazefollow.evals.log_wandb_evaluations import (  # noqa: E402
     DEFAULT_PROJECT,
     GENERATION_TABLE_COLUMNS,
@@ -53,6 +56,14 @@ def build_sample_lookup(entry: Mapping[str, Any]) -> Dict[str, Any]:
         "relative_path": entry.get("relative_path") or entry.get("image_path"),
         "image_relative_path": entry.get("image_relative_path") or entry.get("image_path"),
     }
+
+
+def has_conflicting_in_out_key(entry: Mapping[str, Any], conflicting_keys: Set[str]) -> bool:
+    for field in ("id", "image", "image_path", "relative_path", "image_relative_path"):
+        for key in iter_normalized_keys(entry.get(field)):
+            if key in conflicting_keys:
+                return True
+    return False
 
 
 def infer_in_out_flags(
@@ -132,12 +143,23 @@ def main() -> None:
         if alt_path.is_file():
             generations_path = alt_path
     generations_list = load_json_list(generations_path)
-    in_out_lookup = load_in_out_lookup(args.gt_csv)
+    in_out_lookup, conflicting_keys = load_in_out_lookup_with_conflicts(args.gt_csv)
 
     binary_predictions: List[int] = []
     binary_labels: List[int] = []
+    excluded_due_to_conflict = 0
+    included_generations: List[Dict[str, Any]] = []
 
     for entry in generations_list:
+        if has_conflicting_in_out_key(entry, conflicting_keys):
+            entry["gt_in_out"] = None
+            entry["pred_in_out"] = None
+            entry["excluded_reason"] = "conflicting_gt_in_out"
+            entry.pop("in_out", None)
+            entry.pop("predicted_in_out", None)
+            excluded_due_to_conflict += 1
+            continue
+
         gt_flag, pred_flag = infer_in_out_flags(
             entry,
             in_out_lookup,
@@ -149,18 +171,27 @@ def main() -> None:
         entry.pop("predicted_in_out", None)
 
         if gt_flag is None or pred_flag is None:
+            included_generations.append(entry)
             continue
         binary_predictions.append(pred_flag)
         binary_labels.append(gt_flag)
+        included_generations.append(entry)
 
     total_counts, filtered_counts = filter_gaze_metrics(
-        generations_list,
+        included_generations,
         keep_metric=lambda entry: entry.get("gt_in_out") == 1 and entry.get("pred_in_out") == 1,
         mutate=True,
     )
 
-    summary = summarize_metrics(generations_list, binary_predictions, binary_labels, total_counts, filtered_counts)
+    summary = summarize_metrics(included_generations, binary_predictions, binary_labels, total_counts, filtered_counts)
+    summary["excluded_due_to_conflicting_gt_in_out"] = excluded_due_to_conflict
+    summary["total_generation_samples"] = len(generations_list)
+    summary["samples_used_for_calculation"] = len(binary_labels)
     print(json.dumps(summary, indent=2))
+    print(
+        f"Samples used for calculation: {len(binary_labels)} / {len(generations_list)} "
+        f"(excluded conflicts: {excluded_due_to_conflict})"
+    )
 
     output_dir = results_dir / "offline_recompute"
     output_dir.mkdir(parents=True, exist_ok=True)

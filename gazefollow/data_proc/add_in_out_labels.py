@@ -7,7 +7,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 
 
 CSV_KEY_CANDIDATES: Sequence[str] = ("image_path", "image_path.1", "image", "id")
@@ -60,13 +60,14 @@ def iter_normalized_keys(value: Any) -> Iterable[str]:
         yield text.rsplit("/", 1)[-1]
 
 
-def load_in_out_lookup(csv_path: Path) -> Dict[str, Any]:
+def load_in_out_lookup_with_conflicts(csv_path: Path) -> Tuple[Dict[str, Any], Set[str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         if "in_or_out" not in reader.fieldnames:
             raise ValueError("CSV must contain an 'in_or_out' column.")
 
         lookup: Dict[str, Any] = {}
+        conflicting_keys: Set[str] = set()
         for row in reader:
             raw_value = row["in_or_out"]
             label: Any
@@ -87,14 +88,23 @@ def load_in_out_lookup(csv_path: Path) -> Dict[str, Any]:
                 if column not in row or not row[column]:
                     continue
                 for key in iter_normalized_keys(row[column]):
+                    if key in conflicting_keys:
+                        continue
                     existing = lookup.get(key)
                     if existing is not None and existing != label:
-                        raise ValueError(
-                            f"Conflicting 'in_or_out' values for key '{key}': "
-                            f"{existing!r} vs {label!r}"
-                        )
+                        conflicting_keys.add(key)
+                        lookup.pop(key, None)
+                        continue
                     lookup[key] = label
-        return lookup
+        return lookup, conflicting_keys
+
+
+def load_in_out_lookup(csv_path: Path, *, drop_conflicts: bool = False) -> Dict[str, Any]:
+    lookup, conflicting_keys = load_in_out_lookup_with_conflicts(csv_path)
+    if conflicting_keys and not drop_conflicts:
+        key = sorted(conflicting_keys)[0]
+        raise ValueError(f"Conflicting 'in_or_out' values found for key '{key}'.")
+    return lookup
 
 
 def annotate_json_samples(dataset: List[Dict[str, Any]], lookup: Dict[str, Any]) -> List[str]:
