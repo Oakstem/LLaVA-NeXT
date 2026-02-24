@@ -2,8 +2,16 @@
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 from datetime import datetime
+
+
+def _extract_explicit_label(label: str) -> str | None:
+    match = re.search(r"label\s*:\s*([^\n\r]+)", label, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip()
 
 
 def _normalize_social_label(label: str | None) -> str | None:
@@ -11,6 +19,12 @@ def _normalize_social_label(label: str | None) -> str | None:
         return None
     if not isinstance(label, str):
         label = str(label)
+    explicit_label = _extract_explicit_label(label)
+    if explicit_label is not None:
+        explicit_cleaned = explicit_label.strip().lower()
+        if explicit_cleaned in {"", "null", "none"}:
+            return "NonCommmunicative"
+        label = explicit_label
     cleaned = label.strip().lower()
     if cleaned in {"", "null", "none"}:
         return None
@@ -72,15 +86,55 @@ def _get_gt_labels(entry: dict) -> list[str]:
     return [str(label)] if label is not None else []
 
 
+def _get_prediction_label(entry: dict) -> str | None:
+    if isinstance(entry.get("extracted_gaze_info"), dict):
+        return entry.get("extracted_gaze_info").get("social_interaction_label")
+    return entry.get("response")
+
+
+def _get_frame_path(entry: dict) -> str | None:
+    for key in ("frame_path", "image_path", "img_path", "frame", "image", "file_path"):
+        value = entry.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _build_per_sample_rows(results: list[dict]) -> list[dict]:
+    rows = []
+    for idx, entry in enumerate(results):
+        pred_raw = _get_prediction_label(entry)
+        pred_norm = _normalize_social_label(pred_raw)
+        gt_labels = _get_gt_labels(entry)
+        gt_norms = [
+            normalized
+            for label in gt_labels
+            if (normalized := _normalize_social_label(label)) is not None
+        ]
+        is_correct = int(pred_norm is not None and bool(gt_norms) and pred_norm in gt_norms)
+        rows.append(
+            {
+                "sample_idx": idx,
+                "frame_path": _get_frame_path(entry),
+                "prediction": pred_raw,
+                "gt": " | ".join(gt_labels),
+                "inferred_label": pred_norm,
+                "correct": is_correct,
+                "total_correct_rows": "",
+            }
+        )
+    if rows:
+        total_correct = sum(int(row["correct"]) for row in rows)
+        rows[0]["total_correct_rows"] = total_correct
+    return rows
+
+
 def compute_metrics(results: list[dict]) -> dict:
     total_results = len(results)
     extracted_entries = []
     valid_labels = 0
     for r in results:
-        if isinstance(r.get("extracted_gaze_info"), dict):
-            pred_label = r.get("extracted_gaze_info").get("social_interaction_label")
-        else:
-            pred_label = r.get("response")
+        pred_label = _get_prediction_label(r)
         extracted_entries.append(pred_label)
         if _normalize_social_label(pred_label) is not None:
             valid_labels += 1
@@ -95,10 +149,7 @@ def compute_metrics(results: list[dict]) -> dict:
     skipped_missing_gt = 0
     skipped_missing_pred = 0
     for entry in results:
-        if isinstance(entry.get("extracted_gaze_info"), dict):
-            pred_raw = entry.get("extracted_gaze_info").get("social_interaction_label")
-        else:
-            pred_raw = entry.get("response")
+        pred_raw = _get_prediction_label(entry)
         pred_norm = _normalize_social_label(pred_raw)
         gt_norms = [
             normalized
@@ -265,6 +316,8 @@ def main() -> None:
                 **prompt_columns,
             }
         )
+        per_sample_csv = json_path.with_name(f"{json_path.stem}_samples.csv")
+        write_csv(_build_per_sample_rows(results), per_sample_csv)
 
         aggregate["total_results"] += metrics["total_results"]
         aggregate["total_extractions"] += metrics["total_extractions"]
