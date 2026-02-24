@@ -284,7 +284,10 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     in_out_conflicting_keys: Set[str] = set()
     in_out_lookup = None
     if config.in_out_labels_csv:
-        in_out_lookup, in_out_conflicting_keys = load_in_out_lookup_with_conflicts(config.in_out_labels_csv)
+        in_out_lookup, in_out_conflicting_keys = load_in_out_lookup_with_conflicts(
+            config.in_out_labels_csv,
+            include_basename=False,
+        )
     if in_out_lookup is not None:
         print(f"Loaded in/out labels from {config.in_out_labels_csv} ({len(in_out_lookup)} entries)")
         if in_out_conflicting_keys:

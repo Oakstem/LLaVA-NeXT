@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def iter_normalized_keys(value: Any) -> Iterable[str]:
+def iter_normalized_keys(value: Any, *, include_basename: bool = True) -> Iterable[str]:
     """Produce lookup keys for different representations of the same identifier."""
     if value is None:
         return
@@ -56,11 +56,15 @@ def iter_normalized_keys(value: Any) -> Iterable[str]:
             break
 
     yield text
-    if "/" in text:
+    if include_basename and "/" in text:
         yield text.rsplit("/", 1)[-1]
 
 
-def load_in_out_lookup_with_conflicts(csv_path: Path) -> Tuple[Dict[str, Any], Set[str]]:
+def load_in_out_lookup_with_conflicts(
+    csv_path: Path,
+    *,
+    include_basename: bool = True,
+) -> Tuple[Dict[str, Any], Set[str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         if "in_or_out" not in reader.fieldnames:
@@ -87,7 +91,7 @@ def load_in_out_lookup_with_conflicts(csv_path: Path) -> Tuple[Dict[str, Any], S
             for column in CSV_KEY_CANDIDATES:
                 if column not in row or not row[column]:
                     continue
-                for key in iter_normalized_keys(row[column]):
+                for key in iter_normalized_keys(row[column], include_basename=include_basename):
                     if key in conflicting_keys:
                         continue
                     existing = lookup.get(key)
@@ -99,8 +103,16 @@ def load_in_out_lookup_with_conflicts(csv_path: Path) -> Tuple[Dict[str, Any], S
         return lookup, conflicting_keys
 
 
-def load_in_out_lookup(csv_path: Path, *, drop_conflicts: bool = False) -> Dict[str, Any]:
-    lookup, conflicting_keys = load_in_out_lookup_with_conflicts(csv_path)
+def load_in_out_lookup(
+    csv_path: Path,
+    *,
+    drop_conflicts: bool = False,
+    include_basename: bool = True,
+) -> Dict[str, Any]:
+    lookup, conflicting_keys = load_in_out_lookup_with_conflicts(
+        csv_path,
+        include_basename=include_basename,
+    )
     if conflicting_keys and not drop_conflicts:
         key = sorted(conflicting_keys)[0]
         raise ValueError(f"Conflicting 'in_or_out' values found for key '{key}'.")

@@ -296,6 +296,7 @@ def main() -> None:
     summary["excluded_due_to_in_out_minus_one"] = excluded_due_to_in_out_minus_one
     summary["excluded_total"] = total_skipped
     summary["total_generation_samples"] = len(generations_list)
+    summary["successfully_processed_samples"] = len(generations_list)
     summary["samples_used_for_calculation"] = len(binary_labels)
     print(json.dumps(summary, indent=2))
     print(

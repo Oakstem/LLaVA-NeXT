@@ -205,4 +205,8 @@ def flatten_recomputed_metrics(summary: Mapping[str, Any]) -> Dict[str, float]:
     if isinstance(samples, (int, float)):
         flat["samples_evaluated"] = float(samples)
 
+    processed = summary.get("successfully_processed_samples")
+    if isinstance(processed, (int, float)):
+        flat["successfully_processed_samples"] = float(processed)
+
     return flat
