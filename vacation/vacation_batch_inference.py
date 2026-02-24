@@ -90,18 +90,19 @@ Choose exactly one label using the Step 1 gaze facts.
 Labels:
 MutualGaze: at least two people look at each other (A->B and B->A).
 SharedObjectAttention: at least two people look at the same specific external object/place (not a person), including follow/reference to that same external target.
-OneSidedGaze: one person looks at another person, but reciprocity is absent.
+OneSidedGaze: one person explicitly looks at another visible person (A->B), but reciprocity is absent.
 NonCommmunicative: no clear interpersonal gaze interaction (gaze mostly off-screen/camera/object-only/unclear), or only one person is present.
 None: no usable gaze-looking information is available.
 
 Decision rules:
 1. Do not guess MutualGaze; require explicit reciprocity.
-2. If one person looks at another and it is not reciprocated, use OneSidedGaze.
+2. Use OneSidedGaze only when Step 1 explicitly states person-to-person gaze (A->B) and it is not reciprocated.
 3. Use SharedObjectAttention only when multiple people clearly attend to the same target instance (same object/place), not just similar object categories.
 4. If people look at different objects/places (e.g., each person looking at their own book/phone/newspaper), use NonCommmunicative.
-5. If all gaze targets are off-screen/camera/unclear, use NonCommmunicative.
+5. If all gaze targets are off-screen/camera/unclear, use NonCommmunicative (even if they seem to look in a similar direction).
 6. If only one person is present, use NonCommmunicative.
 7. Use None only when gaze info is not usable.
+8. If no person is looking at another visible person, do not use OneSidedGaze.
 
 Output format:
 - First provide Step 1 findings.
@@ -178,16 +179,17 @@ PROMPT_B = """Given Step-1 gaze facts, choose exactly one label and briefly just
 Labels:
 MutualGaze: at least two people look at each other (A->B and B->A).
 SharedObjectAttention: at least two people look at the same external object/place (not a person), including follow/reference toward that same external target.
-OneSidedGaze: someone looks at another person, but reciprocity is absent.
+OneSidedGaze: someone explicitly looks at another visible person (A->B), but reciprocity is absent.
 NonCommmunicative: no clear interpersonal gaze interaction (off-screen/camera/object-only/unclear), or single-person scene.
 None: no usable gaze-looking information is provided.
 
 Decision rules:
 1. Do not guess MutualGaze; require explicit reciprocity.
-2. If only one person looks at another person and it is not reciprocated, use OneSidedGaze.
+2. Use OneSidedGaze only when Step 1 explicitly contains person-to-person gaze (A->B) and it is not reciprocated.
 3. If all gaze targets are off-screen/camera/unclear, use NonCommmunicative.
 4. If only one person is present, always use NonCommmunicative.
 5. If no usable gaze info exists, use None.
+6. If no person is looking at another visible person, do not use OneSidedGaze.
 
 Output format (strict):
 Label: <MutualGaze|SharedObjectAttention|OneSidedGaze|NonCommmunicative|None>
