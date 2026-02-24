@@ -27,7 +27,7 @@ from auto_phrase_grounding.detect_gaze_targets import (
     normalize_person_description,
     parse_person_descriptions,
 )
-from data_proc.add_in_out_labels import load_in_out_lookup
+from data_proc.add_in_out_labels import load_in_out_lookup_with_conflicts
 from auto_phrase_grounding.qwen3vl_grounding import (
     load_qwen3vl_model,
     run_qwen3vl_grounding,
@@ -74,7 +74,7 @@ except ImportError:  # pragma: no cover - fallback for CLI execution.
         persist_evaluation_results,
         print_metrics,
     )
-    from data_proc.add_in_out_labels import load_in_out_lookup
+    from data_proc.add_in_out_labels import load_in_out_lookup_with_conflicts
 
 
 def load_image_rgb(path: Path) -> Image.Image:
@@ -281,9 +281,19 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
         cache = load_combined_description_cache(candidate)
         if cache:
             gt_caches.append(cache)
-    in_out_lookup = load_in_out_lookup(config.in_out_labels_csv) if config.in_out_labels_csv else None
+    in_out_conflicting_keys: Set[str] = set()
+    in_out_lookup = None
+    if config.in_out_labels_csv:
+        in_out_lookup, in_out_conflicting_keys = load_in_out_lookup_with_conflicts(config.in_out_labels_csv)
     if in_out_lookup is not None:
         print(f"Loaded in/out labels from {config.in_out_labels_csv} ({len(in_out_lookup)} entries)")
+        if in_out_conflicting_keys:
+            examples = ", ".join(sorted(in_out_conflicting_keys)[:5])
+            print(
+                "Dropped conflicting in/out keys: "
+                f"{len(in_out_conflicting_keys)}"
+                + (f" (examples: {examples})" if examples else "")
+            )
     missing_in_out: Set[str] = set()
     skipped_in_out_minus_one: Set[str] = set()
     in_out_counts = {0: 0, 1: 0}
@@ -691,6 +701,9 @@ def evaluate_dataset(config: EvaluationConfig) -> EvaluationResults:
     metrics["in_out_out_of_frame"] = in_out_counts[0]
     metrics["missing_in_out"] = len(missing_in_out)
     metrics["skipped_in_out_minus_one"] = len(skipped_in_out_minus_one)
+    metrics["in_out_conflicting_keys_dropped"] = len(in_out_conflicting_keys)
+    if in_out_conflicting_keys:
+        metrics["in_out_conflicting_keys_examples"] = sorted(in_out_conflicting_keys)[:20]
 
     if gaze_l2_errors:
         metrics["gaze_l2_error_mean"] = sum(gaze_l2_errors) / len(gaze_l2_errors)
