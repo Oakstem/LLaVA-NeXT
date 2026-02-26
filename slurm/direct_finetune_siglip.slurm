@@ -104,6 +104,7 @@ MM_TUNABLE_PARTS="mm_projector,lm_head"
 # MM_TUNABLE_PARTS="mm_projector,model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].mlp"
 #"mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},vision_tower.vision_model.encoder.layers[-4:].mlp"
 MM_VISION_TOWER_LR="1e-6"
+MM_PROJECTOR_LR="5e-5"
 MM_PROJECTOR_TYPE="mlp2x_gelu"
 MM_VISION_SELECT_LAYER="-2"
 MM_USE_IM_START_END="False"
@@ -198,6 +199,7 @@ echo ""
 echo "=== MODEL ARCHITECTURE ==="
 echo "MM Tunable Parts: ${MM_TUNABLE_PARTS}"
 echo "MM Vision Tower LR: ${MM_VISION_TOWER_LR}"
+echo "MM Projector LR: ${MM_PROJECTOR_LR}"
 echo "MM Projector Type: ${MM_PROJECTOR_TYPE}"
 echo "MM Vision Select Layer: ${MM_VISION_SELECT_LAYER}"
 echo "MM Use IM Start End: ${MM_USE_IM_START_END}"
@@ -279,6 +281,7 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --roi_candidates_positive_center_distance_threshold ${ROI_CANDIDATES_POSITIVE_CENTER_DISTANCE_THRESHOLD} \
     --mm_tunable_parts=${MM_TUNABLE_PARTS} \
     --mm_vision_tower_lr=${MM_VISION_TOWER_LR} \
+    --mm_projector_lr=${MM_PROJECTOR_LR} \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type ${MM_PROJECTOR_TYPE} \
     --mm_vision_select_layer ${MM_VISION_SELECT_LAYER} \
