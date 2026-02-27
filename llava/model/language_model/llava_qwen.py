@@ -864,14 +864,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             }
 
         # Sub-step B: optional true-OOF supervision (OOF text as positives, candidate boxes as negatives).
-        can_use_true_oof = (
-            use_true_oof_frames
-            and is_true_oof
-            and oof_enabled
-            and oof_text_projs is not None
-            and oof_text_projs.numel() > 0
-            and not has_pos
-        )
+        has_oof_bank = oof_text_projs is not None and oof_text_projs.numel() > 0
+        can_use_true_oof = use_true_oof_frames and is_true_oof and has_oof_bank and not has_pos
         if not can_use_true_oof:
             return None
 
@@ -1091,9 +1085,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 oof_sample_count = torch.tensor(len(candidate_oof_targets), device=hidden_last.device, dtype=torch.long)
                 total_roi_loss = total_roi_loss + total_roi_loss.new_tensor(oof_weight) * oof_loss
 
-            outputs.loss = outputs.loss + outputs.loss.new_tensor(effective_weight) * total_roi_loss.to(
-                device=outputs.loss.device,
-                dtype=outputs.loss.dtype,
+            roi_weight = float(max(0.0, min(1.0, effective_weight)))
+            ce_weight = 1.0 - roi_weight
+            ce_loss = outputs.loss
+            outputs.loss = (
+                ce_loss.new_tensor(ce_weight) * ce_loss
+                + ce_loss.new_tensor(roi_weight)
+                * total_roi_loss.to(device=ce_loss.device, dtype=ce_loss.dtype)
             )
             (
                 preview_image_index_tensor,
@@ -1106,7 +1104,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 "top1": top1_acc.detach(),
                 "top1_with_oof": top1_with_oof.detach(),
                 "pairs": torch.tensor(candidate_count_total, device=stats_device, dtype=torch.long),
-                "lambda": torch.tensor(effective_weight, device=stats_device, dtype=torch.float32),
+                "lambda": torch.tensor(roi_weight, device=stats_device, dtype=torch.float32),
+                "true_oof_supervised_count": torch.tensor(
+                    samples_true_oof_supervised, device=stats_device, dtype=torch.long
+                ),
                 "preview_image_indices": preview_image_index_tensor,
                 "preview_pred_candidate_slots": preview_pred_slot_tensor,
                 "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
@@ -1263,6 +1264,46 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 return outputs
 
         # Step 3: gaze-centered fallback path when candidate metadata is missing or unusable.
+        return self._apply_roi_fallback_path(
+            outputs=outputs,
+            labels=labels,
+            hidden_last=hidden_last,
+            image_features=image_features,
+            roi_gaze_xy=roi_gaze_xy,
+            roi_gaze_valid=roi_gaze_valid,
+            phrase_sequences=phrase_sequences,
+            default_grid_side=default_grid_side,
+            batch_limit=batch_limit,
+            temperature=temperature,
+            effective_weight=effective_weight,
+            oof_enabled=oof_enabled,
+            oof_weight=oof_weight,
+            oof_text_projs=oof_text_projs,
+            preview_buffer=preview_buffer,
+            debug_this_step=debug_this_step,
+            debug_steps=debug_steps,
+        )
+
+    def _apply_roi_fallback_path(
+        self,
+        outputs: CausalLMOutputWithPast,
+        labels: torch.Tensor,
+        hidden_last: torch.Tensor,
+        image_features: List[torch.Tensor],
+        roi_gaze_xy: Optional[torch.Tensor],
+        roi_gaze_valid: Optional[torch.Tensor],
+        phrase_sequences: List[torch.Tensor],
+        default_grid_side: int,
+        batch_limit: int,
+        temperature: float,
+        effective_weight: float,
+        oof_enabled: bool,
+        oof_weight: float,
+        oof_text_projs: Optional[torch.Tensor],
+        preview_buffer: ROIContrastivePreviewBuffer,
+        debug_this_step: bool,
+        debug_steps: int,
+    ) -> CausalLMOutputWithPast:
         if roi_gaze_xy is None or roi_gaze_valid is None:
             return outputs
 
@@ -1319,6 +1360,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 "top1_with_oof": torch.zeros((), device=stats_device, dtype=torch.float32),
                 "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
                 "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "true_oof_supervised_count": torch.zeros((), device=stats_device, dtype=torch.long),
                 "preview_image_indices": preview_image_index_tensor,
                 "preview_pred_candidate_slots": preview_pred_slot_tensor,
                 "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
@@ -1383,11 +1425,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             has_oof_term = True
 
         has_base_term = pair_count >= 2
-        lambda_value = effective_weight if (has_base_term or has_oof_term) else 0.0
+        roi_weight = float(max(0.0, min(1.0, effective_weight)))
+        ce_weight = 1.0 - roi_weight
+        lambda_value = roi_weight if (has_base_term or has_oof_term) else 0.0
         if has_base_term or has_oof_term:
-            outputs.loss = outputs.loss + outputs.loss.new_tensor(effective_weight) * total_roi_loss.to(
-                device=outputs.loss.device,
-                dtype=outputs.loss.dtype,
+            ce_loss = outputs.loss
+            outputs.loss = (
+                ce_loss.new_tensor(ce_weight) * ce_loss
+                + ce_loss.new_tensor(roi_weight)
+                * total_roi_loss.to(device=ce_loss.device, dtype=ce_loss.dtype)
             )
 
         (
@@ -1402,6 +1448,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             "top1_with_oof": top1_with_oof.detach(),
             "pairs": torch.tensor(pair_count, device=stats_device, dtype=torch.long),
             "lambda": torch.tensor(lambda_value, device=stats_device, dtype=torch.float32),
+            "true_oof_supervised_count": torch.zeros((), device=stats_device, dtype=torch.long),
             "preview_image_indices": preview_image_index_tensor,
             "preview_pred_candidate_slots": preview_pred_slot_tensor,
             "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,

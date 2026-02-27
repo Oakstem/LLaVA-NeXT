@@ -262,6 +262,10 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Additional OOF negative phrases separated by '||' (e.g. 'looking towards the camera||looking at the camera')."},
     )
     roi_contrastive_oof_weight: float = field(default=0.5, metadata={"help": "Weight of the OOF auxiliary term inside ROI contrastive loss."})
+    roi_contrastive_use_true_oof_frames: bool = field(
+        default=False,
+        metadata={"help": "Use true OOF frames as supervision in ROI contrastive candidate path when no positive box exists."},
+    )
     roi_contrastive_metrics_window: int = field(default=100, metadata={"help": "Rolling window size (in metric updates) for logging ROI contrastive averages."})
     roi_contrastive_preview_samples: int = field(default=5, metadata={"help": "Number of ROI samples to log detailed top-k scores for each logging interval."})
     roi_contrastive_preview_topk: int = field(default=5, metadata={"help": "Number of top ROI option scores to log per sampled ROI row."})
@@ -2269,6 +2273,7 @@ def train(attn_implementation=None):
     model.config.roi_contrastive_oof_text = training_args.roi_contrastive_oof_text
     model.config.roi_contrastive_oof_texts = dedup_oof_phrases
     model.config.roi_contrastive_oof_weight = training_args.roi_contrastive_oof_weight
+    model.config.roi_contrastive_use_true_oof_frames = training_args.roi_contrastive_use_true_oof_frames
     model.config.roi_contrastive_oof_token_ids = roi_oof_token_ids
     model.config.roi_contrastive_oof_token_id_sequences = roi_oof_token_id_sequences
     model.config.roi_contrastive_preview_samples = max(1, int(training_args.roi_contrastive_preview_samples))
