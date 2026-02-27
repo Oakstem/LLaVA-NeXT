@@ -24,6 +24,7 @@ TWO_STEP_INFERENCE="${TWO_STEP_INFERENCE:-true}"
 STEP2_KEEP_ADAPTER="${STEP2_KEEP_ADAPTER:-true}"
 STEP2_USES_IMAGE="${STEP2_USES_IMAGE:-true}"
 STEP2_TEMPERATURE="${STEP2_TEMPERATURE:-}"
+RESUME_MISSING_ONLY="${RESUME_MISSING_ONLY:-false}"
 
 RUN_TAG="${RUN_TAG:-${SLURM_ARRAY_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}"
 if [[ -n "$CKPT_START" || -n "$CKPT_END" ]]; then
@@ -38,6 +39,8 @@ else
     OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/vacation_results/vacation_batch_ckpt-${CHECKPOINT_STEP}_${RUN_TAG}}"
 fi
 RUN_LIST_FILE="${RUN_LIST_FILE:-$OUTPUT_DIR/checkpoint_paths.txt}"
+MISSING_LIST_FILE="${MISSING_LIST_FILE:-$OUTPUT_DIR/checkpoint_paths.missing.txt}"
+TASK_LIST_FILE="${TASK_LIST_FILE:-$RUN_LIST_FILE}"
 
 mkdir -p logs "$OUTPUT_DIR"
 
@@ -67,40 +70,92 @@ collect_checkpoints() {
     rm -f "$tmp_file"
 }
 
+output_json_for_checkpoint() {
+    local adapter_path="$1"
+    local run_name
+    local ckpt_tag
+    run_name="$(basename "$(dirname "$adapter_path")")"
+    ckpt_tag="$(basename "$adapter_path")"
+    echo "$OUTPUT_DIR/${run_name}_${ckpt_tag}.json"
+}
+
+collect_missing_checkpoints() {
+    local tmp_file
+    local adapter_path
+    local output_json
+    tmp_file="$(mktemp "${MISSING_LIST_FILE}.tmp.XXXXXX")"
+    mapfile -t checkpoint_paths < "$RUN_LIST_FILE"
+    for adapter_path in "${checkpoint_paths[@]}"; do
+        output_json="$(output_json_for_checkpoint "$adapter_path")"
+        if [ ! -s "$output_json" ]; then
+            echo "$adapter_path" >> "$tmp_file"
+        fi
+    done
+    sort -u "$tmp_file" > "$MISSING_LIST_FILE"
+    rm -f "$tmp_file"
+}
+
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-    collect_checkpoints
-    task_count=$(wc -l < "$RUN_LIST_FILE" | tr -d ' ')
+    if [ -s "$RUN_LIST_FILE" ]; then
+        echo "Using existing run list file: $RUN_LIST_FILE"
+    else
+        collect_checkpoints
+    fi
+
+    if [ "$RESUME_MISSING_ONLY" = "true" ]; then
+        collect_missing_checkpoints
+        TASK_LIST_FILE="$MISSING_LIST_FILE"
+    else
+        TASK_LIST_FILE="$RUN_LIST_FILE"
+    fi
+
+    task_count=$(wc -l < "$TASK_LIST_FILE" | tr -d ' ')
     if [ "$task_count" -eq 0 ]; then
-        if [ "$CKPT_MODE" = "range" ]; then
+        if [ "$RESUME_MISSING_ONLY" = "true" ]; then
+            echo "No missing checkpoints to process under $OUTPUT_DIR"
+        elif [ "$CKPT_MODE" = "range" ]; then
             echo "No checkpoints found for checkpoint-${CKPT_START}..${CKPT_END} (step ${CKPT_STEP}) under $TRAINING_OUTPUTS_ROOT" >&2
         else
             echo "No checkpoints found for checkpoint-$CHECKPOINT_STEP under $TRAINING_OUTPUTS_ROOT" >&2
         fi
-        exit 1
+        exit 0
     fi
     array_spec=$((task_count - 1))
+    if [ "$RESUME_MISSING_ONLY" = "true" ]; then
+        total_count=$(wc -l < "$RUN_LIST_FILE" | tr -d ' ')
+        echo "Resume mode: submitting missing checkpoints only ($task_count/$total_count)"
+    fi
     echo "Submitting SLURM array 0-$array_spec"
-    exec sbatch --array="0-${array_spec}" --export=ALL,OUTPUT_DIR="$OUTPUT_DIR",RUN_LIST_FILE="$RUN_LIST_FILE",CHECKPOINT_STEP="$CHECKPOINT_STEP",CKPT_START="$CKPT_START",CKPT_END="$CKPT_END",CKPT_STEP="$CKPT_STEP",TRAINING_OUTPUTS_ROOT="$TRAINING_OUTPUTS_ROOT",TWO_STEP_INFERENCE="$TWO_STEP_INFERENCE",STEP2_KEEP_ADAPTER="$STEP2_KEEP_ADAPTER",STEP2_USES_IMAGE="$STEP2_USES_IMAGE",STEP2_TEMPERATURE="$STEP2_TEMPERATURE" "$0"
+    exec sbatch --array="0-${array_spec}" --export=ALL,OUTPUT_DIR="$OUTPUT_DIR",RUN_LIST_FILE="$RUN_LIST_FILE",TASK_LIST_FILE="$TASK_LIST_FILE",MISSING_LIST_FILE="$MISSING_LIST_FILE",RESUME_MISSING_ONLY="$RESUME_MISSING_ONLY",CHECKPOINT_STEP="$CHECKPOINT_STEP",CKPT_START="$CKPT_START",CKPT_END="$CKPT_END",CKPT_STEP="$CKPT_STEP",TRAINING_OUTPUTS_ROOT="$TRAINING_OUTPUTS_ROOT",TWO_STEP_INFERENCE="$TWO_STEP_INFERENCE",STEP2_KEEP_ADAPTER="$STEP2_KEEP_ADAPTER",STEP2_USES_IMAGE="$STEP2_USES_IMAGE",STEP2_TEMPERATURE="$STEP2_TEMPERATURE" "$0"
 fi
 
-if [ ! -s "$RUN_LIST_FILE" ]; then
+if [ ! -s "$TASK_LIST_FILE" ]; then
     if [ "${SLURM_ARRAY_TASK_ID:-}" = "0" ]; then
-        collect_checkpoints
+        if [ "$RESUME_MISSING_ONLY" = "true" ]; then
+            if [ ! -s "$RUN_LIST_FILE" ]; then
+                collect_checkpoints
+            fi
+            collect_missing_checkpoints
+            TASK_LIST_FILE="$MISSING_LIST_FILE"
+        else
+            collect_checkpoints
+            TASK_LIST_FILE="$RUN_LIST_FILE"
+        fi
     else
         for _ in $(seq 1 60); do
-            if [ -s "$RUN_LIST_FILE" ]; then
+            if [ -s "$TASK_LIST_FILE" ]; then
                 break
             fi
             sleep 1
         done
     fi
 fi
-if [ ! -s "$RUN_LIST_FILE" ]; then
-    echo "Run list file is missing or empty: $RUN_LIST_FILE" >&2
+if [ ! -s "$TASK_LIST_FILE" ]; then
+    echo "Task list file is missing or empty: $TASK_LIST_FILE" >&2
     exit 1
 fi
 
-mapfile -t CHECKPOINT_PATHS < "$RUN_LIST_FILE"
+mapfile -t CHECKPOINT_PATHS < "$TASK_LIST_FILE"
 INDEX="${SLURM_ARRAY_TASK_ID:-0}"
 if [ "$INDEX" -ge "${#CHECKPOINT_PATHS[@]}" ]; then
     echo "No checkpoint for array index $INDEX (found ${#CHECKPOINT_PATHS[@]} checkpoints)"
@@ -110,7 +165,7 @@ fi
 ADAPTER_PATH="${CHECKPOINT_PATHS[$INDEX]}"
 RUN_NAME="$(basename "$(dirname "$ADAPTER_PATH")")"
 CKPT_TAG="$(basename "$ADAPTER_PATH")"
-OUTPUT_JSON="$OUTPUT_DIR/${RUN_NAME}_${CKPT_TAG}.json"
+OUTPUT_JSON="$(output_json_for_checkpoint "$ADAPTER_PATH")"
 
 export ADAPTER_PATH
 export OUTPUT_JSON
