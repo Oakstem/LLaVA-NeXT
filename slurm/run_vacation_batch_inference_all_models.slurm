@@ -26,6 +26,7 @@ STEP2_USES_IMAGE="${STEP2_USES_IMAGE:-true}"
 STEP2_TEMPERATURE="${STEP2_TEMPERATURE:-}"
 RESUME_MISSING_ONLY="${RESUME_MISSING_ONLY:-false}"
 ARRAY_MAX_CONCURRENT="${ARRAY_MAX_CONCURRENT:-}"
+RESUME_REQUIRE_SUCCESS_MARKER="${RESUME_REQUIRE_SUCCESS_MARKER:-false}"
 
 RUN_TAG="${RUN_TAG:-${SLURM_ARRAY_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}"
 if [[ -n "$CKPT_START" || -n "$CKPT_END" ]]; then
@@ -38,6 +39,9 @@ if [[ -n "$CKPT_START" || -n "$CKPT_END" ]]; then
 else
     CKPT_MODE="single"
     OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/vacation_results/vacation_batch_ckpt-${CHECKPOINT_STEP}_${RUN_TAG}}"
+fi
+if [ "${OUTPUT_DIR#/}" = "$OUTPUT_DIR" ]; then
+    OUTPUT_DIR="$REPO_ROOT/$OUTPUT_DIR"
 fi
 RUN_LIST_FILE="${RUN_LIST_FILE:-$OUTPUT_DIR/checkpoint_paths.txt}"
 MISSING_LIST_FILE="${MISSING_LIST_FILE:-$OUTPUT_DIR/checkpoint_paths.missing.txt}"
@@ -83,16 +87,49 @@ output_json_for_checkpoint() {
     echo "$OUTPUT_DIR/${run_name}_${ckpt_tag}.json"
 }
 
+manifest_index_for_checkpoint() {
+    local adapter_path="$1"
+    if [ ! -s "$TASK_MANIFEST_FILE" ]; then
+        return 1
+    fi
+    awk -F'\t' -v p="$adapter_path" '$2 == p { print $1; exit }' "$TASK_MANIFEST_FILE"
+}
+
+checkpoint_has_success_marker() {
+    local adapter_path="$1"
+    local manifest_index
+    local end_file
+    local exit_code
+    manifest_index="$(manifest_index_for_checkpoint "$adapter_path" || true)"
+    if [ -z "$manifest_index" ]; then
+        return 1
+    fi
+    end_file="$STATUS_DIR/task_${manifest_index}.end"
+    if [ ! -s "$end_file" ]; then
+        return 1
+    fi
+    exit_code="$(awk -F'=' '/^exit_code=/{print $2; exit}' "$end_file")"
+    [ "$exit_code" = "0" ]
+}
+
 collect_missing_checkpoints() {
     local tmp_file
     local adapter_path
     local output_json
+    local manifest_index
     tmp_file="$(mktemp "${MISSING_LIST_FILE}.tmp.XXXXXX")"
     mapfile -t checkpoint_paths < "$RUN_LIST_FILE"
     for adapter_path in "${checkpoint_paths[@]}"; do
         output_json="$(output_json_for_checkpoint "$adapter_path")"
         if [ ! -s "$output_json" ]; then
             echo "$adapter_path" >> "$tmp_file"
+            continue
+        fi
+        if [ "$RESUME_REQUIRE_SUCCESS_MARKER" = "true" ]; then
+            manifest_index="$(manifest_index_for_checkpoint "$adapter_path" || true)"
+            if [ -n "$manifest_index" ] && ! checkpoint_has_success_marker "$adapter_path"; then
+                echo "$adapter_path" >> "$tmp_file"
+            fi
         fi
     done
     sort -u "$tmp_file" > "$MISSING_LIST_FILE"
@@ -158,7 +195,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     echo "Task status dir: $STATUS_DIR"
     echo "Task logs dir: $TASK_LOG_DIR"
     echo "Submitting SLURM array $array_range"
-    exec sbatch --array="$array_range" --export=ALL,OUTPUT_DIR="$OUTPUT_DIR",RUN_LIST_FILE="$RUN_LIST_FILE",TASK_LIST_FILE="$TASK_LIST_FILE",MISSING_LIST_FILE="$MISSING_LIST_FILE",TASK_MANIFEST_FILE="$TASK_MANIFEST_FILE",STATUS_DIR="$STATUS_DIR",TASK_LOG_DIR="$TASK_LOG_DIR",RESUME_MISSING_ONLY="$RESUME_MISSING_ONLY",ARRAY_MAX_CONCURRENT="$ARRAY_MAX_CONCURRENT",CHECKPOINT_STEP="$CHECKPOINT_STEP",CKPT_START="$CKPT_START",CKPT_END="$CKPT_END",CKPT_STEP="$CKPT_STEP",TRAINING_OUTPUTS_ROOT="$TRAINING_OUTPUTS_ROOT",TWO_STEP_INFERENCE="$TWO_STEP_INFERENCE",STEP2_KEEP_ADAPTER="$STEP2_KEEP_ADAPTER",STEP2_USES_IMAGE="$STEP2_USES_IMAGE",STEP2_TEMPERATURE="$STEP2_TEMPERATURE" "$0"
+    exec sbatch --array="$array_range" --export=ALL,OUTPUT_DIR="$OUTPUT_DIR",RUN_LIST_FILE="$RUN_LIST_FILE",TASK_LIST_FILE="$TASK_LIST_FILE",MISSING_LIST_FILE="$MISSING_LIST_FILE",TASK_MANIFEST_FILE="$TASK_MANIFEST_FILE",STATUS_DIR="$STATUS_DIR",TASK_LOG_DIR="$TASK_LOG_DIR",RESUME_MISSING_ONLY="$RESUME_MISSING_ONLY",ARRAY_MAX_CONCURRENT="$ARRAY_MAX_CONCURRENT",RESUME_REQUIRE_SUCCESS_MARKER="$RESUME_REQUIRE_SUCCESS_MARKER",CHECKPOINT_STEP="$CHECKPOINT_STEP",CKPT_START="$CKPT_START",CKPT_END="$CKPT_END",CKPT_STEP="$CKPT_STEP",TRAINING_OUTPUTS_ROOT="$TRAINING_OUTPUTS_ROOT",TWO_STEP_INFERENCE="$TWO_STEP_INFERENCE",STEP2_KEEP_ADAPTER="$STEP2_KEEP_ADAPTER",STEP2_USES_IMAGE="$STEP2_USES_IMAGE",STEP2_TEMPERATURE="$STEP2_TEMPERATURE" "$0"
 fi
 
 if [ ! -s "$TASK_LIST_FILE" ]; then
