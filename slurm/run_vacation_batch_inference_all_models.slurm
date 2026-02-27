@@ -226,30 +226,43 @@ fi
 
 mapfile -t CHECKPOINT_PATHS < "$TASK_LIST_FILE"
 INDEX="${SLURM_ARRAY_TASK_ID:-0}"
+ARRAY_TAG="${SLURM_ARRAY_JOB_ID:-noarray}"
 TASK_START_FILE="$STATUS_DIR/task_${INDEX}.start"
 TASK_END_FILE="$STATUS_DIR/task_${INDEX}.end"
+TASK_START_FILE_UNIQ="$STATUS_DIR/task_${INDEX}.array_${ARRAY_TAG}.start"
+TASK_END_FILE_UNIQ="$STATUS_DIR/task_${INDEX}.array_${ARRAY_TAG}.end"
 TASK_CHILD_OUT="$TASK_LOG_DIR/task_${INDEX}.child.out"
 TASK_CHILD_ERR="$TASK_LOG_DIR/task_${INDEX}.child.err"
+TASK_CHILD_OUT_UNIQ="$TASK_LOG_DIR/task_${INDEX}.array_${ARRAY_TAG}.child.out"
+TASK_CHILD_ERR_UNIQ="$TASK_LOG_DIR/task_${INDEX}.array_${ARRAY_TAG}.child.err"
 mkdir -p "$STATUS_DIR" "$TASK_LOG_DIR"
-{
-    echo "timestamp=$(date -Is)"
-    echo "event=start"
-    echo "job_id=${SLURM_JOB_ID:-N/A}"
-    echo "array_job_id=${SLURM_ARRAY_JOB_ID:-N/A}"
-    echo "task_id=${SLURM_ARRAY_TASK_ID:-N/A}"
-    echo "host=$(hostname)"
-    echo "task_list_file=$TASK_LIST_FILE"
-} > "$TASK_START_FILE"
+task_start_payload="$(
+    cat <<EOF
+timestamp=$(date -Is)
+event=start
+job_id=${SLURM_JOB_ID:-N/A}
+array_job_id=${SLURM_ARRAY_JOB_ID:-N/A}
+task_id=${SLURM_ARRAY_TASK_ID:-N/A}
+host=$(hostname)
+task_list_file=$TASK_LIST_FILE
+EOF
+)"
+printf "%s\n" "$task_start_payload" > "$TASK_START_FILE"
+printf "%s\n" "$task_start_payload" > "$TASK_START_FILE_UNIQ"
 record_task_exit() {
     local exit_code=$?
-    {
-        echo "timestamp=$(date -Is)"
-        echo "event=end"
-        echo "job_id=${SLURM_JOB_ID:-N/A}"
-        echo "array_job_id=${SLURM_ARRAY_JOB_ID:-N/A}"
-        echo "task_id=${SLURM_ARRAY_TASK_ID:-N/A}"
-        echo "exit_code=$exit_code"
-    } > "$TASK_END_FILE"
+    task_end_payload="$(
+        cat <<EOF
+timestamp=$(date -Is)
+event=end
+job_id=${SLURM_JOB_ID:-N/A}
+array_job_id=${SLURM_ARRAY_JOB_ID:-N/A}
+task_id=${SLURM_ARRAY_TASK_ID:-N/A}
+exit_code=$exit_code
+EOF
+    )"
+    printf "%s\n" "$task_end_payload" > "$TASK_END_FILE"
+    printf "%s\n" "$task_end_payload" > "$TASK_END_FILE_UNIQ"
 }
 trap record_task_exit EXIT
 if [ "$INDEX" -ge "${#CHECKPOINT_PATHS[@]}" ]; then
@@ -262,12 +275,18 @@ RUN_NAME="$(basename "$(dirname "$ADAPTER_PATH")")"
 CKPT_TAG="$(basename "$ADAPTER_PATH")"
 OUTPUT_JSON="$(output_json_for_checkpoint "$ADAPTER_PATH")"
 
-{
-    echo "adapter_path=$ADAPTER_PATH"
-    echo "output_json=$OUTPUT_JSON"
-    echo "child_stdout=$TASK_CHILD_OUT"
-    echo "child_stderr=$TASK_CHILD_ERR"
-} >> "$TASK_START_FILE"
+task_paths_payload="$(
+    cat <<EOF
+adapter_path=$ADAPTER_PATH
+output_json=$OUTPUT_JSON
+child_stdout=$TASK_CHILD_OUT
+child_stderr=$TASK_CHILD_ERR
+child_stdout_unique=$TASK_CHILD_OUT_UNIQ
+child_stderr_unique=$TASK_CHILD_ERR_UNIQ
+EOF
+)"
+printf "%s\n" "$task_paths_payload" >> "$TASK_START_FILE"
+printf "%s\n" "$task_paths_payload" >> "$TASK_START_FILE_UNIQ"
 
 export ADAPTER_PATH
 export OUTPUT_JSON
@@ -280,11 +299,15 @@ echo "Checkpoint: $ADAPTER_PATH"
 echo "Output JSON: $OUTPUT_JSON"
 echo "Child stdout log: $TASK_CHILD_OUT"
 echo "Child stderr log: $TASK_CHILD_ERR"
+echo "Child stdout unique log: $TASK_CHILD_OUT_UNIQ"
+echo "Child stderr unique log: $TASK_CHILD_ERR_UNIQ"
 echo "=========================================="
 
 set +e
-bash "$JOB_SCRIPT" > "$TASK_CHILD_OUT" 2> "$TASK_CHILD_ERR"
+bash "$JOB_SCRIPT" > "$TASK_CHILD_OUT_UNIQ" 2> "$TASK_CHILD_ERR_UNIQ"
 child_exit_code=$?
 set -e
+cp -f "$TASK_CHILD_OUT_UNIQ" "$TASK_CHILD_OUT"
+cp -f "$TASK_CHILD_ERR_UNIQ" "$TASK_CHILD_ERR"
 echo "Child script exit code: $child_exit_code"
 exit "$child_exit_code"
