@@ -119,6 +119,7 @@ MM_PATCH_MERGE_TYPE="spatial_unpad"
 LORA_ENABLE="True"
 LORA_R="4"
 LORA_ALPHA="32"
+LORA_DROPOUT="0.05"
 MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
@@ -213,6 +214,7 @@ echo "=== LORA CONFIGURATION ==="
 echo "LoRA Enable: ${LORA_ENABLE}"
 echo "LoRA r: ${LORA_R}"
 echo "LoRA alpha: ${LORA_ALPHA}"
+echo "LoRA dropout: ${LORA_DROPOUT}"
 echo ""
 echo "=== TRAINING HYPERPARAMETERS ==="
 echo "Max Steps: ${MAX_STEPS}"
@@ -294,6 +296,7 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --lora_enable ${LORA_ENABLE} \
     --lora_r ${LORA_R} \
     --lora_alpha ${LORA_ALPHA} \
+    --lora_dropout ${LORA_DROPOUT} \
     --bf16 ${BF16} \
     --run_name $MID_RUN_NAME \
     --output_dir ${OUTPUT_BASE_DIR}/${MID_RUN_NAME} \

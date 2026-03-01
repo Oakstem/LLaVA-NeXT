@@ -2288,6 +2288,7 @@ def train(attn_implementation=None):
         f"oof_enabled={roi_oof_enabled}, "
         f"oof_text_count={len(roi_oof_token_id_sequences)}, "
         f"oof_weight={training_args.roi_contrastive_oof_weight}, "
+        f"use_true_oof_frames={training_args.roi_contrastive_use_true_oof_frames}, "
         f"oof_tokens={len(roi_oof_token_ids)}, "
         f"metrics_window={training_args.roi_contrastive_metrics_window}, "
         f"preview_samples={model.config.roi_contrastive_preview_samples}, "
