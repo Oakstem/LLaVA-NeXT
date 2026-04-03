@@ -48,8 +48,17 @@ from gazefollow.evals.log_wandb_evaluations import (
     DEFAULT_PROJECT,
     build_run_name_from_adapter,
 )
+from vacation.frame_queue import (
+    DEFAULT_ANNOTATIONS,
+    DEFAULT_FRAMES_DIR,
+    build_frame_path,
+    randomize_frame_queue,
+    select_frames_with_skipping,
+)
 from vacation.gpt_extraction import extract_gaze_info_with_gpt
 from vacation.recompute_vacation_metrics import (
+    _get_prediction_label,
+    _normalize_social_label,
     _extract_prompt_columns,
     _extract_run_config,
     compute_metrics,
@@ -60,9 +69,6 @@ from vacation.wandb_utils import (
 )
 from openai import OpenAI
 
-
-DEFAULT_ANNOTATIONS = "datasets/Vacation/test_annotations.csv"
-DEFAULT_FRAMES_DIR = "datasets/Vacation/frames"
 
 # DEFAULT_PROMPT = "For each person in the image, describe who they are, what they are looking at, and then classify the interaction as non-communicative gaze, mutual gaze, or joint attention toward a shared object."
 # DEFAULT_PROMPT = """For each person in the image:
@@ -103,6 +109,7 @@ Decision rules:
 6. If only one person is present, use NonCommmunicative.
 7. Use None only when gaze info is not usable.
 8. If no person is looking at another visible person, do not use OneSidedGaze.
+9. If all targets are off-screen/camera/unclear, label NonCommmunicative..
 
 Output format:
 - First provide Step 1 findings.
@@ -111,6 +118,61 @@ Label: <MutualGaze|SharedObjectAttention|OneSidedGaze|NonCommmunicative|None>
 Reasoning:
 - <short evidence bullet from gaze relations>
 - <optional short tie-break rule bullet>"""
+
+STRICT_DEFAULT_PROMPT = """Count the visible people. Assign IDs left to right: P1, P2, P3.
+
+Step 1A:
+For each person, write exactly one short sentence in this format:
+P1: <short person description> is looking at <short target description>
+
+Step 1B:
+Then convert Step 1A into exactly one reduced line per person:
+P1 | <short description> | <target>
+P2 | <short description> | <target>
+
+Rules:
+- In Step 1A, the target description can be another person's short description or an object/place description.
+- In Step 1B, each line is: person ID | short description | gaze target
+- Keep descriptions short: 2 to 5 words only.
+- The gaze target must be exactly one of:
+  another person ID like P2
+  a short object/place name
+  offscreen
+  camera
+  unclear
+- Use another person ID only if that person is clearly the gaze target.
+- If someone looks at an object they hold, use the object name.
+- Two different objects are different targets unless clearly the same instance.
+- Do not infer shared attention from giving, showing, talking, or exchanging an item.
+- No extra sentences.
+
+Step 2:
+Use only Step 1B. Ignore Step 1A wording like reading, showing, giving, talking, or exchanging.
+Apply these rules in exact order:
+1. MutualGaze: Pi looks at Pj and Pj looks at Pi.
+2. OneSidedGaze: Pi looks at Pj and Pj does not look at Pi.
+3. SharedObjectAttention: at least two people look at the same exact object/place.
+4. NonCommmunicative: otherwise.
+5. None: no usable gaze info.
+
+Important:
+- If any valid person-to-person gaze exists in Step 1B, the label must be MutualGaze or OneSidedGaze, not SharedObjectAttention.
+- A target like `P1` or `P2` is person-to-person gaze.
+- Any non-ID target name is object/place gaze.
+- If Step 1B has `P1 | ... | object_name` and `P2 | ... | P1`, the label must be OneSidedGaze.
+
+Output exactly:
+People: <number>
+Step 1A:
+P1: <short person description> is looking at <short target description>
+P2: <short person description> is looking at <short target description>
+Step 1B:
+P1 | <short description> | <gaze target>
+P2 | <short description> | <gaze target>
+Rule1_MutualGaze: <yes|no>
+Rule2_OneSidedGaze: <yes|no>
+Rule3_SharedObjectAttention: <yes|no>
+Label: <MutualGaze|SharedObjectAttention|OneSidedGaze|NonCommmunicative|None>"""
 
 PROMPT_A = """Describe the scene in free wording with focus on people and gaze.
 
@@ -121,6 +183,67 @@ Include:
 
 Keep the response concise but ensure all visible people are covered.
 Do not assign any interaction label (no MutualGaze, SharedObjectAttention, OneSidedGaze, NonCommmunicative, or None)."""
+
+STRICT_PROMPT_A = """Count the visible people. Assign IDs left to right: P1, P2, P3.
+
+Step 1A:
+For each person, write exactly one short sentence in this format:
+P1: <short person description> is looking at <short target description>
+
+Step 1B:
+Then convert Step 1A into exactly one reduced line per person:
+P1 | <short description> | <target>
+P2 | <short description> | <target>
+
+Rules:
+- In Step 1A, the target description can be another person's short description or an object/place description.
+- In Step 1B, each line is: person ID | short description | gaze target
+- Keep descriptions short: 2 to 5 words only.
+- The gaze target must be exactly one of:
+  another person ID like P2
+  a short object/place name
+  offscreen
+  camera
+  unclear
+- Use another person ID only if that person is clearly the gaze target.
+- If someone looks at an object they hold, use the object name.
+- If uncertain, use unclear.
+- No extra sentences.
+
+Output exactly:
+People: <number>
+Step 1A:
+P1: <short description> is looking at <short target description>
+P2: <short description> is looking at <short target description>
+Step 1B:
+P1 | <short description> | <gaze target>
+P2 | <short description> | <gaze target>"""
+
+# DEFAULT_PROMPT = """Analyze the image in two steps.
+
+# Step 1 - Gaze facts (no label yet):
+# - Count visible people and assign IDs left-to-right: P1, P2, ...
+# - For each person, output exactly one line:
+#   Pi (<short description of the person>) is looking at <target description> [confidence: high|medium|low].
+# - Allowed targets:
+#   another visible person ID (e.g., P2),
+#   a specific visible object/place,
+#   off-screen (<left|right|up|down|unknown>),
+#   the camera,
+#   unclear.
+
+# Conservative targeting rules (important):
+# 1) Default to off-screen or unclear unless a visible target is clearly supported.
+# 2) Use a person ID target only when gaze/head direction clearly intersects that person’s face/head AND no equally plausible alternative target exists.
+# 3) If uncertain between multiple targets, choose unclear (not a person ID).
+# 4) Do not infer gaze target from social context, roles, or scene priors.
+
+# Step 2 - Label decision:
+# Choose exactly one label using the Step 1 gaze facts.
+# - MutualGaze / OneSidedGaze can use only person-ID targets with confidence=high.
+# - If person-ID targets are only medium/low confidence, do not use MutualGaze or OneSidedGaze.
+# - If all targets are off-screen/camera/unclear, label NonCommmunicative."""
+
 # PROMPT_A = """Identify all visible people in the image.
 # For each person:
 # Assign a unique ID (e.g., Person_1, Person_2).
@@ -197,6 +320,47 @@ Reason:
 - <1 short bullet citing key gaze relation(s), e.g., P1->P2 and P2->P1>
 - <optional 2nd short bullet for tie-break/rule applied>"""
 
+STRICT_PROMPT_B = """Use only the reduced Step 1B lines below. Ignore the image, scene semantics, object exchange, and all earlier prose.
+
+Input format:
+P1 | <short description> | <gaze target>
+P2 | <short description> | <gaze target>
+
+Interpretation:
+- If the gaze target is another ID like P2, that is person-to-person gaze.
+- If the gaze target is any non-ID target name, that is an object/place target.
+- offscreen, camera, and unclear are not person-to-person gaze.
+
+Apply these rules in exact order. Stop at the first true rule:
+1. MutualGaze: there exists Pi -> Pj and Pj -> Pi.
+2. OneSidedGaze: there exists Pi -> Pj and Pj does not look at Pi.
+3. SharedObjectAttention: at least two people look at the same exact object/place.
+4. NonCommmunicative: otherwise.
+5. None: no usable gaze info.
+
+Important constraints:
+- If any valid person-to-person gaze exists, choose MutualGaze or OneSidedGaze. Do not choose SharedObjectAttention.
+- Two different object names are different unless the Step 1B lines explicitly indicate the same object.
+- Do not use Step 1A wording like "showing" or "reading" to override Step 1B.
+
+Output exactly:
+Rule1_MutualGaze: <yes|no>
+Rule2_OneSidedGaze: <yes|no>
+Rule3_SharedObjectAttention: <yes|no>
+Label: <MutualGaze|SharedObjectAttention|OneSidedGaze|NonCommmunicative|None>"""
+
+
+def apply_prompt_preset(args: argparse.Namespace) -> None:
+    if args.prompt_preset == "current":
+        return
+
+    if args.prompt == DEFAULT_PROMPT:
+        args.prompt = STRICT_DEFAULT_PROMPT
+    if args.prompt_a == PROMPT_A:
+        args.prompt_a = STRICT_PROMPT_A
+    if args.prompt_b == PROMPT_B:
+        args.prompt_b = STRICT_PROMPT_B
+
 # PROMPT_B = """Task: Assign exactly one Vacation gaze label:
 # MutualGaze, SharedObjectAttention, OneSidedGaze, NonCommmunicative, None
 # Use ONLY the Step 1 result (people + gaze targets). Ignore scene/story/context.
@@ -254,6 +418,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_PROMPT,
         help="Inference prompt to use for all frames",
+    )
+    parser.add_argument(
+        "--prompt-preset",
+        type=str,
+        default="current",
+        choices=["current", "strict"],
+        help=(
+            "Use one of the built-in prompt sets. "
+            "This only swaps prompts that were not manually overridden."
+        ),
     )
     parser.add_argument(
         "--two-step-inference",
@@ -469,61 +643,9 @@ def parse_args() -> argparse.Namespace:
         help="W&B resume mode used when --wandb-run-id is provided.",
     )
     
-    return parser.parse_args()
-
-
-def build_frame_path(frames_dir: Path, video_id: int, frame_id: int) -> Path:
-    """Build frame path: frames/{video_id}/{frame_id+1:06d}.png (1-indexed)."""
-    return frames_dir / str(video_id) / f"{frame_id + 1:06d}.png"
-
-
-def select_frames_with_skipping(df: pd.DataFrame, skip_step: int) -> pd.DataFrame:
-    """
-    Select frames to process, skipping every skip_step frames
-    within consecutive runs of the same event_attribute per video.
-    
-    Args:
-        df: DataFrame with columns video_id, frame_id, event_attribute
-        skip_step: Sample every N frames within each event run
-        
-    Returns:
-        DataFrame with selected (video_id, frame_id) pairs
-    """
-    if skip_step <= 1:
-        # No skipping, return unique frames with their first event_attribute
-        return (
-            df.groupby(["video_id", "frame_id"])
-            .agg({"event_attribute": "first"})
-            .reset_index()
-        )
-    
-    # Get unique frames with their first event_attribute
-    unique_frames = (
-        df.groupby(["video_id", "frame_id"])
-        .agg({"event_attribute": "first"})
-        .reset_index()
-        .sort_values(["video_id", "frame_id"])
-    )
-    
-    selected_frames = []
-    
-    for video_id in unique_frames["video_id"].unique():
-        video_frames = unique_frames[unique_frames["video_id"] == video_id].copy()
-        video_frames = video_frames.sort_values("frame_id").reset_index(drop=True)
-        
-        # Detect runs of consecutive frames with same event_attribute
-        video_frames["event_changed"] = (
-            video_frames["event_attribute"] != video_frames["event_attribute"].shift(1)
-        ) | (video_frames["frame_id"] != video_frames["frame_id"].shift(1) + 1)
-        video_frames["run_id"] = video_frames["event_changed"].cumsum()
-        
-        # Within each run, sample every skip_step frames
-        for run_id in video_frames["run_id"].unique():
-            run_frames = video_frames[video_frames["run_id"] == run_id]
-            sampled = run_frames.iloc[::skip_step]
-            selected_frames.append(sampled[["video_id", "frame_id", "event_attribute"]])
-    
-    return pd.concat(selected_frames, ignore_index=True)
+    args = parser.parse_args()
+    apply_prompt_preset(args)
+    return args
 
 
 def get_frame_annotations(df: pd.DataFrame, video_id: int, frame_id: int) -> List[dict]:
@@ -841,6 +963,22 @@ def build_wandb_metric_row(output_path: Path, config: dict, metrics: dict) -> Di
     return row
 
 
+def print_running_success_metrics(metrics: dict) -> None:
+    evaluated = int(metrics.get("accuracy_evaluated_frames", 0))
+    correct = int(metrics.get("accuracy_correct_nb", 0))
+    failed = max(evaluated - correct, 0)
+    success_rate = float(metrics.get("accuracy_vs_atomic_attribute_combo", 0.0))
+    failure_rate = 1.0 - success_rate if evaluated > 0 else 0.0
+    skipped_pred = int(metrics.get("accuracy_skipped_missing_pred", 0))
+    skipped_gt = int(metrics.get("accuracy_skipped_missing_gt", 0))
+    print(
+        "Running success metrics: "
+        f"success_rate={success_rate:.4f}, failure_rate={failure_rate:.4f}, "
+        f"success={correct}, failure={failed}, evaluated={evaluated}, "
+        f"skipped_missing_pred={skipped_pred}, skipped_missing_gt={skipped_gt}"
+    )
+
+
 def main():
     args = parse_args()
     
@@ -922,6 +1060,7 @@ def main():
         )
 
     config = {
+        "prompt_preset": args.prompt_preset,
         "prompt": args.prompt,
         "two_step_inference": args.two_step_inference,
         "prompt_a": args.prompt_a if args.two_step_inference else None,
@@ -950,6 +1089,7 @@ def main():
     }
 
     base_wandb_config: Dict[str, Any] = {
+        "prompt_preset": args.prompt_preset,
         "model_path": args.model_path,
         "model_base": args.model_base,
         "adapter_path": adapter_path,
@@ -1119,16 +1259,14 @@ def main():
     # Randomize queue if requested
     if args.randomize:
         if args.seed is not None:
-            random.seed(args.seed)
-            np.random.seed(args.seed)
-            torch.manual_seed(args.seed)
             print(f"Randomizing queue with seed={args.seed}...")
         else:
             print("Randomizing queue (no seed, non-reproducible)...")
-        selected_frames = selected_frames.sample(
-            frac=1,
-            random_state=args.seed,
-        ).reset_index(drop=True)
+    selected_frames = randomize_frame_queue(
+        selected_frames,
+        randomize=args.randomize,
+        seed=args.seed,
+    )
     
     # Apply limit if specified
     if args.limit:
@@ -1228,22 +1366,27 @@ def main():
             "annotations": annotations,
             "atomic_attributes": atomic_attributes,
         }
-        # Print response snippet
-        print(f"\nProcessed video_id={video_id}, frame_id={frame_id}")
-        print(f"Response: {response}")
-
         # Run GPT extraction if enabled
         if openai_client is not None:
             extracted = extract_gaze_info_with_gpt(openai_client, response, args.gpt_model)
             result_entry["extracted_gaze_info"] = extracted
+
+        pred_norm = _normalize_social_label(_get_prediction_label(result_entry))
+
+        # Print response snippet
+        print(f"\nProcessed video_id={video_id}, frame_id={frame_id}")
+        print(f"Image path: {frame_path}")
+        print(f"Inferred label: {pred_norm}")
+        print(f"Response: {response}")
         
         results.append(result_entry)
+        running_metrics = compute_metrics(results)
+        print_running_success_metrics(running_metrics)
         
         # Checkpoint
         if (idx + 1) % args.checkpoint_interval == 0:
             print(f"\nSaving checkpoint at {idx + 1} frames...")
-            metrics = compute_metrics(results)
-            save_checkpoint(output_path, config, results, metrics)
+            save_checkpoint(output_path, config, results, running_metrics)
     
     # Final save
     print(f"\nSaving final results to {output_path}...")
