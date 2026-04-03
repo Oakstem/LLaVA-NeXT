@@ -87,15 +87,6 @@ if not hasattr(_transformers_modeling_utils, 'prune_linear_layer'):
         return new_layer
     _transformers_modeling_utils.prune_linear_layer = _prune_linear_layer
 
-try:
-    from gazefollow.auto_phrase_grounding.detect_gaze_targets import (
-        parse_person_descriptions as gdino_parse_person_descriptions,
-        detect_gaze_targets as gdino_detect_gaze_targets,
-    )
-except Exception:  # noqa: BLE001
-    gdino_parse_person_descriptions = None
-    gdino_detect_gaze_targets = None
-
 DEFAULT_PROMPT = """You are an expert vision assistant.
 Step 1 - Caption
 • Provide one concise sentence that broadly describes the entire scene.
@@ -298,11 +289,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-output", default=None, help="Optional path to save the generated text as JSON (with keys image, prompt, response).")
     parser.add_argument("--chat", action="store_true", help="Enter an interactive chat loop that reuses the loaded model and image.")
     parser.add_argument("--no-stream", action="store_true", help="Disable token streaming and only print responses after generation completes.")
-    parser.add_argument("--run-gdino", action="store_true", help="Run GroundingDINO gaze detection on the generated response.")
-    parser.add_argument("--gdino-model-id", default="IDEA-Research/grounding-dino-base", help="Hugging Face model identifier for GroundingDINO.")
-    parser.add_argument("--gdino-box-threshold", type=float, default=0.3, help="Box confidence threshold for GroundingDINO detections.")
-    parser.add_argument("--gdino-text-threshold", type=float, default=0.25, help="Text matching threshold for GroundingDINO detections.")
-    parser.add_argument("--gdino-device", default="cuda", help="Device string for GroundingDINO (default: cuda).")
     parser.add_argument("--disable-repetition-stop", action="store_true", help="Disable early stopping when repetitive token loops are detected.")
     parser.add_argument("--repetition-stop-window", type=int, default=100, help="Token window size used to detect repeated n-gram loops.")
     parser.add_argument("--repetition-stop-ngram-max", type=int, default=20, help="Maximum n-gram size to check for repetition.")
@@ -405,53 +391,6 @@ def prepare_image_tensor(image_path: str, image_processor, model) -> Tuple[torch
 
     image_tensor = image_tensor.to(model.device, dtype=model.dtype)
     return image_tensor, pil_image.size
-
-
-def maybe_run_gdino(args: argparse.Namespace, description_text: str, image_path: str) -> Optional[Dict[str, Any]]:
-    """Run GroundingDINO on the generated description when requested."""
-    if not args.run_gdino:
-        return None
-
-    if gdino_parse_person_descriptions is None or gdino_detect_gaze_targets is None:
-        print("GroundingDINO utilities not available; skipping detection.", file=sys.stderr)
-        return {"error": "detect_gaze_targets module not available"}
-
-    try:
-        persons = gdino_parse_person_descriptions(description_text)
-    except Exception as exc:  # noqa: BLE001
-        print(f"Failed to parse person descriptions for GroundingDINO: {exc}", file=sys.stderr)
-        return {"error": f"parse error: {exc}"}
-
-    payload_base: Dict[str, Any] = {
-        "image_path": str(image_path),
-        "model_id": args.gdino_model_id,
-    }
-
-    if not persons:
-        payload_base["results"] = {}
-        payload_base["warning"] = "No person descriptions detected in generated text."
-        return payload_base
-
-    try:
-        pil_image = load_image(image_path)
-        device_choice = args.gdino_device or "cpu"
-        if device_choice.lower() == "auto":
-            device_choice = "cuda" if torch.cuda.is_available() else "cpu"
-
-        detections = gdino_detect_gaze_targets(
-            image=pil_image,
-            persons=persons,
-            model_id=args.gdino_model_id,
-            box_threshold=args.gdino_box_threshold,
-            text_threshold=args.gdino_text_threshold,
-            device=device_choice,
-        )
-
-        payload_base["results"] = detections
-        return payload_base
-    except Exception as exc:  # noqa: BLE001
-        print(f"GroundingDINO detection failed: {exc}", file=sys.stderr)
-        return {"error": str(exc)}
 
 
 def build_generation_kwargs(args: argparse.Namespace, tokenizer, image_tensor: torch.Tensor, image_size: Tuple[int, int]):
@@ -1018,11 +957,6 @@ def main() -> None:
             if maybe_record_topk(next_prompt, response, sequences, prompt_token_length, turn_index):
                 turn_index += 1
 
-    gdino_payload = maybe_run_gdino(args, response, image_path)
-    if gdino_payload is not None:
-        print("\n=== GroundingDINO Results ===")
-        print(json.dumps(gdino_payload, indent=2))
-
     if args.save_output:
         output_path = Path(args.save_output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1042,9 +976,6 @@ def main() -> None:
                 "prompt": prompt_text,
                 "response": response,
             }
-
-        if gdino_payload is not None:
-            payload["gdino"] = gdino_payload
 
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Saved response to {output_path}")
