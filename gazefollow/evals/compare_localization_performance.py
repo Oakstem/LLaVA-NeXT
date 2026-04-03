@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to write CSV file with per-dataset total metrics (default: <root>/localization_total_metrics.csv).",
     )
+    parser.add_argument(
+        "--output-invalid-coordinates-json",
+        type=Path,
+        default=None,
+        help="Path to write JSON file with per-dataset image IDs without valid gaze coordinates (default: <root>/localization_invalid_coordinates_ids_<timestamp>.json).",
+    )
     return parser.parse_args()
 
 
@@ -118,6 +124,7 @@ class DatasetMetrics:
     precision: Optional[float] = None
     accuracy: Optional[float] = None
     valid_ids: Set[str] = field(default_factory=set)
+    invalid_coordinate_ids: List[str] = field(default_factory=list)
     normalized_errors: Dict[str, float] = field(default_factory=dict)
     gaze_targets: Dict[str, Optional[str]] = field(default_factory=dict)
     in_out_labels: Dict[str, Optional[int]] = field(default_factory=dict)
@@ -189,6 +196,8 @@ def load_dataset_metrics(path: Path) -> DatasetMetrics:
         dataset.in_out_labels[str(sample_id)] = gt_in_out_flag
         inferred_in_out = normalize_in_out(entry.get("pred_in_out"))
         if inferred_in_out is None:
+            inferred_in_out = normalize_in_out(entry.get("predicted_in_out"))
+        if inferred_in_out is None:
             inferred_in_out = normalize_in_out(infer_in_out_from_phrase(gaze_target))
         if inferred_in_out is None:
             inferred_in_out = 1 if coords_valid else 0
@@ -231,6 +240,8 @@ def load_dataset_metrics(path: Path) -> DatasetMetrics:
             normalized_error = person.get("gaze_normalized_l2_error")
             if isinstance(normalized_error, (int, float)):
                 dataset.normalized_errors[str(sample_id)] = float(normalized_error)
+        if not (coords_valid and inferred_in_out == 1):
+            dataset.invalid_coordinate_ids.append(str(sample_id))
 
     if dataset.normalized_errors:
         dataset.mean_normalized_error = mean(dataset.normalized_errors.values())
@@ -496,12 +507,28 @@ def write_metrics_csv(path: Path, datasets: Iterable[DatasetMetrics]) -> None:
             )
 
 
+def write_invalid_coordinate_ids_json(path: Path, datasets: Iterable[DatasetMetrics]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        str(ds.path): {
+            "adapter_path": ds.adapter_path,
+            "count": len(ds.invalid_coordinate_ids),
+            "image_ids": ds.invalid_coordinate_ids,
+        }
+        for ds in datasets
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
 def main() -> int:
     args = parse_args()
     files = find_localization_files(args.root)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_json_path = args.output_json or (args.root / f"localization_top_diffs_{timestamp}.json")
     output_csv_path = args.output_csv or (args.root / f"localization_total_metrics_{timestamp}.csv")
+    output_invalid_coordinates_json_path = args.output_invalid_coordinates_json or (
+        args.root / f"localization_invalid_coordinates_ids_{timestamp}.json"
+    )
 
     print(f"Found {len(files)} localization result file(s) under {args.root}")
 
@@ -592,8 +619,10 @@ def main() -> int:
     }
     write_top_diff_json(output_json_path, summary)
     write_metrics_csv(output_csv_path, datasets)
+    write_invalid_coordinate_ids_json(output_invalid_coordinates_json_path, datasets)
     print(f"Top difference details saved to {output_json_path}")
     print(f"Total metrics CSV saved to {output_csv_path}")
+    print(f"Invalid coordinate IDs JSON saved to {output_invalid_coordinates_json_path}")
 
     return 0
 

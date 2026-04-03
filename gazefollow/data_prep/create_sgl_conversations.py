@@ -21,16 +21,17 @@ from gazefollow.generation_utils import fix_wsl_paths
 
 
 # COMBINED_CSV_PATH = r"gazefollow/data/combined_source_extract_patchscope_valid_20260204.csv"
-# COMBINED_CSV_PATH = r"gazefollow/data/test2_combined_description_results.csv"
-COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/combined_source_extract_patchscope_valid_with_missing_merged_additionals.csv"
-COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/combined_source_extract_patchscope_valid_with_missing_merged_additionals_v11.csv"
+COMBINED_CSV_PATH = r"gazefollow/data/test2_combined_description_results.csv"
+COMBINED_CSV_PATH = r"gazefollow/data/test_inject_and_ground_queue_20251207_merged.csv"
+# COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/combined_source_extract_patchscope_valid_with_missing_merged_additionals.csv"
+# COMBINED_CSV_PATH = r"gazefollow/data/slurm_data/combined_source_extract_patchscope_valid_with_missing_merged_additionals_v11.csv"
 # COMBINED_CSV_PATH = r"/mnt/d/Projects/data/gazefollow/results/valid_runs/combined_ppl_desc_results.csv"
 COMBINED_CSV_PATH = fix_wsl_paths(COMBINED_CSV_PATH)
 OUTSIDE_FRAME_TARGET_DESCRIPTION = "something or someone outside the frame"
-DEFAULT_MIN_IOU_THRESHOLD_SOURCE = 0.2
-DEFAULT_MAX_L2_THRESHOLD_SOURCE = 0.16
+DEFAULT_MIN_IOU_THRESHOLD_SOURCE = 0.4
+DEFAULT_MAX_L2_THRESHOLD_SOURCE = 0.4
 DEFAULT_MIN_IOU_THRESHOLD_TARGET = 0.0
-DEFAULT_MAX_L2_THRESHOLD_TARGET = 0.12
+DEFAULT_MAX_L2_THRESHOLD_TARGET = 0.4
 
 test_set = 'test' in COMBINED_CSV_PATH.lower()
 # Create output directory with timestamp
@@ -103,6 +104,17 @@ def _print_error_frame_stats(stats):
     print(f"  kept rows: {stats['kept_rows']}")
 
 
+def _print_l2_summary(label, values):
+    if not values:
+        print(f"{label} L2 error (kept rows): no finite values.")
+        return
+    arr = np.asarray(values, dtype=float)
+    print(
+        f"{label} L2 error (kept rows): "
+        f"n={len(arr)}, mean={arr.mean():.4f}, median={np.median(arr):.4f}, max={arr.max():.4f}"
+    )
+
+
 def _source_error_filter_mask_patchscope(df):
     mask = pd.Series([0] * len(df), index=df.index, dtype=bool)
     if "source_description" in df.columns and "steered_source_description" in df.columns:
@@ -128,6 +140,27 @@ def _source_error_filter_mask(df, eligibility="metrics"):
     iou = df["source_grounding_bbox_iou"]
     mask = l2.notna() & iou.notna()
     mask &= np.isfinite(l2) & np.isfinite(iou)
+    return mask
+
+
+def _target_error_filter_mask(df):
+    has_metrics = all(
+        col in df.columns
+        for col in (
+            "target_grounding_normalized_l2_error",
+            "target_grounding_bbox_iou",
+        )
+    )
+    if not has_metrics:
+        return pd.Series([False] * len(df), index=df.index, dtype=bool)
+    l2 = df["target_grounding_normalized_l2_error"]
+    iou = df["target_grounding_bbox_iou"]
+    mask = l2.notna() & iou.notna()
+    mask &= np.isfinite(l2) & np.isfinite(iou)
+    if "patchscope_target_description" in df.columns:
+        mask &= df["patchscope_target_description"].apply(lambda x: isinstance(x, str))
+    in_or_out = df.get("in_or_out", pd.Series([0] * len(df), index=df.index))
+    mask &= in_or_out == 1
     return mask
 
 
@@ -214,18 +247,12 @@ def _print_cumulative_filter_counts(
     after_source_count = int(cumulative_keep_mask.sum())
 
     if has_target_metrics:
-        patchscope_target_mask = pd.Series([False] * total_count, index=combined_df.index, dtype=bool)
-        if "patchscope_target_description" in combined_df.columns:
-            patchscope_target_mask = combined_df["patchscope_target_description"].apply(
-                lambda x: isinstance(x, str)
-            )
-        in_or_out = combined_df.get("in_or_out", pd.Series([0] * total_count, index=combined_df.index))
-        target_filter_mask = cumulative_keep_mask & patchscope_target_mask & (in_or_out == 1)
+        target_filter_mask = cumulative_keep_mask & _target_error_filter_mask(combined_df)
         target_keep_mask = pd.Series([True] * total_count, index=combined_df.index, dtype=bool)
         target_keep_mask.loc[target_filter_mask] = (
-            combined_df.loc[target_filter_mask, "target_grounding_normalized_l2_error"] < max_l2_threshold_target
+            combined_df.loc[target_filter_mask, "target_grounding_normalized_l2_error"] <= max_l2_threshold_target
         ) & (
-            combined_df.loc[target_filter_mask, "target_grounding_bbox_iou"] > min_iou_threshold_target
+            combined_df.loc[target_filter_mask, "target_grounding_bbox_iou"] >= min_iou_threshold_target
         )
         cumulative_keep_mask &= target_keep_mask
 
@@ -334,7 +361,7 @@ def _select_thresholds_interactively(
     target_errors = None
     target_error_stats = None
     if has_target_metrics:
-        target_mask = combined_df.get("in_or_out", fallback_mask) == 1
+        target_mask = _target_error_filter_mask(combined_df)
         target_errors, target_error_stats = _build_error_frame(
             combined_df,
             "target_grounding_normalized_l2_error",
@@ -483,7 +510,7 @@ def parse_args():
     )
     parser.add_argument(
         "--auto-threshold",
-        default=True,
+        default=False,
         action="store_true",
         help="Auto-select L2/IOU thresholds from error histograms.",
     )
@@ -630,7 +657,11 @@ def create_conversational_data(
         source_filter_mask = pd.Series(
             [False] * len(combined_df), index=combined_df.index, dtype=bool
         )
+    target_filter_mask = _target_error_filter_mask(combined_df) if has_target_metrics else pd.Series(
+        [False] * len(combined_df), index=combined_df.index, dtype=bool
+    )
     source_filter_eligible = int(source_filter_mask.sum())
+    target_filter_eligible = int(target_filter_mask.sum())
 
     if auto_threshold:
         (
@@ -655,6 +686,7 @@ def create_conversational_data(
     )
     print(f"Source eligibility mode: {source_eligibility}")
     print(f"Source error filter eligible rows: {source_filter_eligible}")
+    print(f"Target error filter eligible rows: {target_filter_eligible}")
     if not has_source_metrics:
         print("Source grounding metrics not found; source error filtering will be skipped.")
     if not has_target_metrics:
@@ -698,6 +730,8 @@ def create_conversational_data(
     skipped_due_to_target_format = 0
     skipped_due_to_large_source_error = 0
     skipped_due_to_large_target_error = 0
+    kept_source_l2_errors = []
+    kept_target_l2_errors = []
 
     # Create progress bar
     total_items = len(combined_df)
@@ -724,6 +758,8 @@ def create_conversational_data(
             if row['source_grounding_bbox_iou'] < min_iou_threshold_source or row['source_grounding_normalized_l2_error'] > max_l2_threshold_source:
                 skipped_due_to_large_source_error += 1
                 continue
+        if eligible_for_source_filter:
+            kept_source_l2_errors.append(float(row['source_grounding_normalized_l2_error']))
 
         # subject_entry is like {"caption": "hairdresser", ...}
         patchscope_subject_entry = row.get("patchscope_source_description", None)
@@ -743,11 +779,11 @@ def create_conversational_data(
 
         patchscope_target_entry = row.get("patchscope_target_description", None)
         if patchscope_target_entry is not None and isinstance(patchscope_target_entry, str):
-            if has_target_metrics:
-                if row['target_grounding_normalized_l2_error'] < max_l2_threshold_target and row['target_grounding_bbox_iou'] > min_iou_threshold_target:
+            if bool(target_filter_mask.iloc[current_index - 1]):
+                if row['target_grounding_normalized_l2_error'] <= max_l2_threshold_target and row['target_grounding_bbox_iou'] >= min_iou_threshold_target:
                     # use the patchscope extracted target description if available
                     target_entry = patchscope_target_entry
-                elif row['in_or_out'] == 1:
+                else:
                     skipped_due_to_large_target_error += 1
                     continue
             else:
@@ -768,6 +804,8 @@ def create_conversational_data(
             print(f"Warning: Unexpected format for target_entry in image_key '{image_key}'. Skipping.")
             skipped_due_to_target_format += 1
             continue
+        if bool(target_filter_mask.iloc[current_index - 1]):
+            kept_target_l2_errors.append(float(row['target_grounding_normalized_l2_error']))
 
         # --- Data Extraction ---
         # For subjects_data: image_key maps directly to the subject string.
@@ -878,6 +916,10 @@ def create_conversational_data(
     if skipped_due_to_large_target_error > 0:
         print(f"Skipped (large target grounding error): {skipped_due_to_large_target_error}")
     print(f"Source error filter eligible rows: {source_filter_eligible}")
+    print(f"Target error filter eligible rows: {target_filter_eligible}")
+    _print_l2_summary("Source", kept_source_l2_errors)
+    _print_l2_summary("Target", kept_target_l2_errors)
+    print(f"Final file samples: {len(output_data)}")
 
     # Final save
     if save_progress(output_data, processed_image_paths, is_final=True):
