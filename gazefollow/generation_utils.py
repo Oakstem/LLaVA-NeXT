@@ -1758,6 +1758,7 @@ def _prepare_inputs(
 
     if not gt_mask_used and mask_path is not None:
         mask = load_mask_from_file(mask_path)
+        print(f"Loaded target mask from file: {mask_path}")
 
     if mask is not None:
         target_mask_raw = np.copy(mask)

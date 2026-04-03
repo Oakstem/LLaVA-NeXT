@@ -1385,16 +1385,13 @@ def run_repr_layer_sweep_experiment(
         print("No representation layers met the filtering criteria (non-zero correlation and containing 'looking').")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    generated_text_by_combo = {
+        combo_label: (result.get("generated_text", "") or "")
+        for combo_label, result in all_results.items()
+    }
     sweep_payload = {
         "timestamp": timestamp,
-        "repr_layer_indices": repr_layer_indices,
-        "repr_target_layer_indices": inject_indices,
-        "pairwise_sweep_enabled": enable_pairwise_sweep,
-        "bias_strength_used": effective_bias,
-        "repr_layer_results": all_results,
-        "performance_summary": performance_summary,
-        "best_repr_capture_layer_idx": best_capture_idx,
-        "best_repr_inject_layer_idx": best_inject_idx,
+        "generated_text_by_layer_combination": generated_text_by_combo,
     }
     saved_results_path = save_image_results(
         sweep_payload,
@@ -1532,7 +1529,7 @@ if __name__ == '__main__':
 #                         a man → a man in a black leather jacket and glasses. 
 #                         a woman → a woman in a dark green sweater and black jeans carrying a tan shoulder bag
     parser.add_argument('--prompt', type=str, default=DEFAULT_PROMPT, help="Input prompt.")
-    parser.add_argument('--use-gt-gaze-csv', action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument('--use-gt-gaze-csv', action=argparse.BooleanOptionalAction, default=False,
                         dest='use_gt_gaze_csv', help="Use ground-truth gaze CSV to override gaze masks (default: enabled).")
     parser.add_argument('--gt_gaze_csv_path', type=str, default=str(DEFAULT_GT_GAZE_CSV),
                         help="Path to the ground-truth gaze CSV file.")
@@ -1585,10 +1582,10 @@ if __name__ == '__main__':
                         help="Bias strength to use during repr layer sweep (defaults to generation bias).")
     parser.add_argument('--repr_combo_sweep', action='store_true',
                         help="When provided, performs a pairwise sweep over capture/inject repr layers instead of a single shared index.")
-    parser.add_argument('--repr_capture_layers', type=int, nargs='*', default=[20],
+    parser.add_argument('--repr_capture_layers', type=int, nargs='*', default=None,
                         dest='repr_capture_layers',
                         help="Optional override for capture/person representation layers used during combo sweeps.")
-    parser.add_argument('--repr_inject_layers', type=int, nargs='*', default=[0],
+    parser.add_argument('--repr_inject_layers', type=int, nargs='*', default=None,
                         dest='repr_inject_layers',
                         help="Optional override for inject/gaze representation layers used during combo sweeps.")
     parser.add_argument('--token_injection_repr_sweep', action=argparse.BooleanOptionalAction, default=False,
