@@ -105,9 +105,15 @@ def load_sweep_entries(results_file: Path) -> List[SweepEntry]:
     return entries
 
 
-def load_mask_center(mask_meta_path: Path) -> Tuple[Path, Dict[str, Any], Tuple[float, float], Tuple[int, int], List[int]]:
+def load_mask_center(
+    mask_meta_path: Path,
+    image_path_override: Optional[Path] = None,
+) -> Tuple[Path, Dict[str, Any], Tuple[float, float], Tuple[int, int], List[int]]:
     metadata = json.loads(mask_meta_path.read_text(encoding="utf-8"))
-    image_path = _normalize_path(str(metadata.get("image_path") or ""))
+    if image_path_override is not None:
+        image_path = image_path_override
+    else:
+        image_path = _normalize_path(str(metadata.get("image_path") or ""))
     image_width = int(metadata.get("image_width") or 0)
     image_height = int(metadata.get("image_height") or 0)
     if image_width <= 0 or image_height <= 0:
@@ -250,6 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ground each sweep description and score it against a region-mask center.")
     parser.add_argument("--results-file", default=DEFAULT_RESULTS_FILE)
     parser.add_argument("--mask-meta-file", default=DEFAULT_MASK_META)
+    parser.add_argument("--image-path", default=None)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
@@ -267,11 +274,15 @@ def main() -> None:
     results_path = _normalize_path(args.results_file)
     mask_meta_path = _normalize_path(args.mask_meta_file)
     output_root = _normalize_path(args.output_dir)
+    image_path_override = _normalize_path(args.image_path) if args.image_path else None
 
     entries = load_sweep_entries(results_path)
     if args.limit is not None:
         entries = entries[: args.limit]
-    image_path, mask_meta, mask_center, image_size, mask_bounds = load_mask_center(mask_meta_path)
+    image_path, mask_meta, mask_center, image_size, mask_bounds = load_mask_center(
+        mask_meta_path,
+        image_path_override=image_path_override,
+    )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = output_root / f"grounding_review_{timestamp}"

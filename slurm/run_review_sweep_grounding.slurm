@@ -23,6 +23,7 @@ fi
 
 RESULTS_FILE="${RESULTS_FILE:-$PROJECT_ROOT/results/steered_generation/repr_layer_sweep_results_20260403_183355.json}"
 MASK_META_FILE="${MASK_META_FILE:-$PROJECT_ROOT/region_masks/active_region_mask2.json}"
+IMAGE_PATH="${IMAGE_PATH:-}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-160}"
@@ -45,6 +46,7 @@ echo "Working Directory: $(pwd)"
 echo "Python: $PYTHON_BIN"
 echo "Results File: $RESULTS_FILE"
 echo "Mask Meta File: $MASK_META_FILE"
+echo "Image Path: ${IMAGE_PATH:-<from mask metadata>}"
 echo "Model ID: $MODEL_ID"
 echo "Device Map: $DEVICE_MAP"
 echo "Max New Tokens: $MAX_NEW_TOKENS"
@@ -78,6 +80,11 @@ if [ ! -f "$MASK_META_FILE" ]; then
     exit 1
 fi
 
+if [ -n "$IMAGE_PATH" ] && [ ! -f "$IMAGE_PATH" ]; then
+    echo "ERROR: Image file not found at $IMAGE_PATH"
+    exit 1
+fi
+
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
@@ -91,6 +98,10 @@ ARGS=(
     "--temperature" "$TEMPERATURE"
     "--print-top-k" "$PRINT_TOP_K"
 )
+
+if [ -n "$IMAGE_PATH" ]; then
+    ARGS+=("--image-path" "$IMAGE_PATH")
+fi
 
 if [ -n "$LIMIT" ]; then
     ARGS+=("--limit" "$LIMIT")
