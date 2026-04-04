@@ -196,14 +196,20 @@ def draw_overlay(
     if best_detection and best_detection.get("bbox"):
         x1, y1, x2, y2 = [int(round(float(v))) for v in best_detection["bbox"]]
         draw.rectangle([(x1, y1), (x2, y2)], outline="#ff6b35", width=4)
+        caption_lines.append(f"bbox=[{x1}, {y1}, {x2}, {y2}]")
         pred_center = best_detection.get("bbox_center")
         if pred_center:
             px, py = pred_center
             draw.ellipse([(px - 5, py - 5), (px + 5, py + 5)], fill="#ff6b35")
         metrics = best_detection.get("metrics") or {}
+        l2 = metrics.get("gaze_l2_error")
         norm_l2 = metrics.get("gaze_normalized_l2_error")
+        if l2 is not None:
+            caption_lines.append(f"l2={l2:.2f}")
         if norm_l2 is not None:
             caption_lines.append(f"norm_l2={norm_l2:.4f}")
+    else:
+        caption_lines.append("bbox=<none>")
 
     draw.multiline_text(
         (12, 12),
@@ -252,6 +258,11 @@ def write_markdown_table(rows: List[Dict[str, Any]], path: Path) -> None:
             handle.write("| " + " | ".join(values) + " |\n")
 
 
+def _safe_filename(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._")
+    return cleaned[:120] if cleaned else fallback
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ground each sweep description and score it against a region-mask center.")
     parser.add_argument("--results-file", default=DEFAULT_RESULTS_FILE)
@@ -263,7 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--save-overlays", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-overlays", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--print-top-k", type=int, default=15)
     return parser.parse_args()
 
@@ -295,10 +306,13 @@ def main() -> None:
     width, height = image_size
     summary_rows: List[Dict[str, Any]] = []
     detail_rows: List[Dict[str, Any]] = []
+    unique_texts = list(dict.fromkeys(entry.text for entry in entries))
+    print(f"Loaded {len(entries)} entries with {len(unique_texts)} unique text values.")
 
-    for idx, entry in enumerate(entries, start=1):
-        print(f"[{idx}/{len(entries)}] {entry.combo_key}: {entry.text}")
-        query = build_qwen_query(entry.text)
+    text_results: Dict[str, Dict[str, Any]] = {}
+    for idx, text in enumerate(unique_texts, start=1):
+        print(f"[unique {idx}/{len(unique_texts)}] {text}")
+        query = build_qwen_query(text)
         detections, raw_response = run_qwen3vl_grounding(
             image_path=str(image_path),
             query=query,
@@ -329,11 +343,26 @@ def main() -> None:
                 mask_bounds=mask_bounds,
                 mask_center=mask_center,
                 best_detection=best_detection,
-                combo_key=entry.combo_key,
-                description=entry.text,
-                output_path=overlays_dir / f"{entry.combo_key}.png",
+                combo_key=_safe_filename(text, f"text_{idx}"),
+                description=text,
+                output_path=overlays_dir / f"{idx:04d}_{_safe_filename(text, f'text_{idx}')}.png",
             )
 
+        text_results[text] = {
+            "query": query,
+            "detections": detections,
+            "best_detection": best_detection,
+            "best_metrics": best_metrics,
+            "raw_response": raw_response,
+            "overlay_path": None if overlay_path is None else str(overlay_path),
+            "num_detections": len(detections),
+            "all_detections": serialize_detection_metrics(detections, mask_center, image_size),
+        }
+
+    for entry in entries:
+        cached = text_results[entry.text]
+        best_detection = cached["best_detection"]
+        best_metrics = cached["best_metrics"]
         best_bbox = best_detection.get("bbox") if best_detection else None
         best_center = best_detection.get("bbox_center") if best_detection else None
         score = best_detection.get("score") if best_detection else None
@@ -351,8 +380,8 @@ def main() -> None:
                 "norm_l2": None if best_metrics is None else best_metrics.get("gaze_normalized_l2_error"),
                 "modified_l2": None if best_metrics is None else best_metrics.get("gaze_modified_l2_error"),
                 "gaze_iou": None if best_metrics is None else best_metrics.get("gaze_iou"),
-                "num_detections": len(detections),
-                "overlay_path": "" if overlay_path is None else str(overlay_path),
+                "num_detections": cached["num_detections"],
+                "overlay_path": "" if cached["overlay_path"] is None else cached["overlay_path"],
             }
         )
         detail_rows.append(
@@ -362,12 +391,12 @@ def main() -> None:
                 "target_layer": entry.target_layer,
                 "raw_text": entry.raw_text,
                 "text": entry.text,
-                "query": query,
+                "query": cached["query"],
                 "best_detection": best_detection,
                 "best_metrics": best_metrics,
-                "all_detections": serialize_detection_metrics(detections, mask_center, image_size),
-                "raw_response": raw_response,
-                "overlay_path": None if overlay_path is None else str(overlay_path),
+                "all_detections": cached["all_detections"],
+                "raw_response": cached["raw_response"],
+                "overlay_path": cached["overlay_path"],
             }
         )
 
@@ -385,6 +414,8 @@ def main() -> None:
         "mask_center": {"x": mask_center[0], "y": mask_center[1]},
         "mask_bounds": mask_bounds,
         "mask_metadata": mask_meta,
+        "num_entries": len(entries),
+        "num_unique_texts": len(unique_texts),
         "summary_rows": summary_rows,
         "details": detail_rows,
     }
