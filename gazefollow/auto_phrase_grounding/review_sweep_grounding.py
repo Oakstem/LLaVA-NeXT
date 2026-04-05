@@ -26,7 +26,7 @@ from gazefollow.auto_phrase_grounding.qwen3vl_grounding import (
     run_qwen3vl_grounding,
 )
 from gazefollow.gaze_metrics import compute_gaze_errors
-from gazefollow.qwen3vl_utils import build_qwen_query, choose_best_detection_by_error
+from gazefollow.qwen3vl_utils import build_qwen_query, extract_bbox, extract_score
 
 
 DEFAULT_RESULTS_FILE = "results/steered_generation/repr_layer_sweep_results_20260403_183355.json"
@@ -188,6 +188,51 @@ def serialize_detection_metrics(
     return serialized
 
 
+def choose_best_detection_by_score(
+    detections: Sequence[Dict[str, Any]],
+    ground_truth_point: Tuple[float, float],
+    image_width: int,
+    image_height: int,
+    score_threshold: float,
+    iou_radius_ratio: float,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    best_detection: Optional[Dict[str, Any]] = None
+    best_metrics: Optional[Dict[str, Any]] = None
+    best_score = float("-inf")
+    best_modified_l2 = float("inf")
+
+    for detection in detections:
+        bbox = extract_bbox(detection)
+        if not bbox:
+            continue
+
+        score = extract_score(detection)
+        if score is not None and score < score_threshold:
+            continue
+
+        metrics = compute_gaze_errors(
+            predicted_box=bbox,
+            person_box=None,
+            ground_truth_point=ground_truth_point,
+            image_width=image_width,
+            image_height=image_height,
+            iou_radius_ratio=iou_radius_ratio,
+        )
+        modified_l2 = metrics.get("gaze_modified_l2_error")
+        comparable_score = score if score is not None else float("-inf")
+        if comparable_score > best_score or (
+            comparable_score == best_score
+            and modified_l2 is not None
+            and modified_l2 < best_modified_l2
+        ):
+            best_score = comparable_score
+            best_modified_l2 = modified_l2 if modified_l2 is not None else float("inf")
+            best_detection = detection
+            best_metrics = metrics
+
+    return best_detection, best_metrics
+
+
 def draw_overlay(
     image_path: Path,
     mask_bounds: Sequence[int],
@@ -340,7 +385,7 @@ def main() -> None:
             temperature=args.temperature,
         )
 
-        best_detection, best_metrics = choose_best_detection_by_error(
+        best_detection, best_metrics = choose_best_detection_by_score(
             detections=detections,
             ground_truth_point=mask_center,
             image_width=width,
