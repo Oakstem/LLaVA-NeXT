@@ -109,22 +109,36 @@ def load_mask_center(
     mask_meta_path: Path,
     image_path_override: Optional[Path] = None,
 ) -> Tuple[Path, Dict[str, Any], Tuple[float, float], Tuple[int, int], List[int]]:
-    metadata = json.loads(mask_meta_path.read_text(encoding="utf-8"))
+    metadata: Dict[str, Any] = {}
+    if mask_meta_path.suffix.lower() == ".json":
+        metadata = json.loads(mask_meta_path.read_text(encoding="utf-8"))
+        npy_path: Optional[Path] = None
+    elif mask_meta_path.suffix.lower() == ".npy":
+        npy_path = mask_meta_path
+    else:
+        raise ValueError(f"Expected a .json or .npy mask input, got: {mask_meta_path}")
+
     if image_path_override is not None:
         image_path = image_path_override
     else:
-        image_path = _normalize_path(str(metadata.get("image_path") or ""))
+        image_path_value = str(metadata.get("image_path") or "").strip()
+        if not image_path_value:
+            raise ValueError(
+                "Mask input does not provide an image path. Pass --image-path or use a JSON file that includes image_path."
+            )
+        image_path = _normalize_path(image_path_value)
+
     image_width = int(metadata.get("image_width") or 0)
     image_height = int(metadata.get("image_height") or 0)
-    if image_width <= 0 or image_height <= 0:
-        raise ValueError("Mask metadata must include positive image_width and image_height.")
-
-    npy_path = mask_meta_path.with_suffix(".npy")
-    if npy_path.exists():
+    if npy_path is not None:
         mask = np.load(npy_path, allow_pickle=True)
         if isinstance(mask, np.ndarray) and mask.ndim > 2:
             mask = np.squeeze(mask)
         mask = np.asarray(mask).astype(bool)
+        if mask.ndim != 2:
+            raise ValueError(f"Mask array must be 2D after squeeze: {npy_path}")
+        if image_width <= 0 or image_height <= 0:
+            image_height, image_width = mask.shape
         ys, xs = np.nonzero(mask)
         if xs.size == 0 or ys.size == 0:
             raise ValueError(f"Mask file is empty: {npy_path}")
@@ -132,6 +146,8 @@ def load_mask_center(
         bounds = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
         return image_path, metadata, center, (image_width, image_height), bounds
 
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("Mask metadata must include positive image_width and image_height.")
     pixel_bounds = metadata.get("pixel_bounds") or {}
     x_min = int(pixel_bounds.get("x_min", 0))
     y_min = int(pixel_bounds.get("y_min", 0))
