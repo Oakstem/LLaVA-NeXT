@@ -82,8 +82,14 @@ def _extract_description_parts(text: str) -> Tuple[str, str]:
     return cleaned, cleaned
 
 
-def load_sweep_entries(results_file: Path) -> List[SweepEntry]:
+def load_sweep_payload(results_file: Path) -> Dict[str, Any]:
     payload = json.loads(results_file.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Results JSON must contain a top-level object.")
+    return payload
+
+
+def load_sweep_entries(payload: Dict[str, Any]) -> List[SweepEntry]:
     generated = payload.get("generated_text_by_layer_combination")
     if not isinstance(generated, dict):
         raise ValueError("Results JSON does not contain 'generated_text_by_layer_combination'.")
@@ -103,6 +109,35 @@ def load_sweep_entries(results_file: Path) -> List[SweepEntry]:
             )
         )
     return entries
+
+
+def _optional_normalize_path(path_str: Optional[str]) -> Optional[Path]:
+    if path_str is None:
+        return None
+    value = str(path_str).strip()
+    if not value:
+        return None
+    return _normalize_path(value)
+
+
+def resolve_sweep_context(
+    payload: Dict[str, Any],
+    mask_meta_arg: Optional[str],
+    image_path_arg: Optional[str],
+) -> Tuple[Path, Optional[Path]]:
+    mask_path = _optional_normalize_path(mask_meta_arg)
+    if mask_path is None:
+        mask_path = _optional_normalize_path(payload.get("mask_path"))
+    if mask_path is None:
+        mask_path = _optional_normalize_path(payload.get("mask_meta_file"))
+    if mask_path is None:
+        raise ValueError("Could not resolve a mask file. Pass --mask-meta-file or store mask_path in the sweep results JSON.")
+
+    image_path = _optional_normalize_path(image_path_arg)
+    if image_path is None:
+        image_path = _optional_normalize_path(payload.get("image_path"))
+
+    return mask_path, image_path
 
 
 def load_mask_center(
@@ -327,7 +362,7 @@ def _safe_filename(value: str, fallback: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ground each sweep description and score it against a region-mask center.")
     parser.add_argument("--results-file", default=DEFAULT_RESULTS_FILE)
-    parser.add_argument("--mask-meta-file", default=DEFAULT_MASK_META)
+    parser.add_argument("--mask-meta-file", default=None)
     parser.add_argument("--image-path", default=None)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device-map", default="auto")
@@ -344,11 +379,15 @@ def main() -> None:
     args = parse_args()
 
     results_path = _normalize_path(args.results_file)
-    mask_meta_path = _normalize_path(args.mask_meta_file)
     output_root = _normalize_path(args.output_dir)
-    image_path_override = _normalize_path(args.image_path) if args.image_path else None
+    sweep_payload = load_sweep_payload(results_path)
+    mask_meta_path, image_path_override = resolve_sweep_context(
+        sweep_payload,
+        args.mask_meta_file,
+        args.image_path,
+    )
 
-    entries = load_sweep_entries(results_path)
+    entries = load_sweep_entries(sweep_payload)
     if args.limit is not None:
         entries = entries[: args.limit]
     image_path, mask_meta, mask_center, image_size, mask_bounds = load_mask_center(

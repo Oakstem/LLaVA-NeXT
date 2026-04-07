@@ -1391,6 +1391,9 @@ def run_repr_layer_sweep_experiment(
     }
     sweep_payload = {
         "timestamp": timestamp,
+        "image_path": str(base_experiment_config.get("image_path") or ""),
+        "mask_path": str(base_experiment_config.get("mask_path") or ""),
+        "output_dir": str(base_output_dir_path),
         "generated_text_by_layer_combination": generated_text_by_combo,
     }
     saved_results_path = save_image_results(
