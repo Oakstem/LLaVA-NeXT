@@ -2,9 +2,9 @@
 #SBATCH --job-name=random_mask_repr_pipeline
 #SBATCH --output=logs/random_mask_repr_pipeline_%j.out
 #SBATCH --error=logs/random_mask_repr_pipeline_%j.err
-#SBATCH --time=01:00:00
-#SBATCH --partition=gpu-tad-pool
-#SBATCH --qos=owner
+#SBATCH --time=05:00:00
+#SBATCH --partition=power-general-shared-pool
+#SBATCH --qos=public
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=2G
 #SBATCH --nodes=1

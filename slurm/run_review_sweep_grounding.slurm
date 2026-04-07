@@ -2,7 +2,7 @@
 #SBATCH --job-name=review_sweep_grounding
 #SBATCH --output=logs/review_sweep_grounding_%j.out
 #SBATCH --error=logs/review_sweep_grounding_%j.err
-#SBATCH --time=06:00:00
+#SBATCH --time=03:00:00
 #SBATCH --partition=gpu-tad-pool
 #SBATCH --qos=owner
 #SBATCH --gres=gpu:1

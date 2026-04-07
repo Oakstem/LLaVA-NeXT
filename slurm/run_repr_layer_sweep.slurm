@@ -2,12 +2,12 @@
 #SBATCH --job-name=repr_layer_sweep
 #SBATCH --output=logs/repr_layer_sweep_%j.out
 #SBATCH --error=logs/repr_layer_sweep_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=6:00:00
 #SBATCH --partition=gpu-tad-pool
 #SBATCH --qos=owner
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=48G
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=20G
 #SBATCH --nodes=1
 
 PROJECT_ROOT="/galitylab/students/alonmardi/projects/LLaVA-NeXT"
