@@ -246,7 +246,8 @@ def run_generation_with_attention(
         include_image_inputs: Whether to send image tensors to the model on the first decoding step
         filter_image_tokens_to_person_mask: Restrict image tokens to the person_mask selection when True
         use_target_insert_for_source: When True, reuse gaze target insert indices/representations for the source slots
-        attention_mask_viz_dir: Directory to store compressed custom attention mask visualizations (optional)
+        attention_mask_viz_dir: Directory to store compressed custom attention mask visualizations.
+            When unset or False, HTML visualization generation is disabled.
 
     Returns:
         Dictionary containing generation results and analysis
@@ -267,12 +268,8 @@ def run_generation_with_attention(
      tensor_output_dir, collage_output_dir, similarity_output_dir) = output_directories
     mask_overlay_dir = Path(output_dir) / "mask_overlays"
     mask_viz_dir: Optional[Path] = None
-    if attention_mask_viz_dir is False:
-        mask_viz_dir = None
-    elif attention_mask_viz_dir:
+    if attention_mask_viz_dir:
         mask_viz_dir = Path(fix_wsl_paths(str(attention_mask_viz_dir))).expanduser().resolve()
-    else:
-        mask_viz_dir = Path(output_dir) / "attention_mask_visualizations"
     if mask_viz_dir is not None:
         mask_viz_dir.mkdir(parents=True, exist_ok=True)
 
