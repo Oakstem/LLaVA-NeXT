@@ -11,12 +11,12 @@
 
 PROJECT_ROOT="/galitylab/students/alonmardi/projects/LLaVA-NeXT"
 
-PYTHON_BIN="/galitylab/students/alonmardi/llava/bin/python"
+PYTHON_BIN="/galitylab/students/alonmardi/.ground-uv/bin/python"
 if [ ! -x "$PYTHON_BIN" ]; then
     PYTHON_BIN="/home/alonz/llava/bin/python"
 fi
 if [ ! -x "$PYTHON_BIN" ]; then
-    echo "ERROR: Python env not found at /galitylab/students/alonmardi/llava/bin/python or /home/alonz/llava/bin/python"
+    echo "ERROR: Python env not found at /galitylab/students/alonmardi/.ground-uv/bin/python or /home/alonz/llava/bin/python"
     exit 1
 fi
 

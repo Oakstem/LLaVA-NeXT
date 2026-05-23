@@ -3,7 +3,8 @@
 #SBATCH --output=logs/vacation_batch_all_%A_%a.out
 #SBATCH --error=logs/vacation_batch_all_%A_%a.err
 #SBATCH --time=02:00:00
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu-tad-pool
+#SBATCH --qos=owner
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=20G
@@ -14,10 +15,10 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/galitylab/students/alonmardi/projects/LLaVA-NeXT}"
 TRAINING_OUTPUTS_ROOT="${TRAINING_OUTPUTS_ROOT:-$REPO_ROOT/training_outputs}"
-RUN_NAME_PATTERN="${RUN_NAME_PATTERN:-*}"
+RUN_NAME_PATTERN="${RUN_NAME_PATTERN:-*225603*}"
 CHECKPOINT_STEP="${CHECKPOINT_STEP:-1000}"
 CKPT_START="${CKPT_START:-6000}"
-CKPT_END="${CKPT_END:-10000}"
+CKPT_END="${CKPT_END:-13000}"
 CKPT_STEP="${CKPT_STEP:-$CHECKPOINT_STEP}"
 JOB_SCRIPT="${JOB_SCRIPT:-$REPO_ROOT/slurm/run_vacation_batch_inference.slurm}"
 TWO_STEP_INFERENCE="${TWO_STEP_INFERENCE:-true}"

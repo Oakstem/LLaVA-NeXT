@@ -31,7 +31,7 @@ LOAD_8BIT="${LOAD_8BIT:-false}"
 # Dataset configuration
 DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-LIMIT="${LIMIT:-3000}"
+LIMIT="${LIMIT:-100}"
 
 # Generation controls
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
