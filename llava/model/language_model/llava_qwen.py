@@ -93,6 +93,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self._roi_contrastive_warned_small_pair_count = False
         self.latest_person_mask_repr: Optional[torch.Tensor] = None
         self.latest_attention_mask_snapshot: Optional[Dict[str, Any]] = None
+        self._last_logged_repr_layer_config: Optional[Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]] = None
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -213,6 +214,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 mask_hidden_state_source = mask_hidden_state_target
 
         repr_layer_idx = kwargs.get("repr_layer_idx", None)
+        self._maybe_log_repr_layer_indices(repr_layer_idx)
         use_layer_injection = repr_layer_idx is not None and insert_positions is not None
         layer_injection_data = None
         updated = False
@@ -283,6 +285,49 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             updated = True
 
         return updated
+
+    def _normalize_repr_layer_index(
+        self,
+        idx: Optional[int],
+        num_hidden_layers: int,
+    ) -> Optional[int]:
+        if idx is None:
+            return None
+        normalized = int(idx)
+        if normalized < 0:
+            normalized += num_hidden_layers
+        if normalized < 0 or normalized >= num_hidden_layers:
+            return None
+        return normalized
+
+    def _maybe_log_repr_layer_indices(
+        self,
+        repr_layer_idx: Optional[Union[int, Dict[str, Any]]],
+    ) -> None:
+        if repr_layer_idx is None:
+            return
+
+        if isinstance(repr_layer_idx, dict):
+            capture_raw = repr_layer_idx.get("capture")
+            inject_raw = repr_layer_idx.get("inject")
+        else:
+            capture_raw = repr_layer_idx
+            inject_raw = repr_layer_idx
+
+        num_hidden_layers = len(self.get_model().layers)
+        capture_norm = self._normalize_repr_layer_index(capture_raw, num_hidden_layers)
+        inject_norm = self._normalize_repr_layer_index(inject_raw, num_hidden_layers)
+        current_config = (capture_raw, capture_norm, inject_raw, inject_norm)
+        if self._last_logged_repr_layer_config == current_config:
+            return
+
+        print(
+            "[REPR_LAYER_VERIFY][model] "
+            f"capture={capture_raw} (normalized={capture_norm}) "
+            f"inject={inject_raw} (normalized={inject_norm}) "
+            f"num_hidden_layers={num_hidden_layers}"
+        )
+        self._last_logged_repr_layer_config = current_config
 
     def forward(
         self,
@@ -892,6 +937,25 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             "image_top1": image_top1,
         }
 
+    @staticmethod
+    def _build_roi_candidate_count_stats(
+        stats_device: torch.device,
+        candidate_breakdown: Optional[Dict[str, int]],
+        candidate_inputs_ready: bool,
+        candidate_path_applied: bool,
+    ) -> Dict[str, torch.Tensor]:
+        breakdown = candidate_breakdown or {}
+        count_values = {
+            "gt_in_out_encountered": int(breakdown.get("candidate_samples_out_of_frame", 0)),
+            "candidate_samples_true_oof_encountered": int(breakdown.get("candidate_samples_true_oof_encountered", 0)),
+            "candidate_samples_true_oof_supervisable": int(breakdown.get("candidate_samples_true_oof_supervisable", 0)),
+            "candidate_samples_true_oof_supervised": int(breakdown.get("true_oof_supervised_count", 0)),
+        }
+        return {
+            key: torch.tensor(value, device=stats_device, dtype=torch.long)
+            for key, value in count_values.items()
+        }
+
     def _apply_roi_candidate_path(
         self,
         outputs: CausalLMOutputWithPast,
@@ -913,7 +977,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         preview_buffer: ROIContrastivePreviewBuffer,
         debug_this_step: bool,
         debug_steps: int,
-    ) -> bool:
+    ) -> Tuple[bool, Dict[str, int]]:
         # Sub-step 1: initialize per-batch bookkeeping for candidate-path supervision.
         batch_limit_candidate = min(
             hidden_last.shape[0],
@@ -937,10 +1001,20 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         samples_with_candidates = 0
         samples_with_pos = 0
         samples_with_pos_and_neg = 0
+        samples_in_frame = 0
+        samples_out_of_frame = 0
+        samples_true_oof_encountered = 0
+        samples_true_oof_supervisable = 0
         samples_true_oof_supervised = 0
+        has_oof_bank = oof_enabled and oof_text_projs is not None and oof_text_projs.numel() > 0
 
         # Sub-step 2: build image-level candidate/text representations and image-level objectives.
         for im_idx in range(batch_limit_candidate):
+            if roi_gaze_valid is not None:
+                if bool(roi_gaze_valid[im_idx].item()):
+                    samples_in_frame += 1
+                else:
+                    samples_out_of_frame += 1
             focus_start = locate_focus_start_index(labels[im_idx], phrase_sequences)
             if focus_start is None:
                 continue
@@ -992,6 +1066,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dim=-1,
             ).squeeze(0)
             is_true_oof = roi_gaze_valid is not None and not bool(roi_gaze_valid[im_idx].item())
+            if is_true_oof:
+                samples_true_oof_encountered += 1
+            if is_true_oof and use_true_oof_frames and has_oof_bank and not has_pos:
+                samples_true_oof_supervisable += 1
             image_obj = self._compute_roi_candidate_image_objective(
                 candidate_tensor=candidate_tensor,
                 positive_mask=positive_mask,
@@ -1058,6 +1136,23 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 candidate_oof_anchors.append(positive_anchor)
                 candidate_oof_targets.append(text_index)
 
+        candidate_breakdown = {
+            "candidate_samples_total": batch_limit_candidate,
+            "candidate_samples_in_frame": samples_in_frame,
+            "candidate_samples_out_of_frame": samples_out_of_frame,
+            "candidate_samples_focus_found": samples_focus_found,
+            "candidate_samples_span_valid": samples_span_valid,
+            "candidate_samples_image_valid": samples_image_valid,
+            "candidate_samples_with_candidates": samples_with_candidates,
+            "candidate_samples_with_pos": samples_with_pos,
+            "candidate_samples_with_pos_and_neg": samples_with_pos_and_neg,
+            "candidate_samples_true_oof_encountered": samples_true_oof_encountered,
+            "candidate_samples_true_oof_supervisable": samples_true_oof_supervisable,
+            "candidate_samples_objective_applied": len(image_losses),
+            "candidate_oof_anchor_samples": len(candidate_oof_targets),
+            "true_oof_supervised_count": samples_true_oof_supervised,
+        }
+
         # Sub-step 3: aggregate image losses, optionally add OOF-anchor term, and write final stats.
         if image_losses or (oof_enabled and len(candidate_oof_anchors) > 0):
             stats_device = outputs.loss.device
@@ -1113,6 +1208,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
                 "preview_oof_scores": preview_oof_score_tensor,
             }
+            self._roi_contrastive_stats.update(
+                self._build_roi_candidate_count_stats(
+                    stats_device=stats_device,
+                    candidate_breakdown=candidate_breakdown,
+                    candidate_inputs_ready=True,
+                    candidate_path_applied=True,
+                )
+            )
             if oof_enabled:
                 self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
                 self._roi_contrastive_stats["oof_samples"] = oof_sample_count.detach().to(device=stats_device, dtype=torch.long)
@@ -1123,12 +1226,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     message=(
                         f"candidate_path: samples_total={batch_limit_candidate}, focus={samples_focus_found}, span={samples_span_valid}, "
                         f"images_valid={samples_image_valid}, has_cands={samples_with_candidates}, has_pos={samples_with_pos}, "
-                        f"has_pos_neg={samples_with_pos_and_neg}, true_oof_samples={samples_true_oof_supervised}, "
+                        f"has_pos_neg={samples_with_pos_and_neg}, true_oof_encountered={samples_true_oof_encountered}, "
+                        f"true_oof_supervisable={samples_true_oof_supervisable}, true_oof_samples={samples_true_oof_supervised}, "
                         f"image_losses={len(image_losses)}, pairs={candidate_count_total}, "
                         f"oof_samples={int(oof_sample_count.item())}, nce={float(nce_loss.item()):.6f}, oof={float(oof_loss.item()):.6f}"
                     ),
                 )
-            return True
+            return True, candidate_breakdown
 
         if debug_this_step:
             roi_debug_log(
@@ -1137,11 +1241,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 message=(
                     f"candidate_path_skipped: samples_total={batch_limit_candidate}, focus={samples_focus_found}, span={samples_span_valid}, "
                     f"images_valid={samples_image_valid}, has_cands={samples_with_candidates}, has_pos={samples_with_pos}, "
-                    f"has_pos_neg={samples_with_pos_and_neg}, true_oof_samples={samples_true_oof_supervised}, "
+                    f"has_pos_neg={samples_with_pos_and_neg}, true_oof_encountered={samples_true_oof_encountered}, "
+                    f"true_oof_supervisable={samples_true_oof_supervisable}, true_oof_samples={samples_true_oof_supervised}, "
                     f"image_losses={len(image_losses)}"
                 ),
             )
-        return False
+        return False, candidate_breakdown
 
     def _apply_roi_contrastive_loss(
         self,
@@ -1238,8 +1343,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 ),
             )
         # Step 2: candidate-box path (preferred when explicit positive/negative ROIs exist).
+        candidate_breakdown: Dict[str, int] = {}
         if candidate_inputs_ready:
-            candidate_applied = self._apply_roi_candidate_path(
+            candidate_applied, candidate_breakdown = self._apply_roi_candidate_path(
                 outputs=outputs,
                 labels=labels,
                 hidden_last=hidden_last,
@@ -1282,6 +1388,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             preview_buffer=preview_buffer,
             debug_this_step=debug_this_step,
             debug_steps=debug_steps,
+            candidate_inputs_ready=candidate_inputs_ready,
+            candidate_breakdown=candidate_breakdown,
         )
 
     def _apply_roi_fallback_path(
@@ -1303,8 +1411,40 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         preview_buffer: ROIContrastivePreviewBuffer,
         debug_this_step: bool,
         debug_steps: int,
+        candidate_inputs_ready: bool = False,
+        candidate_breakdown: Optional[Dict[str, int]] = None,
     ) -> CausalLMOutputWithPast:
         if roi_gaze_xy is None or roi_gaze_valid is None:
+            stats_device = outputs.loss.device
+            (
+                preview_image_index_tensor,
+                preview_pred_slot_tensor,
+                preview_candidate_slot_score_tensor,
+                preview_oof_score_tensor,
+            ) = preview_buffer.to_tensors(stats_device)
+            self._roi_contrastive_stats = {
+                "nce_loss": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "top1": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "top1_with_oof": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "pairs": torch.zeros((), device=stats_device, dtype=torch.long),
+                "lambda": torch.zeros((), device=stats_device, dtype=torch.float32),
+                "true_oof_supervised_count": torch.zeros((), device=stats_device, dtype=torch.long),
+                "preview_image_indices": preview_image_index_tensor,
+                "preview_pred_candidate_slots": preview_pred_slot_tensor,
+                "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
+                "preview_oof_scores": preview_oof_score_tensor,
+            }
+            self._roi_contrastive_stats.update(
+                self._build_roi_candidate_count_stats(
+                    stats_device=stats_device,
+                    candidate_breakdown=candidate_breakdown,
+                    candidate_inputs_ready=candidate_inputs_ready,
+                    candidate_path_applied=False,
+                )
+            )
+            if oof_enabled:
+                self._roi_contrastive_stats["oof_loss"] = torch.zeros((), device=stats_device, dtype=torch.float32)
+                self._roi_contrastive_stats["oof_samples"] = torch.zeros((), device=stats_device, dtype=torch.long)
             return outputs
 
         radius_ratio = float(getattr(self.config, "roi_contrastive_radius_ratio", 0.08))
@@ -1366,6 +1506,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
                 "preview_oof_scores": preview_oof_score_tensor,
             }
+            self._roi_contrastive_stats.update(
+                self._build_roi_candidate_count_stats(
+                    stats_device=stats_device,
+                    candidate_breakdown=candidate_breakdown,
+                    candidate_inputs_ready=candidate_inputs_ready,
+                    candidate_path_applied=False,
+                )
+            )
             if oof_enabled:
                 self._roi_contrastive_stats["oof_loss"] = torch.zeros((), device=stats_device, dtype=torch.float32)
                 self._roi_contrastive_stats["oof_samples"] = torch.zeros((), device=stats_device, dtype=torch.long)
@@ -1454,6 +1602,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             "preview_candidate_slot_scores": preview_candidate_slot_score_tensor,
             "preview_oof_scores": preview_oof_score_tensor,
         }
+        self._roi_contrastive_stats.update(
+            self._build_roi_candidate_count_stats(
+                stats_device=stats_device,
+                candidate_breakdown=candidate_breakdown,
+                candidate_inputs_ready=candidate_inputs_ready,
+                candidate_path_applied=False,
+            )
+        )
         if oof_enabled:
             self._roi_contrastive_stats["oof_loss"] = oof_loss.detach().to(device=stats_device, dtype=torch.float32)
             self._roi_contrastive_stats["oof_samples"] = oof_sample_count.detach().to(device=stats_device, dtype=torch.long)
