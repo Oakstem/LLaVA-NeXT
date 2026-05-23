@@ -2,13 +2,15 @@
 # powershell -ExecutionPolicy Bypass -File scripts/run_single_region_workflow.ps1
 Param(
     [string]$RepoRoot = "D:\Projects\LLaVA-NeXT",
-    [string]$ImagePath = "",
+    [string]$ImagePath = "D:\Projects\data\gazefollow\train\00000096\00096721.jpg",
     [string]$TrainDir = "D:/Projects/data/gazefollow/train",
     [string]$WindowsPython = "D:\pythonEnvs\p39\Scripts\python.exe",
     [string]$MaskScript = "scripts/create_region_mask_from_bbox.py",
     [string]$MaskOutputDir = "region_masks",
     [string]$MaskPrefix = "active_region_mask",
     [string]$WslScript = "scripts/run_single_region_wsl.sh",
+    [Nullable[int]]$CaptureLayerIndex = $null,
+    [Nullable[int]]$InjectionLayerIndex = $null,
     [string[]]$ExtractionArgs = @(),
     [switch]$NoGui,
     [switch]$OverwriteMask = $true
@@ -79,6 +81,14 @@ $driveLetter = $repoRootFull.Substring(0,1).ToLowerInvariant()
 $repoRootWsl = "/mnt/$driveLetter/" + $repoRootFull.Substring(3).Replace("\", "/")
 $wslScriptPath = "$repoRootWsl/$($WslScript.Replace('\', '/'))"
 $wslCommand = "cd $repoRootWsl && bash ""$wslScriptPath"""
+
+if ($null -ne $CaptureLayerIndex) {
+    $wslCommand += " --repr-capture-layer $CaptureLayerIndex"
+}
+
+if ($null -ne $InjectionLayerIndex) {
+    $wslCommand += " --repr-inject-layer $InjectionLayerIndex"
+}
 
 if ($ExtractionArgs.Length -gt 0) {
     $argString = ""
