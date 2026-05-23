@@ -1185,12 +1185,10 @@ def run_repr_layer_sweep_experiment(
 
     for source_idx, target_idx in combos:
         print(f"\n{'='*60}")
-        if enable_pairwise_sweep:
-            print(
-                f"Running repr-layer sweep experiment with capture layer {source_idx} -> inject layer {target_idx}"
-            )
-        else:
-            print(f"Running repr-layer sweep experiment with repr_layer_idx: {target_idx}")
+        print(
+            f"Running repr-layer sweep experiment with capture layer {source_idx} -> inject layer {target_idx}"
+        )
+
 
         experiment_config = copy.deepcopy(base_experiment_config)
         combo_label = f"src{source_idx}_tgt{target_idx}" #if enable_pairwise_sweep else f"layer_{target_idx}"
@@ -1509,25 +1507,8 @@ if __name__ == '__main__':
     )
 
     # --- Single Experiment Arguments ---
-    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000000\00000691.jpg", help="Path to the input image.")
-    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\small_masks\gaze__00000691_results.npy", help="Path to the attention mask.")
-    # parser.add_argument('--image_path', type=str, default=r"D:\Projects\Annotators\data\llava_results\our_llava_results\109166.png", help="Path to the input image.")
-    # parser.add_argument('--mask_path', type=str, default=r"D:\Projects\data\gazefollow\train_gaze_segmentations\manual_masks\gaze__109166_masks.npy", help="Path to the attention mask.")
-    # parser.add_argument('--prompt', type=str, default="The _ is looking at _ . Where is the _ person looking?", help="Input prompt.")
-    # parser.add_argument('--prompt', type=str, default="Describe the person _ which is looking at _", help="Input prompt.")
-#     parser.add_argument('--prompt', type=str, default="""Complete the sentence in the following format, examples:
-# a woman looking at a red mug → a woman in a cream sweater with straight dark hair, looking at a small red ceramic mug
-# a guy looking at a laptop → a guy in a gray hoodie and jeans, looking at an open silver laptop
-# a girl looking at a book → a girl with a ponytail and a denim jacket, looking at a thick hardcover book
-# a boy looking at another boy → a boy in a blue t-shirt with curly hair, looking at a shorter boy in a yellow hoodie
-# a man looking at a woman → a man in a black jacket and glasses, looking at a woman in a long beige coat
-# a woman looking at a child → a woman with wavy brown hair and a green coat, looking at a small child in a red jacket
-# a person looking at a dog → a person in a puffer vest and beanie, looking at a small brown dog
-# The sentence: a _ looking at _ → """, help="Input prompt.")
-#                         a guy → a guy in a gray hoodie and ripped jeans sitting on a worn wooden bench. 
-#                         a woman → a woman in a beige coat and ankle boots holding a phone. 
-#                         a man → a man in a black leather jacket and glasses. 
-#                         a woman → a woman in a dark green sweater and black jeans carrying a tan shoulder bag
+    parser.add_argument('--image_path', type=str, default=r"D:\Projects\data\gazefollow\train\00000096\00096721.jpg", help="Path to the input image.")
+    parser.add_argument('--mask_path', type=str, default=r"D:\Projects\LLaVA-NeXT\region_masks\active_region_mask.npy", help="Path to the attention mask.")
     parser.add_argument('--prompt', type=str, default=DEFAULT_PROMPT, help="Input prompt.")
     parser.add_argument('--use-gt-gaze-csv', action=argparse.BooleanOptionalAction, default=False,
                         dest='use_gt_gaze_csv', help="Use ground-truth gaze CSV to override gaze masks (default: enabled).")

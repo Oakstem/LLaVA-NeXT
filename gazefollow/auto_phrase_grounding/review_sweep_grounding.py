@@ -354,6 +354,104 @@ def write_markdown_table(rows: List[Dict[str, Any]], path: Path) -> None:
             handle.write("| " + " | ".join(values) + " |\n")
 
 
+def _parse_box(value: Any) -> Optional[List[float]]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        box = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        box = json.loads(text)
+    if not isinstance(box, list) or len(box) != 4:
+        return None
+    try:
+        return [float(coord) for coord in box]
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_box_iou(box_a: Optional[List[float]], box_b: Optional[List[float]]) -> Optional[float]:
+    if not box_a or not box_b:
+        return None
+
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+
+    intersection = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - intersection
+    if union <= 0:
+        return None
+    return intersection / union
+
+
+def add_mask_bbox_iou(summary_rows: List[Dict[str, Any]], mask_bounds: Optional[Sequence[Any]]) -> None:
+    parsed_mask_bounds = _parse_box(list(mask_bounds) if mask_bounds is not None else None)
+    for row in summary_rows:
+        row["mask_bbox_iou"] = compute_box_iou(_parse_box(row.get("best_bbox")), parsed_mask_bounds)
+
+
+def assign_top_k(summary_rows: List[Dict[str, Any]]) -> None:
+    rank_by_key: Dict[Tuple[str, Any], int] = {}
+    next_rank = 1
+    for row in summary_rows:
+        rank_key = (str(row.get("text") or ""), row.get("norm_l2"))
+        if rank_key not in rank_by_key:
+            rank_by_key[rank_key] = next_rank
+            next_rank += 1
+        row["top_k"] = rank_by_key[rank_key]
+
+
+def sort_summary_rows(summary_rows: List[Dict[str, Any]]) -> None:
+    summary_rows.sort(key=lambda row: math.inf if row.get("norm_l2") is None else float(row["norm_l2"]))
+    assign_top_k(summary_rows)
+
+
+def resolve_summary_run_dirs(path_value: str) -> List[Path]:
+    path = _normalize_path(path_value)
+    if path.is_file():
+        if path.name != "summary.json":
+            raise ValueError(f"Expected a summary.json file, got: {path}")
+        return [path.parent]
+    if not path.is_dir():
+        raise FileNotFoundError(f"Offline summary path not found: {path}")
+    direct_summary = path / "summary.json"
+    if direct_summary.exists():
+        return [path]
+    run_dirs = sorted(summary_path.parent for summary_path in path.rglob("summary.json"))
+    if not run_dirs:
+        raise FileNotFoundError(f"No summary.json files found under: {path}")
+    return run_dirs
+
+
+def update_existing_summary_run(run_dir: Path) -> None:
+    summary_path = run_dir / "summary.json"
+    csv_path = run_dir / "summary.csv"
+    md_path = run_dir / "summary.md"
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary_rows = payload.get("summary_rows")
+    if not isinstance(summary_rows, list):
+        raise ValueError(f"summary_rows is missing or invalid in: {summary_path}")
+    add_mask_bbox_iou(summary_rows, payload.get("mask_bounds"))
+    sort_summary_rows(summary_rows)
+    payload["summary_rows"] = summary_rows
+    payload["num_entries"] = len(summary_rows)
+    summary_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_csv(summary_rows, csv_path)
+    write_markdown_table(summary_rows, md_path)
+    print(f"Updated summary files: {run_dir}")
+
+
 def _safe_filename(value: str, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._")
     return cleaned[:120] if cleaned else fallback
@@ -372,11 +470,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--save-overlays", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--print-top-k", type=int, default=15)
+    parser.add_argument("--offline-summary-path", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.offline_summary_path:
+        run_dirs = resolve_summary_run_dirs(args.offline_summary_path)
+        for run_dir in run_dirs:
+            update_existing_summary_run(run_dir)
+        return
 
     results_path = _normalize_path(args.results_file)
     output_root = _normalize_path(args.output_dir)
@@ -480,6 +585,7 @@ def main() -> None:
                 "norm_l2": None if best_metrics is None else best_metrics.get("gaze_normalized_l2_error"),
                 "modified_l2": None if best_metrics is None else best_metrics.get("gaze_modified_l2_error"),
                 "gaze_iou": None if best_metrics is None else best_metrics.get("gaze_iou"),
+                "mask_bbox_iou": compute_box_iou(best_bbox, [float(v) for v in mask_bounds]),
                 "num_detections": cached["num_detections"],
                 "overlay_path": "" if cached["overlay_path"] is None else cached["overlay_path"],
             }
@@ -500,7 +606,7 @@ def main() -> None:
             }
         )
 
-    summary_rows.sort(key=lambda row: math.inf if row["norm_l2"] is None else float(row["norm_l2"]))
+    sort_summary_rows(summary_rows)
     summary_path = run_dir / "summary.json"
     csv_path = run_dir / "summary.csv"
     md_path = run_dir / "summary.md"

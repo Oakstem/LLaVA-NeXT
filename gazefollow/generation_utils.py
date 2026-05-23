@@ -2688,6 +2688,23 @@ def process_hidden_states_and_embeddings(
 
     capture_layer_idx = _normalize_layer_idx(capture_layer_idx_raw, "repr_capture_layer_idx")
     similarity_layer_idx = _normalize_layer_idx(similarity_layer_idx_raw, "repr_layer_idx")
+    current_repr_layer_selection = (
+        capture_layer_idx_raw,
+        capture_layer_idx,
+        target_layer_idx_raw,
+        similarity_layer_idx_raw,
+        similarity_layer_idx,
+        num_layers,
+    )
+    if state.get("_logged_repr_layer_selection") != current_repr_layer_selection:
+        print(
+            "[REPR_LAYER_VERIFY][hidden-state-select] "
+            f"capture={capture_layer_idx_raw} (normalized={capture_layer_idx}) "
+            f"inject={target_layer_idx_raw} "
+            f"similarity={similarity_layer_idx_raw} (normalized={similarity_layer_idx}) "
+            f"num_hidden_states={num_layers}"
+        )
+        state["_logged_repr_layer_selection"] = current_repr_layer_selection
 
     selected_hidden_state = hidden_states[similarity_layer_idx].squeeze(0)
     capture_hidden_state = hidden_states[capture_layer_idx].squeeze(0)

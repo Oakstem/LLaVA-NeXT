@@ -114,13 +114,13 @@ def _print_mask_info(mask_path: Path, metadata: Optional[Dict[str, Any]], mask: 
         )
 
 
-# DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
-# a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans.
-# a chic woman in a beige coat → a woman in a beige coat and ankle boots.
-# a techy man in a leather jacket → a man in a black leather jacket and glasses.
-# a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans.
+DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
+a tired guy in a hoodie → a guy in a gray hoodie and ripped jeans sitting on a worn wooden bench.  
+a chic woman in a beige coat → a woman in a beige coat and ankle boots holding a phone.  
+a techy man in a leather jacket → a man in a black leather jacket and glasses.  
+a relaxed woman in a green sweater → a woman in a dark green sweater and black jeans carrying a tan shoulder bag.
 
-# The sentence: a _ →"""
+The sentence: a _ → """
 # DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
 # a scruffy guy in a tee → a guy with messy hair wearing a faded graphic t-shirt and loose jeans.
 # a warm croissant → a golden, flaky croissant with crisp layers and a soft buttery center.
@@ -133,13 +133,13 @@ def _print_mask_info(mask_path: Path, metadata: Optional[Dict[str, Any]], mask: 
 # The sentence: a _ →"""
 
 ## Objects Only Prompt
-DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
-a warm croissant → a golden, flaky croissant with crisp layers and a soft buttery center.
-a bulky backpack → a large black backpack with thick straps and a padded mesh back.
-a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
-a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
+# DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
+# a warm croissant → a golden, flaky croissant with crisp layers and a soft buttery center.
+# a bulky backpack → a large black backpack with thick straps and a padded mesh back.
+# a glossy metal bottle → a tall stainless-steel bottle with a smooth reflective finish.
+# a worn-out notebook → a small notebook with frayed edges and a cracked leather cover.
 
-The sentence: a _ →"""
+# The sentence: a _ →"""
 # DEFAULT_PROMPT = """Complete the sentence in the following format, for example:
 # a scruffy guy in a tee → a guy with messy hair wearing a faded graphic t-shirt and loose jeans.
 # a stylish woman in red → a woman with sleek hair wearing a bright red blazer and matching heels.
@@ -202,7 +202,7 @@ def main() -> None:
     parser.add_argument("--adapter-path", default=None)
     parser.add_argument("--load-4bit", action="store_true", default=False)
     parser.add_argument("--load-8bit", action="store_true", default=False)
-    parser.add_argument("--repr-capture-layer", type=int, default=20)
+    parser.add_argument("--repr-capture-layer", type=int, default=0)
     parser.add_argument("--repr-inject-layer", type=int, default=0)
     parser.add_argument("--query-indices", type=json.loads, default=None)
     parser.add_argument("--guidance-top-k", type=int, default=5)

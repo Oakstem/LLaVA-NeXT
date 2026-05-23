@@ -204,6 +204,12 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--use-gaze-guidance", action="store_true", default=False)
     parser.add_argument("--save-debug-files", action="store_true", default=False)
+    parser.add_argument(
+        "--save-attention-mask-html",
+        action="store_true",
+        default=False,
+        help="Save attention_mask_sequence.html visualization (disabled by default).",
+    )
     parser.add_argument("--save-mask-overlays", action="store_true", default=False)
     parser.add_argument("--mask-overlay-alpha", type=float, default=0.4)
     parser.add_argument("--exclude-image-inputs", action="store_true", default=False)
@@ -307,7 +313,9 @@ def main() -> None:
         "include_image_inputs": not args.exclude_image_inputs,
         "filter_image_tokens_to_person_mask": args.filter_image_tokens,
         "same_mask_for_person": False,
-        "attention_mask_viz_dir": str(run_dir / "attention_masks"),
+        "attention_mask_viz_dir": str(run_dir / "attention_masks")
+        if args.save_attention_mask_html
+        else False,
     }
 
     prev_hidden_state = None
