@@ -111,3 +111,6 @@ text_embeddings/*
 *.txt
 *.err
 *.out
+results/*
+vacation_results/*
+vacation_resultsFeb/*
