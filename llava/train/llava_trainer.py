@@ -297,6 +297,13 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+    ROI_CONTRASTIVE_COUNT_METRIC_KEYS = (
+        "true_oof_supervised_count",
+        "gt_in_out_encountered",
+        "candidate_samples_true_oof_encountered",
+        "candidate_samples_true_oof_supervisable",
+        "candidate_samples_true_oof_supervised",
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -323,9 +330,13 @@ class LLaVATrainer(Trainer):
             "top1_with_oof": [],
             "pairs": [],
             "lambda": [],
-            "true_oof_supervised_count": [],
             "oof_loss": [],
             "oof_samples": [],
+        }
+        for key in self.ROI_CONTRASTIVE_COUNT_METRIC_KEYS:
+            self.roi_contrastive_stats[key] = []
+        self.roi_contrastive_cumulative_counts = {
+            key: 0.0 for key in self.ROI_CONTRASTIVE_COUNT_METRIC_KEYS
         }
         self.roi_contrastive_stats_window = max(1, int(getattr(self.args, "roi_contrastive_metrics_window", 100)))
         self.roi_contrastive_stats_cap = max(2048, self.roi_contrastive_stats_window * 4)
@@ -755,20 +766,22 @@ class LLaVATrainer(Trainer):
 
         oof_loss = stats.get("oof_loss")
         oof_samples = stats.get("oof_samples")
-        true_oof_supervised_count = stats.get("true_oof_supervised_count")
         preview_image_indices = stats.get("preview_image_indices")
         preview_pred_candidate_slots = stats.get("preview_pred_candidate_slots")
         preview_candidate_slot_scores = stats.get("preview_candidate_slot_scores")
         preview_oof_scores = stats.get("preview_oof_scores")
+        gathered_count_tensors: Dict[str, torch.Tensor] = {}
         gathered_oof_loss = None
         gathered_oof_samples = None
-        gathered_true_oof_supervised_count = None
         if oof_loss is not None and oof_samples is not None:
             gathered_oof_loss = self.accelerator.gather(oof_loss.detach().float().reshape(1))
             gathered_oof_samples = self.accelerator.gather(oof_samples.detach().long().reshape(1))
-        if true_oof_supervised_count is not None:
-            gathered_true_oof_supervised_count = self.accelerator.gather(
-                true_oof_supervised_count.detach().long().reshape(1)
+        for key in self.ROI_CONTRASTIVE_COUNT_METRIC_KEYS:
+            value = stats.get(key)
+            if value is None:
+                continue
+            gathered_count_tensors[key] = self.accelerator.gather(
+                value.detach().long().reshape(1)
             )
 
         if self.is_world_process_zero():
@@ -777,9 +790,11 @@ class LLaVATrainer(Trainer):
             self.roi_contrastive_stats["top1_with_oof"].append(float(gathered_top1_with_oof.mean().item()))
             self.roi_contrastive_stats["pairs"].append(float(gathered_pairs.float().mean().item()))
             self.roi_contrastive_stats["lambda"].append(float(gathered_lambda.mean().item()))
-            if gathered_true_oof_supervised_count is not None:
-                self.roi_contrastive_stats["true_oof_supervised_count"].append(
-                    float(gathered_true_oof_supervised_count.float().sum().item())
+            for key, gathered_value in gathered_count_tensors.items():
+                step_sum = float(gathered_value.float().sum().item())
+                self.roi_contrastive_stats.setdefault(key, []).append(step_sum)
+                self.roi_contrastive_cumulative_counts[key] = (
+                    self.roi_contrastive_cumulative_counts.get(key, 0.0) + step_sum
                 )
             self.roi_contrastive_local_preview_rows = []
             if (
@@ -813,18 +828,9 @@ class LLaVATrainer(Trainer):
             self._trim_roi_contrastive_stats()
 
     def _trim_roi_contrastive_stats(self):
-        for key in (
-            "nce_loss",
-            "top1",
-            "top1_with_oof",
-            "pairs",
-            "lambda",
-            "true_oof_supervised_count",
-            "oof_loss",
-            "oof_samples",
-        ):
-            if len(self.roi_contrastive_stats[key]) > self.roi_contrastive_stats_cap:
-                self.roi_contrastive_stats[key] = self.roi_contrastive_stats[key][-self.roi_contrastive_stats_cap:]
+        for key, values in self.roi_contrastive_stats.items():
+            if len(values) > self.roi_contrastive_stats_cap:
+                self.roi_contrastive_stats[key] = values[-self.roi_contrastive_stats_cap:]
 
     def _log_sequence_length_stats(self):
         if not self.is_world_process_zero():
@@ -918,20 +924,29 @@ class LLaVATrainer(Trainer):
             roi_top1_with_oof = sum(self.roi_contrastive_stats["top1_with_oof"][-recent_roi:]) / recent_roi
             roi_pairs = sum(self.roi_contrastive_stats["pairs"][-recent_roi:]) / recent_roi
             roi_lambda = sum(self.roi_contrastive_stats["lambda"][-recent_roi:]) / recent_roi
-            roi_true_oof_supervised = 0.0
-            if self.roi_contrastive_stats["true_oof_supervised_count"]:
-                roi_true_oof_supervised = (
-                    sum(self.roi_contrastive_stats["true_oof_supervised_count"][-recent_roi:]) / recent_roi
-                )
             metrics["roi_contrastive/nce_loss"] = roi_nce
             metrics["roi_contrastive/top1"] = roi_top1
             metrics["roi_contrastive/top1_with_oof"] = roi_top1_with_oof
             metrics["roi_contrastive/pairs"] = roi_pairs
             metrics["roi_contrastive/lambda"] = roi_lambda
-            metrics["roi_contrastive/true_oof_supervised_count"] = roi_true_oof_supervised
+            for key in self.ROI_CONTRASTIVE_COUNT_METRIC_KEYS:
+                if not self.roi_contrastive_stats.get(key):
+                    continue
+                count_recent = min(recent_roi, len(self.roi_contrastive_stats[key]))
+                if count_recent <= 0:
+                    continue
+                key_avg = sum(self.roi_contrastive_stats[key][-count_recent:]) / count_recent
+                metrics[f"roi_contrastive/{key}"] = key_avg
+                metrics[f"roi_contrastive/{key}_accum"] = self.roi_contrastive_cumulative_counts.get(key, 0.0)
+            roi_true_oof_supervised = metrics.get("roi_contrastive/true_oof_supervised_count", 0.0)
+            roi_oof_frames = metrics.get("roi_contrastive/gt_in_out_encountered", 0.0)
+            roi_oof_encountered = metrics.get("roi_contrastive/candidate_samples_true_oof_encountered", 0.0)
+            roi_oof_supervisable = metrics.get("roi_contrastive/candidate_samples_true_oof_supervisable", 0.0)
             rank0_print(
                 f"ROI contrastive - NCE: {roi_nce:.4f}, Top1: {roi_top1:.3f}, Top1+OOF: {roi_top1_with_oof:.3f}, "
-                f"Pairs: {roi_pairs:.2f}, Lambda: {roi_lambda:.4f}, True-OOF count: {roi_true_oof_supervised:.2f} "
+                f"Pairs: {roi_pairs:.2f}, Lambda: {roi_lambda:.4f}, True-OOF count: {roi_true_oof_supervised:.2f}, "
+                f"OOF frames: {roi_oof_frames:.2f}, OOF encountered: {roi_oof_encountered:.2f}, "
+                f"OOF supervisable: {roi_oof_supervisable:.2f} "
                 f"(window={recent_roi})"
             )
             if self.roi_contrastive_stats["oof_loss"]:
