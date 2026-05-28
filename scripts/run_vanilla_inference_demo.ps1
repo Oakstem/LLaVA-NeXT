@@ -3,7 +3,8 @@
 Param(
     [string]$RepoRoot = "D:\Projects\LLaVA-NeXT",
     [int]$Port = 7861,
-    [string]$AdapterPath = "training_outputs/llava-20260304_225738/checkpoint-10000",
+    #[string]$AdapterPath = "training_outputs/llava-20260304_225738/checkpoint-10000",
+    [string]$AdapterPath = "training_outputs/llava-20260420_030228/checkpoint-6000",
     [string]$ModelPath = "lmms-lab/llava-onevision-qwen2-7b-ov-chat",
     [switch]$Load4bit,
     [switch]$Load8bit

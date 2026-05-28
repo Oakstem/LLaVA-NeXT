@@ -16,7 +16,8 @@ from pathlib import Path
 from io import BytesIO
 
 from PIL import Image
-from flask import Flask, request, jsonify, send_from_directory, send_file
+from flask import Flask, request, jsonify, redirect, send_from_directory, send_file
+from werkzeug.exceptions import HTTPException
 
 # Add project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -90,6 +91,16 @@ def index():
     return send_from_directory(app.static_folder, "vanilla_inference.html")
 
 
+@app.route("/")
+def root():
+    return redirect("/vanilla/")
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
+
+
 @app.route("/vanilla/status")
 def model_status():
     with _model_lock:
@@ -111,6 +122,9 @@ def default_image():
 @app.errorhandler(Exception)
 def handle_exception(e):
     """Return JSON for any unhandled exception instead of Flask's HTML error page."""
+    if isinstance(e, HTTPException):
+        return jsonify({"error": f"{e.name}: {e.description}"}), e.code
+
     import traceback
     traceback.print_exc()
     return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
@@ -258,6 +272,9 @@ def run_inference():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import logging
+    from flask import cli as flask_cli
+
     parser = argparse.ArgumentParser(description="Vanilla Inference Demo Server")
     parser.add_argument("--port", type=int, default=7861)
     parser.add_argument("--host", default="0.0.0.0")
@@ -275,7 +292,11 @@ def main():
     )
     loader_thread.start()
 
+    flask_cli.show_server_banner = lambda *args, **kwargs: None
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
     print(f"Starting vanilla inference demo on {cli.host}:{cli.port}")
+    print(f"Open: http://localhost:{cli.port}/vanilla/")
     print(f"Adapter: {cli.adapter_path}")
     print("Model is loading in the background...")
     app.run(host=cli.host, port=cli.port, debug=False, threaded=True)
