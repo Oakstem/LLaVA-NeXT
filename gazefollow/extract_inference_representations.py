@@ -81,8 +81,11 @@ def format_seconds_for_path(seconds: float) -> str:
     return f"{int(seconds)}s" if float(seconds).is_integer() else f"{seconds:g}s"
 
 
-def default_output_dir_for_video(window_duration_seconds: float) -> Path:
-    return Path(DEFAULT_OUTPUT_DIR) / f"{DEFAULT_MOVIE_NAME}_{format_seconds_for_path(window_duration_seconds)}"
+def default_output_dir_for_video(
+    window_duration_seconds: float,
+    movie_name: str = DEFAULT_MOVIE_NAME,
+) -> Path:
+    return Path(DEFAULT_OUTPUT_DIR) / f"{movie_name}_{format_seconds_for_path(window_duration_seconds)}"
 
 
 def default_output_path_for_video_window(
@@ -585,6 +588,7 @@ def collect_movie_inference_representations(
     end_seconds: Optional[float] = DEFAULT_END_SECONDS,
     limit: Optional[int] = None,
     layer_indices: Optional[Sequence[int]] = DEFAULT_LAYER_INDICES,
+    movie_name: str = DEFAULT_MOVIE_NAME,
 ) -> List[Dict[str, Any]]:
     from decord import VideoReader, cpu
 
@@ -595,7 +599,11 @@ def collect_movie_inference_representations(
     if total_frames < 1:
         raise ValueError(f"Video contains no frames: {resolved_video_path}")
 
-    output_dir = Path(fix_wsl_paths(output_dir)) if output_dir is not None else default_output_dir_for_video(window_duration_seconds)
+    output_dir = (
+        Path(fix_wsl_paths(output_dir))
+        if output_dir is not None
+        else default_output_dir_for_video(window_duration_seconds, movie_name)
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stride_seconds = window_stride_seconds or window_duration_seconds
@@ -634,7 +642,7 @@ def collect_movie_inference_representations(
             image_sizes_for_model=image_sizes,
             media_metadata={
                 "media_type": "video",
-                "movie_name": DEFAULT_MOVIE_NAME,
+                "movie_name": movie_name,
                 "video_path": resolved_video_path,
                 "fps": fps,
                 "total_frames": total_frames,
@@ -757,6 +765,7 @@ def collect_and_save_movie_inference_representations(
     end_seconds: Optional[float] = DEFAULT_END_SECONDS,
     limit: Optional[int] = None,
     layer_indices: Optional[Sequence[int]] = DEFAULT_LAYER_INDICES,
+    movie_name: str = DEFAULT_MOVIE_NAME,
 ) -> List[Dict[str, Any]]:
     if not disable_optimizations:
         from generation_utils import enable_inference_optimizations
@@ -794,6 +803,7 @@ def collect_and_save_movie_inference_representations(
         end_seconds=end_seconds,
         limit=limit,
         layer_indices=layer_indices,
+        movie_name=movie_name,
     )
 
 
@@ -821,6 +831,7 @@ def collect_and_save_movie_prompts_inference_representations(
     end_seconds: Optional[float] = DEFAULT_END_SECONDS,
     limit: Optional[int] = None,
     layer_indices: Optional[Sequence[int]] = DEFAULT_LAYER_INDICES,
+    movie_name: str = DEFAULT_MOVIE_NAME,
 ) -> List[List[Dict[str, Any]]]:
     if not disable_optimizations:
         from generation_utils import enable_inference_optimizations
@@ -839,7 +850,11 @@ def collect_and_save_movie_prompts_inference_representations(
         attn_layer_ind=-1,
     )
 
-    base_output_dir = Path(fix_wsl_paths(output_dir)) if output_dir is not None else default_output_dir_for_video(window_duration_seconds)
+    base_output_dir = (
+        Path(fix_wsl_paths(output_dir))
+        if output_dir is not None
+        else default_output_dir_for_video(window_duration_seconds, movie_name)
+    )
     all_results: List[List[Dict[str, Any]]] = []
     for prompt_index, prompt in enumerate(prompts):
         prompt_output_dir = base_output_dir
@@ -852,7 +867,7 @@ def collect_and_save_movie_prompts_inference_representations(
             num_prompts=len(prompts),
             metadata={
                 "video_path": fix_wsl_paths(video_path),
-                "movie_name": DEFAULT_MOVIE_NAME,
+                "movie_name": movie_name,
                 "model_path": model_path,
                 "model_base": model_base,
                 "adapter_path": adapter_path,
@@ -896,6 +911,7 @@ def collect_and_save_movie_prompts_inference_representations(
                 end_seconds=end_seconds,
                 limit=limit,
                 layer_indices=layer_indices,
+                movie_name=movie_name,
             )
         )
     return all_results
@@ -923,6 +939,11 @@ def parse_args() -> argparse.Namespace:
             "Directory for video-window .pt files. Defaults to "
             f"{DEFAULT_OUTPUT_DIR}/{DEFAULT_MOVIE_NAME}_<window_duration>s."
         ),
+    )
+    parser.add_argument(
+        "--movie-name",
+        default=DEFAULT_MOVIE_NAME,
+        help="Movie name used in default video output directories and metadata.",
     )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--model-base", default=None)
@@ -993,6 +1014,7 @@ def main(args: argparse.Namespace) -> None:
             end_seconds=args.end_seconds,
             limit=args.limit,
             layer_indices=layer_indices,
+            movie_name=args.movie_name,
         )
         num_windows = sum(len(results) for results in prompt_results)
         if num_windows:
