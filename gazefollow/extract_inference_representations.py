@@ -21,13 +21,14 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_MODEL_PATH = "lmms-lab/llava-onevision-qwen2-7b-ov-chat"
 DEFAULT_ADAPTER_PATH = "training_outputs/llava-20260420_030228/checkpoint-6000"
+DEFAULT_ADAPTER_PATH = None
 DEFAULT_OUTPUT_DIR = "inference_representations"
-DEFAULT_VIDEO = "/mnt/d/Projects/LLaVA-NeXT/datasets/Vacation/Videos/1.mp4"
-DEFAULT_MOVIE_NAME = "Vacation"
+DEFAULT_VIDEO = "/galitylab/students/alonmardi/Sherlock.S01E01.A.Study.in.Pink.mkv"
+DEFAULT_MOVIE_NAME = "Sherlock_llava_20260420_030228_6k_ckpt"
 DEFAULT_PROMPTS = [
-    "Describe where each of the people in the image are looking, and whether they are facing each other. Conclude what's the interaction between them if any.",
+    "Describe where each person in the image is looking and whether they are facing each other. Conclude by describing the interaction between them, if any.",
 ]
-DEFAULT_WINDOW_DURATION_SECONDS = 5.0
+DEFAULT_WINDOW_DURATION_SECONDS = 3.0
 DEFAULT_WINDOW_STRIDE_SECONDS = 1.5
 DEFAULT_END_SECONDS = 3000
 DEFAULT_LAYER_INDICES = [20, 28]

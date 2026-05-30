@@ -9,6 +9,8 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=32G
 #SBATCH --nodes=1
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=alonmardi@mail.tau.ac.il
 
 PROJECT_ROOT="${PROJECT_ROOT:-/galitylab/students/alonmardi/projects/LLaVA-NeXT}"
 
@@ -23,7 +25,7 @@ fi
 
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-ADAPTER_PATH="${ADAPTER_PATH:-}"
+ADAPTER_PATH="${ADAPTER_PATH:-training_outputs/llava-20260420_030228/checkpoint-6000}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-qwen_1_5}"
@@ -48,7 +50,7 @@ WINDOW_DURATION_SECONDS="${WINDOW_DURATION_SECONDS:-5.0}"
 WINDOW_STRIDE_SECONDS="${WINDOW_STRIDE_SECONDS:-1.5}"
 OFFSET_SECONDS="${OFFSET_SECONDS:-0.0}"
 END_SECONDS="${END_SECONDS:-3000}"
-LIMIT="${LIMIT:-2}"
+LIMIT="${LIMIT:-}"
 
 mkdir -p "$PROJECT_ROOT/logs"
 
