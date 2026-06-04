@@ -21,10 +21,10 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_MODEL_PATH = "lmms-lab/llava-onevision-qwen2-7b-ov-chat"
 DEFAULT_ADAPTER_PATH = "training_outputs/llava-20260420_030228/checkpoint-6000"
-DEFAULT_ADAPTER_PATH = None
+# DEFAULT_ADAPTER_PATH = None
 DEFAULT_OUTPUT_DIR = "inference_representations"
 DEFAULT_VIDEO = "/galitylab/students/alonmardi/Sherlock.S01E01.A.Study.in.Pink.mkv"
-DEFAULT_MOVIE_NAME = "Sherlock_llava_20260420_030228_6k_ckpt"
+DEFAULT_MOVIE_NAME = "Vacation_217"
 DEFAULT_PROMPTS = [
     "Describe where each person in the image is looking and whether they are facing each other. Conclude by describing the interaction between them, if any.",
 ]
@@ -132,14 +132,25 @@ def load_prompts_file(prompts_path: Union[str, Path]) -> List[str]:
     ]
 
 
+def load_prompt_file(prompt_path: Union[str, Path]) -> str:
+    path = Path(fix_wsl_paths(prompt_path))
+    prompt = path.read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise ValueError(f"--prompt-file is empty: {path}")
+    return prompt
+
+
 def resolve_prompt_list(
     prompt: Optional[str],
+    prompt_file: Optional[Union[str, Path]],
     prompts: Optional[Sequence[str]],
     prompts_file: Optional[Union[str, Path]],
 ) -> List[str]:
     resolved_prompts: List[str] = []
     if prompt:
         resolved_prompts.append(prompt)
+    if prompt_file:
+        resolved_prompts.append(load_prompt_file(prompt_file))
     if prompts:
         resolved_prompts.extend(prompts)
     if prompts_file:
@@ -149,7 +160,10 @@ def resolve_prompt_list(
     if not resolved_prompts:
         resolved_prompts = [prompt.strip() for prompt in DEFAULT_PROMPTS if prompt.strip()]
     if not resolved_prompts:
-        raise ValueError("Provide at least one prompt using --prompt, --prompts, --prompts-file, or DEFAULT_PROMPTS.")
+        raise ValueError(
+            "Provide at least one prompt using --prompt, --prompt-file, "
+            "--prompts, --prompts-file, or DEFAULT_PROMPTS."
+        )
     return resolved_prompts
 
 
@@ -922,6 +936,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-path", default=None, help="Image path.")
     parser.add_argument("--video-path", default=None, help=f"Video path. Defaults to DEFAULT_VIDEO when no image path is provided: {DEFAULT_VIDEO}")
     parser.add_argument("--prompt", default=None, help="Prompt to run with the media. Defaults to DEFAULT_PROMPTS when no prompt source is provided.")
+    parser.add_argument("--prompt-file", default=None, help="Text file whose full contents are used as one prompt.")
     parser.add_argument("--prompts", nargs="+", default=None, help="Additional prompts to run. Video mode writes one directory per prompt when multiple prompts are provided.")
     parser.add_argument("--prompts-file", default=None, help="Text file with one prompt per line, or a JSON list of prompt strings.")
     parser.add_argument(
@@ -986,7 +1001,7 @@ def main(args: argparse.Namespace) -> None:
     if bool(args.image_path) == bool(video_path):
         raise ValueError("Provide exactly one of --image-path or --video-path.")
 
-    prompts = resolve_prompt_list(args.prompt, args.prompts, args.prompts_file)
+    prompts = resolve_prompt_list(args.prompt, args.prompt_file, args.prompts, args.prompts_file)
     layer_indices = parse_layer_indices(args.layer_indices)
 
     if video_path:
