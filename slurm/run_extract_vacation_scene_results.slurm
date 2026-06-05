@@ -163,10 +163,10 @@ if [ -n "$LIMIT_SCENES" ]; then
 fi
 
 echo "Executing command:"
-echo "$PYTHON_BIN gazefollow/extract_vacation_scene_results.py ${ARGS[*]}"
+echo "$PYTHON_BIN vacation/extract_vacation_scene_results.py ${ARGS[*]}"
 echo "=========================================="
 
-"$PYTHON_BIN" gazefollow/extract_vacation_scene_results.py "${ARGS[@]}"
+"$PYTHON_BIN" vacation/extract_vacation_scene_results.py "${ARGS[@]}"
 
 exit_code=$?
 echo "=========================================="
