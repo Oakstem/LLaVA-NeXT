@@ -1797,11 +1797,16 @@ def main():
             if args.wandb_run_id:
                 init_kwargs["id"] = args.wandb_run_id
                 init_kwargs["resume"] = "allow"
-            wandb_run = wandb_module.init(**init_kwargs)
+            try:
+                wandb_run = wandb_module.init(**init_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                wandb_disabled_reason = f"wandb init failed: {exc}"
+                print(f"\n⚠️  wandb logging disabled for this eval job: {exc}")
+                return None
         return wandb_run
 
     def flush_generation_rows(force: bool = False) -> None:
-        nonlocal table_logging_streamed
+        nonlocal table_logging_streamed, wandb_disabled_reason
         buffer = evaluation_state.generation_rows_buffer
         if not buffer:
             return
@@ -1818,18 +1823,25 @@ def main():
                     handle.write(json.dumps(row, ensure_ascii=False))
                     handle.write("\n")
 
+        if table_log_interval <= 0:
+            return
+
         wandb_run_instance = ensure_wandb_run()
         if wandb_run_instance is not None:
-            table = wandb_module.Table(columns=GENERATION_TABLE_COLUMNS)
-            for row in rows_to_log:
-                table.add_data(*(row.get(column) for column in GENERATION_TABLE_COLUMNS))
-            wandb_run_instance.log({wandb_history_key(wandb_metric_prefix, "generation_results"): table}, commit=False)
-            table_logging_streamed = True
+            try:
+                table = wandb_module.Table(columns=GENERATION_TABLE_COLUMNS)
+                for row in rows_to_log:
+                    table.add_data(*(row.get(column) for column in GENERATION_TABLE_COLUMNS))
+                wandb_run_instance.log({wandb_history_key(wandb_metric_prefix, "generation_results"): table}, commit=False)
+                table_logging_streamed = True
+            except Exception as exc:  # noqa: BLE001
+                wandb_disabled_reason = f"wandb generation table log failed: {exc}"
+                print(f"\n⚠️  wandb generation table logging disabled: {exc}")
 
     configured_oof_labels = list(getattr(getattr(model, "config", None), "roi_contrastive_oof_texts", []) or [])
 
     def flush_roi_overlays(force: bool = False) -> None:
-        nonlocal roi_overlay_logging_streamed
+        nonlocal roi_overlay_logging_streamed, wandb_disabled_reason
         if roi_overlay_log_interval <= 0:
             if force:
                 evaluation_state.roi_overlay_payload_buffer.clear()
@@ -1861,8 +1873,12 @@ def main():
                 overlays.append(overlay)
         buffer.clear()
         if overlays:
-            wandb_run_instance.log({wandb_history_key(wandb_metric_prefix, "roi_contrastive/preview_overlays"): overlays}, commit=False)
-            roi_overlay_logging_streamed = True
+            try:
+                wandb_run_instance.log({wandb_history_key(wandb_metric_prefix, "roi_contrastive/preview_overlays"): overlays}, commit=False)
+                roi_overlay_logging_streamed = True
+            except Exception as exc:  # noqa: BLE001
+                wandb_disabled_reason = f"wandb ROI overlay log failed: {exc}"
+                print(f"\n⚠️  wandb ROI overlay logging disabled: {exc}")
 
     def handle_sample_output(sample_output: EvaluationSampleOutput) -> None:
         evaluation_state.roi_seen_samples += 1

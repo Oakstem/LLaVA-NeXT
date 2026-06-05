@@ -53,6 +53,8 @@ SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-true}"
 GENERATE_MODEL_RESULTS="${GENERATE_MODEL_RESULTS:-true}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 PROMPT_OVERRIDE="${PROMPT_OVERRIDE:-}"
+TABLE_LOG_INTERVAL="${TABLE_LOG_INTERVAL:-0}"
+ROI_OVERLAY_LOG_INTERVAL="${ROI_OVERLAY_LOG_INTERVAL:-0}"
 WANDB="${WANDB:-true}"
 WANDB_PROJECT="${WANDB_PROJECT:-}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
@@ -116,6 +118,8 @@ fi
 
 ARGS+=("--output-dir" "$OUTPUT_DIR")
 ARGS+=("--batch-size" "$BATCH_SIZE")
+ARGS+=("--table-log-interval" "$TABLE_LOG_INTERVAL")
+ARGS+=("--roi-overlay-log-interval" "$ROI_OVERLAY_LOG_INTERVAL")
 
 if [ "$SAVE_PREDICTIONS" = "true" ]; then
     ARGS+=("--save-predictions")
@@ -184,6 +188,8 @@ else
     echo "GPU inventory: nvidia-smi not available"
 fi
 echo "Output dir: $OUTPUT_DIR"
+echo "Table log interval: $TABLE_LOG_INTERVAL"
+echo "ROI overlay log interval: $ROI_OVERLAY_LOG_INTERVAL"
 echo "wandb run id: ${WANDB_RUN_ID:-N/A}"
 echo "wandb training step: ${WANDB_TRAINING_STEP:-N/A}"
 echo "=========================================="
