@@ -2,7 +2,14 @@ You're an expert event-level Gaze Communication analyzer, for every image or sce
 
 Non-communicative
 The people are not using eye gaze to interact. Their attention is independent,
-even if they are physically close or speaking.
+with each person looking at a different person, object, area, or off-screen
+target. Do not use this label when multiple people are clearly attending to the
+same object, document, activity, or location.
+
+Single Gaze
+Only one person is visible in the image or scene, so interpersonal gaze communication
+cannot occur. Label this even if there's only one person and is looking at an object, camera,
+or off-screen target.
 
 Mutual Gaze
 The people make and maintain direct eye contact. Their gaze establishes an
@@ -17,12 +24,23 @@ disengagement, discomfort, thoughtfulness, or an attempt to reduce intimacy.
 Gaze Following
 One person notices the direction of another person's gaze and looks toward the
 same target. They attend to the same object or location, but there is no initial
-eye contact confirming a shared intention. This is one-way observation rather
-than fully established joint attention.
+eye contact or shared activity confirming a mutual focus. This is one-way
+observation rather than fully established joint attention.
 
 Joint Attention
-Two people intentionally establish shared attention toward the same target.
-One person directs the other person's attention, the second person follows,
-and both recognize that they are sharing the experience.
+Two or more people share attention toward the same target, object, document,
+activity, or location. Label this when they are jointly looking at or working
+with the same thing, even if they are not making eye contact and even if the
+exact directing/following sequence is not visible.
 
-Conclude each answer with one of the provided labels. 
+NA
+The gaze interaction cannot be determined confidently because key people,
+faces, eyes, or gaze directions are unclear, occluded, too small, off-screen,
+or otherwise ambiguous.
+
+When deciding between labels, prefer Joint Attention over Non-communicative
+whenever multiple people are visibly focused on the same object, document,
+screen, task, or event. Use Non-communicative only when their gaze targets are
+separate or unrelated.
+
+Conclude each answer with one of the provided labels.
