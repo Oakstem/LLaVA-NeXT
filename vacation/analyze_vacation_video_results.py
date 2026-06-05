@@ -17,10 +17,10 @@ GT_TO_LABEL = {
     "GazeFollow": "Gaze Following",
     "JointAtt": "Joint Attention",
     "MutualGaze": "Mutual Gaze",
-    "SingleGaze": "Non-communicative",
+    "SingleGaze": "SingleGaze",
 }
 LABELS = [
-    "Non-communicative",
+    "SingleGaze",
     "Mutual Gaze",
     "Gaze Aversion",
     "Gaze Following",
@@ -59,7 +59,12 @@ def clean_label(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.casefold())
 
 
-LABEL_BY_CLEAN = {clean_label(label): label for label in LABELS}
+LABEL_BY_CLEAN = {
+    **{clean_label(label): label for label in LABELS},
+    clean_label("Non-communicative"): "SingleGaze",
+    clean_label("Non communicative"): "SingleGaze",
+    clean_label("Single Gaze"): "SingleGaze",
+}
 
 
 def normalize_pred_label(text: str) -> str:

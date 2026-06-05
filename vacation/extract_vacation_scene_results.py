@@ -40,12 +40,19 @@ DEFAULT_VIDEOS_DIR = "datasets/Vacation/Videos"
 DEFAULT_OUTPUT_CSV = "vacation_results/videos/test_annotations_with_scene_results.csv"
 DEFAULT_PROMPT_FILE = "docs/vacation_event_level_gaze_communication_labels_concise.txt"
 GAZE_LABELS = [
-    "Non-communicative",
+    "SingleGaze",
     "Mutual Gaze",
     "Gaze Aversion",
     "Gaze Following",
     "Joint Attention",
 ]
+GAZE_LABEL_ALIASES = {
+    "SingleGaze": ["SingleGaze", "Single Gaze", "Non-communicative", "Non communicative"],
+    "Mutual Gaze": ["Mutual Gaze"],
+    "Gaze Aversion": ["Gaze Aversion"],
+    "Gaze Following": ["Gaze Following"],
+    "Joint Attention": ["Joint Attention"],
+}
 
 
 def normalize_label_text(text: str) -> str:
@@ -54,10 +61,13 @@ def normalize_label_text(text: str) -> str:
 
 def extract_gaze_label(text: str) -> Optional[str]:
     normalized_text = normalize_label_text(text or "")
+    matches: List[Tuple[int, str]] = []
     for label in GAZE_LABELS:
-        if normalize_label_text(label) in normalized_text:
-            return label
-    return None
+        for alias in GAZE_LABEL_ALIASES[label]:
+            match_index = normalized_text.rfind(normalize_label_text(alias))
+            if match_index >= 0:
+                matches.append((match_index, label))
+    return max(matches)[1] if matches else None
 
 
 def relative_display_path(path: Path) -> str:
