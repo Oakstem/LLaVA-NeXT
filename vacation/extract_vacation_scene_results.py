@@ -26,6 +26,13 @@ from gazefollow.extract_inference_representations import (  # noqa: E402
     prepare_multimodal_video_tensor,
     resolve_device,
 )
+from vacation.analyze_vacation_video_results import (  # noqa: E402
+    find_baseline,
+    format_summary,
+    load_scene_records,
+    run_name,
+    write_details_csv,
+)
 
 
 DEFAULT_ANNOTATIONS_CSV = "datasets/Vacation/test_annotations_with_scene_id.csv"
@@ -246,6 +253,48 @@ def run_vacation_scene_inference(args: argparse.Namespace) -> pd.DataFrame:
     return df
 
 
+def run_post_eval(args: argparse.Namespace) -> None:
+    output_csv = Path(fix_wsl_paths(args.output_csv)).resolve()
+    result_files = [output_csv]
+    baseline_csv = args.eval_baseline_csv
+    if baseline_csv:
+        baseline_path = Path(fix_wsl_paths(baseline_csv)).resolve()
+    else:
+        candidates = sorted(
+            path.resolve()
+            for path in output_csv.parent.glob("test_annotations_with_scene_results*.csv")
+            if path.is_file()
+        )
+        baseline_path = find_baseline(candidates, None).resolve()
+
+    if baseline_path != output_csv:
+        result_files.insert(0, baseline_path)
+
+    source_files = {run_name(path): path for path in result_files}
+    all_records = {name: load_scene_records(path) for name, path in source_files.items()}
+    baseline_name = run_name(baseline_path)
+    eval_output_dir = output_csv.parent / "analysis"
+    summary_txt = (
+        Path(fix_wsl_paths(args.eval_summary_txt))
+        if args.eval_summary_txt
+        else eval_output_dir / f"{output_csv.stem}_analysis_summary.txt"
+    )
+    details_csv = (
+        Path(fix_wsl_paths(args.eval_details_csv))
+        if args.eval_details_csv
+        else eval_output_dir / f"{output_csv.stem}_analysis_details.csv"
+    )
+
+    summary = format_summary(all_records, baseline_name, source_files)
+    print()
+    print(summary, end="")
+    summary_txt.parent.mkdir(parents=True, exist_ok=True)
+    summary_txt.write_text(summary, encoding="utf-8")
+    write_details_csv(details_csv, all_records, baseline_name, args.eval_include_generated_text)
+    print(f"Wrote evaluation summary to {relative_display_path(summary_txt)}")
+    print(f"Wrote evaluation details CSV to {relative_display_path(details_csv)}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run one LLaVA video inference per Vacation scene and write an annotation-aligned CSV."
@@ -272,6 +321,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-scenes", type=int, default=None, help="Optional cap for debugging.")
     parser.add_argument("--save-every", type=int, default=25, help="Write the CSV every N processed scenes; 0 disables intermediate writes.")
     parser.add_argument("--disable-optimizations", action="store_true")
+    parser.add_argument("--skip-eval", action="store_true", help="Skip post-run GT/baseline evaluation.")
+    parser.add_argument("--eval-baseline-csv", default=None, help="Baseline results CSV. Defaults to the baseline CSV in output dir.")
+    parser.add_argument("--eval-summary-txt", default=None, help="Post-eval summary TXT path.")
+    parser.add_argument("--eval-details-csv", default=None, help="Post-eval detailed CSV path.")
+    parser.add_argument("--eval-include-generated-text", action="store_true", help="Include full generations in the post-eval CSV.")
     return parser.parse_args()
 
 
@@ -281,6 +335,8 @@ def main() -> None:
     completed = df["scene_generated_text"].notna().sum()
     print(f"Wrote {completed}/{len(df)} annotation rows with scene results.")
     print(f"Saved results CSV to {relative_display_path(Path(fix_wsl_paths(args.output_csv)))}")
+    if not args.skip_eval:
+        run_post_eval(args)
 
 
 if __name__ == "__main__":
