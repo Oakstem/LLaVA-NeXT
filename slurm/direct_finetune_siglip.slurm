@@ -154,9 +154,23 @@ ROI_CONTRASTIVE_PREVIEW_TOPK="10"
 EVALUATION_STRATEGY="no"
 EVAL_STEPS="1000000"    # never evaluate during training
 SAVE_STRATEGY="steps"
-SAVE_STEPS="2000"
+SAVE_STEPS="1000"
 SAVE_TOTAL_LIMIT="10"
 LOGGING_STEPS="100"
+
+# External Qwen3-VL evaluation submitted by the training job after checkpoint saves.
+# This requires SAVE_STEPS to be aligned with SLURM_EVAL_STEPS.
+SLURM_EVAL_ENABLE="True"
+SLURM_EVAL_STEPS="1000"
+SLURM_EVAL_SCRIPT="slurm/run_qwen3vl_model_full_evaluation.slurm"
+SLURM_EVAL_MODEL_PATH="${CKPT_PATH}"
+SLURM_EVAL_MODEL_BASE=""
+SLURM_EVAL_DATASET_JSON="report_finals/datasets/validation/20251217/20251205_174741_sgl_conversation_data_20251214_204738/val_filtered.json"
+SLURM_EVAL_IMAGES_DIR="${IMAGE_FOLDER}"
+SLURM_EVAL_OUTPUT_ROOT="${OUTPUT_BASE_DIR}/${MID_RUN_NAME}/periodic_qwen3vl_eval"
+SLURM_EVAL_RUN_TAG="${MID_RUN_NAME}"
+SLURM_EVAL_EXTRA_EXPORT="LIMIT=1000,BATCH_SIZE=1,WANDB_METRIC_PREFIX=qwen3vl_eval"
+SLURM_EVAL_SBATCH_ARGS=""
 
 # Precision and performance
 BF16="True"
@@ -228,6 +242,19 @@ echo "Learning Rate: ${LEARNING_RATE}"
 echo "Weight Decay: ${WEIGHT_DECAY}"
 echo "Warmup Ratio: ${WARMUP_RATIO}"
 echo "LR Scheduler: ${LR_SCHEDULER_TYPE}"
+echo ""
+echo "=== EXTERNAL SLURM EVALUATION ==="
+echo "SLURM Eval Enable: ${SLURM_EVAL_ENABLE}"
+echo "SLURM Eval Steps: ${SLURM_EVAL_STEPS}"
+echo "SLURM Eval Script: ${SLURM_EVAL_SCRIPT}"
+echo "SLURM Eval Model Path: ${SLURM_EVAL_MODEL_PATH}"
+echo "SLURM Eval Model Base: ${SLURM_EVAL_MODEL_BASE:-<none>}"
+echo "SLURM Eval Dataset JSON: ${SLURM_EVAL_DATASET_JSON}"
+echo "SLURM Eval Images Dir: ${SLURM_EVAL_IMAGES_DIR}"
+echo "SLURM Eval Output Root: ${SLURM_EVAL_OUTPUT_ROOT}"
+echo "SLURM Eval Run Tag: ${SLURM_EVAL_RUN_TAG}"
+echo "SLURM Eval Extra Export: ${SLURM_EVAL_EXTRA_EXPORT:-<none>}"
+echo "SLURM Eval sbatch args: ${SLURM_EVAL_SBATCH_ARGS:-<none>}"
 echo "ROI Contrastive Enable: ${ROI_CONTRASTIVE_ENABLE}"
 echo "ROI Contrastive Weight: ${ROI_CONTRASTIVE_WEIGHT}"
 echo "ROI Contrastive Temperature: ${ROI_CONTRASTIVE_TEMPERATURE}"
@@ -311,6 +338,17 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --save_strategy ${SAVE_STRATEGY} \
     --save_steps ${SAVE_STEPS} \
     --save_total_limit ${SAVE_TOTAL_LIMIT} \
+    --slurm_eval_enable ${SLURM_EVAL_ENABLE} \
+    --slurm_eval_steps ${SLURM_EVAL_STEPS} \
+    --slurm_eval_script "${SLURM_EVAL_SCRIPT}" \
+    --slurm_eval_model_path "${SLURM_EVAL_MODEL_PATH}" \
+    --slurm_eval_model_base "${SLURM_EVAL_MODEL_BASE}" \
+    --slurm_eval_dataset_json "${SLURM_EVAL_DATASET_JSON}" \
+    --slurm_eval_images_dir "${SLURM_EVAL_IMAGES_DIR}" \
+    --slurm_eval_output_root "${SLURM_EVAL_OUTPUT_ROOT}" \
+    --slurm_eval_run_tag "${SLURM_EVAL_RUN_TAG}" \
+    --slurm_eval_extra_export "${SLURM_EVAL_EXTRA_EXPORT}" \
+    --slurm_eval_sbatch_args "${SLURM_EVAL_SBATCH_ARGS}" \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay ${WEIGHT_DECAY} \
     --warmup_ratio ${WARMUP_RATIO} \

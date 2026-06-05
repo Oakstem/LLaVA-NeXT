@@ -92,6 +92,18 @@ from log_wandb_evaluations import (
 DEFAULT_TRAIN_CSV = "gazefollow/data/combined_description_results.csv"
 DEFAULT_TEST_CSV = "gazefollow/data/test2_combined_description_results.csv"
 
+
+def env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def wandb_history_key(prefix: str, name: str) -> str:
+    cleaned_prefix = prefix.strip().strip("/")
+    return f"{cleaned_prefix}/{name}" if cleaned_prefix else name
+
 @dataclass
 class EvaluationSampleOutput:
     index: int
@@ -281,13 +293,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--wandb-project",
-        default=DEFAULT_PROJECT,
+        default=os.getenv("WANDB_PROJECT", DEFAULT_PROJECT),
         help="Weights & Biases project name to use when logging evaluations.",
     )
     parser.add_argument(
         "--wandb-entity",
-        default=None,
+        default=os.getenv("WANDB_ENTITY") or None,
         help="Optional Weights & Biases entity/organization name.",
+    )
+    parser.add_argument(
+        "--wandb-run-id",
+        default=os.getenv("WANDB_RUN_ID") or None,
+        help="Optional existing Weights & Biases run id to resume/update.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        default=os.getenv("WANDB_RUN_NAME") or None,
+        help="Optional Weights & Biases run name. Defaults to an adapter-derived name.",
+    )
+    parser.add_argument(
+        "--wandb-training-step",
+        type=int,
+        default=env_int("WANDB_TRAINING_STEP"),
+        help="Training checkpoint step associated with this evaluation.",
+    )
+    parser.add_argument(
+        "--wandb-metric-prefix",
+        default=os.getenv("WANDB_METRIC_PREFIX", "qwen3vl_eval"),
+        help="Prefix for metrics/tables logged to Weights & Biases.",
     )
     parser.add_argument(
         "--focus-loss-after-looking",
@@ -1599,7 +1632,8 @@ def main():
     print(f"Using conversation template: {conv_template}")
 
     generation_kwargs = build_generation_kwargs(args, tokenizer)
-    wandb_run_name = build_run_name_from_adapter(args.adapter_path or args.model_path)
+    wandb_run_name = args.wandb_run_name or build_run_name_from_adapter(args.adapter_path or args.model_path)
+    wandb_metric_prefix = str(args.wandb_metric_prefix or "").strip().strip("/")
     base_wandb_config: Dict[str, Any] = {
         "model_path": args.model_path,
         "model_base": args.model_base,
@@ -1613,6 +1647,10 @@ def main():
         "roi_overlay_log_interval": roi_overlay_log_interval,
         "table_log_file": str(progress_log_path),
     }
+    if args.wandb_training_step is not None:
+        base_wandb_config["training_step"] = args.wandb_training_step
+    if args.wandb_run_id:
+        base_wandb_config["wandb_run_id"] = args.wandb_run_id
     if args.in_out_labels_csv:
         base_wandb_config["in_out_labels_csv"] = args.in_out_labels_csv
     if args.roi_negatives_csv:
@@ -1756,6 +1794,9 @@ def main():
             }
             if args.wandb_entity:
                 init_kwargs["entity"] = args.wandb_entity
+            if args.wandb_run_id:
+                init_kwargs["id"] = args.wandb_run_id
+                init_kwargs["resume"] = "allow"
             wandb_run = wandb_module.init(**init_kwargs)
         return wandb_run
 
@@ -1782,7 +1823,7 @@ def main():
             table = wandb_module.Table(columns=GENERATION_TABLE_COLUMNS)
             for row in rows_to_log:
                 table.add_data(*(row.get(column) for column in GENERATION_TABLE_COLUMNS))
-            wandb_run_instance.log({"generation_results": table}, commit=False)
+            wandb_run_instance.log({wandb_history_key(wandb_metric_prefix, "generation_results"): table}, commit=False)
             table_logging_streamed = True
 
     configured_oof_labels = list(getattr(getattr(model, "config", None), "roi_contrastive_oof_texts", []) or [])
@@ -1820,7 +1861,7 @@ def main():
                 overlays.append(overlay)
         buffer.clear()
         if overlays:
-            wandb_run_instance.log({"roi_contrastive/preview_overlays": overlays}, commit=False)
+            wandb_run_instance.log({wandb_history_key(wandb_metric_prefix, "roi_contrastive/preview_overlays"): overlays}, commit=False)
             roi_overlay_logging_streamed = True
 
     def handle_sample_output(sample_output: EvaluationSampleOutput) -> None:
@@ -1905,6 +1946,9 @@ def main():
             "average_time_per_sample": evaluation_time / processed_samples if processed_samples else 0.0,
         }
     )
+    if args.wandb_training_step is not None:
+        final_metrics["training_step"] = args.wandb_training_step
+        final_metrics["checkpoint_step"] = args.wandb_training_step
 
     loss_values = [output.loss for output in sample_outputs if output.loss is not None]
     if loss_values:
@@ -2035,6 +2079,8 @@ def main():
         "limit": args.limit,
         "evaluation_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if args.wandb_training_step is not None:
+        config["training_step"] = args.wandb_training_step
     if args.in_out_labels_csv:
         config["in_out_labels_csv"] = args.in_out_labels_csv
     config["table_log_interval"] = table_log_interval
@@ -2087,7 +2133,12 @@ def main():
 
                 try:
                     wandb_run_instance.config.update(config_updates, allow_val_change=True)
-                    wandb_run_instance.log(scalar_metrics or {"_placeholder": final_metrics.get("total_samples", 0)})
+                    logged_scalar_metrics = {
+                        wandb_history_key(wandb_metric_prefix, key): value for key, value in scalar_metrics.items()
+                    }
+                    if not logged_scalar_metrics:
+                        logged_scalar_metrics[wandb_history_key(wandb_metric_prefix, "_placeholder")] = final_metrics.get("total_samples", 0)
+                    wandb_run_instance.log(logged_scalar_metrics)
                     if not table_logging_streamed and model_generation_records:
                         table_rows: List[Dict[str, Any]] = []
                         for record in model_generation_records:
@@ -2096,7 +2147,7 @@ def main():
                             table = wandb_module.Table(columns=GENERATION_TABLE_COLUMNS)
                             for row in table_rows:
                                 table.add_data(*(row.get(column) for column in GENERATION_TABLE_COLUMNS))
-                            wandb_run_instance.log({"generation_results": table}, commit=False)
+                            wandb_run_instance.log({wandb_history_key(wandb_metric_prefix, "generation_results"): table}, commit=False)
                             table_logging_streamed = True
                     if not roi_overlay_logging_streamed:
                         flush_roi_overlays(force=True)

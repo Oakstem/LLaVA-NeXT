@@ -54,6 +54,12 @@ GENERATE_MODEL_RESULTS="${GENERATE_MODEL_RESULTS:-true}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 PROMPT_OVERRIDE="${PROMPT_OVERRIDE:-}"
 WANDB="${WANDB:-true}"
+WANDB_PROJECT="${WANDB_PROJECT:-}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
+WANDB_TRAINING_STEP="${WANDB_TRAINING_STEP:-}"
+WANDB_METRIC_PREFIX="${WANDB_METRIC_PREFIX:-qwen3vl_eval}"
 
 # Qwen3-VL grounding options
 GAZE_MODEL_ID="${GAZE_MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}"
@@ -141,6 +147,24 @@ fi
 if [ "$WANDB" = "true" ]; then
     ARGS+=("--log-to-wandb")
 fi
+if [ -n "$WANDB_PROJECT" ]; then
+    ARGS+=("--wandb-project" "$WANDB_PROJECT")
+fi
+if [ -n "$WANDB_ENTITY" ]; then
+    ARGS+=("--wandb-entity" "$WANDB_ENTITY")
+fi
+if [ -n "$WANDB_RUN_ID" ]; then
+    ARGS+=("--wandb-run-id" "$WANDB_RUN_ID")
+fi
+if [ -n "$WANDB_RUN_NAME" ]; then
+    ARGS+=("--wandb-run-name" "$WANDB_RUN_NAME")
+fi
+if [ -n "$WANDB_TRAINING_STEP" ]; then
+    ARGS+=("--wandb-training-step" "$WANDB_TRAINING_STEP")
+fi
+if [ -n "$WANDB_METRIC_PREFIX" ]; then
+    ARGS+=("--wandb-metric-prefix" "$WANDB_METRIC_PREFIX")
+fi
 
 echo "=========================================="
 echo "Executing Qwen3-VL evaluation:"
@@ -160,6 +184,8 @@ else
     echo "GPU inventory: nvidia-smi not available"
 fi
 echo "Output dir: $OUTPUT_DIR"
+echo "wandb run id: ${WANDB_RUN_ID:-N/A}"
+echo "wandb training step: ${WANDB_TRAINING_STEP:-N/A}"
 echo "=========================================="
 
 start_time=$(date +%s)

@@ -236,6 +236,19 @@ class TrainingArguments(transformers.TrainingArguments):
     eval_steps: Optional[int] = field(default=5000, metadata={"help": "Number of training steps between evaluations. If None, uses evaluation_strategy."})
     evaluation_strategy: str = field(default="steps", metadata={"help": "Evaluation strategy: 'no', 'steps', 'epoch'."})
     eval_accumulation_steps: Optional[int] = field(default=None, metadata={"help": "Number of predictions steps to accumulate before moving tensors to CPU."})
+
+    # External SLURM evaluation parameters
+    slurm_eval_enable: bool = field(default=False, metadata={"help": "Submit an external SLURM evaluation job after saved checkpoints."})
+    slurm_eval_steps: int = field(default=1000, metadata={"help": "Submit external evaluation for checkpoints whose step is divisible by this value."})
+    slurm_eval_script: str = field(default="slurm/run_qwen3vl_model_full_evaluation.slurm", metadata={"help": "SLURM script used for external checkpoint evaluation."})
+    slurm_eval_model_path: Optional[str] = field(default=None, metadata={"help": "MODEL_PATH exported to the external evaluation job. Defaults to model_name_or_path."})
+    slurm_eval_model_base: Optional[str] = field(default=None, metadata={"help": "MODEL_BASE exported to the external evaluation job."})
+    slurm_eval_dataset_json: Optional[str] = field(default=None, metadata={"help": "DATASET_JSON exported to the external evaluation job."})
+    slurm_eval_images_dir: Optional[str] = field(default=None, metadata={"help": "IMAGES_DIR exported to the external evaluation job."})
+    slurm_eval_output_root: str = field(default="./evaluation_results", metadata={"help": "OUTPUT_ROOT exported to the external evaluation job."})
+    slurm_eval_run_tag: Optional[str] = field(default=None, metadata={"help": "Base RUN_TAG exported to external evaluation jobs; checkpoint step is appended."})
+    slurm_eval_extra_export: str = field(default="", metadata={"help": "Extra comma-separated VAR=VALUE entries appended to sbatch --export."})
+    slurm_eval_sbatch_args: str = field(default="", metadata={"help": "Extra sbatch arguments for external evaluation submission, parsed with shell-like quoting."})
     
     # Custom evaluation parameters (from evaluate_model.py)
     use_custom_eval: bool = field(default=False, metadata={"help": "Use custom evaluation from evaluate_model.py"})
@@ -2062,6 +2075,13 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     parsed_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     model_args, data_args, training_args = parsed_args[:3]
+    if training_args.slurm_eval_enable:
+        if not training_args.slurm_eval_model_path:
+            training_args.slurm_eval_model_path = model_args.model_name_or_path
+        if not training_args.slurm_eval_dataset_json and data_args.eval_data_path:
+            training_args.slurm_eval_dataset_json = data_args.eval_data_path
+        if not training_args.slurm_eval_images_dir and data_args.image_folder:
+            training_args.slurm_eval_images_dir = data_args.image_folder
     
     rank0_print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     rank0_print("Starting training setup...")
