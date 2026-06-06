@@ -319,8 +319,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--wandb-metric-prefix",
-        default=os.getenv("WANDB_METRIC_PREFIX", "qwen3vl_eval"),
-        help="Prefix for metrics/tables logged to Weights & Biases.",
+        default=os.getenv("WANDB_METRIC_PREFIX", ""),
+        help="Optional prefix for metrics/tables logged to Weights & Biases.",
     )
     parser.add_argument(
         "--focus-loss-after-looking",
