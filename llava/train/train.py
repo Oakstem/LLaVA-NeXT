@@ -249,6 +249,8 @@ class TrainingArguments(transformers.TrainingArguments):
     slurm_eval_run_tag: Optional[str] = field(default=None, metadata={"help": "Base RUN_TAG exported to external evaluation jobs; checkpoint step is appended."})
     slurm_eval_extra_export: str = field(default="", metadata={"help": "Extra comma-separated VAR=VALUE entries appended to sbatch --export."})
     slurm_eval_sbatch_args: str = field(default="", metadata={"help": "Extra sbatch arguments for external evaluation submission, parsed with shell-like quoting."})
+    slurm_eval_final_wait_seconds: int = field(default=3600, metadata={"help": "Seconds to wait at training end for the last external SLURM eval metrics file."})
+    slurm_eval_poll_interval_seconds: int = field(default=60, metadata={"help": "Polling interval while waiting for external SLURM eval metrics."})
     
     # Custom evaluation parameters (from evaluate_model.py)
     use_custom_eval: bool = field(default=False, metadata={"help": "Use custom evaluation from evaluate_model.py"})
@@ -2671,6 +2673,12 @@ def train(attn_implementation=None):
     else:
         rank0_print("No checkpoints found, starting fresh training")
         trainer.train()
+
+    if training_args.slurm_eval_enable:
+        trainer.slurm_eval_manager.wait_for_results(
+            timeout_seconds=training_args.slurm_eval_final_wait_seconds,
+            poll_interval_seconds=training_args.slurm_eval_poll_interval_seconds,
+        )
 
     if (
         wandb_notes_env

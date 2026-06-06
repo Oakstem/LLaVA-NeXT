@@ -6,8 +6,6 @@ import torch.nn as nn
 import datetime
 import json
 import pathlib
-import shlex
-import subprocess
 import time
 from collections import OrderedDict
 
@@ -61,6 +59,7 @@ from llava.constants import DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT
 from llava.conversation import SeparatorStyle
 from llava.mm_utils import process_images, tokenizer_image_token, KeywordsStoppingCriteria
 from llava.utils import rank0_print
+from llava.train.slurm_eval_utils import SlurmEvalManager
 from gazefollow.roi_overlay_render import draw_labeled_norm_box, draw_overlay_text_lines
 
 
@@ -348,108 +347,7 @@ class LLaVATrainer(Trainer):
         self._sanity_table = None
         self._sanity_consecutive_failures = 0
         self._sanity_failure_limit = getattr(self.args, "sanity_check_failures_to_stop", 5)
-
-    def _submit_slurm_eval_for_checkpoint(self, checkpoint_dir: str) -> None:
-        if not getattr(self.args, "slurm_eval_enable", False):
-            return
-        if not self.is_world_process_zero():
-            return
-
-        step = int(self.state.global_step)
-        eval_steps = int(getattr(self.args, "slurm_eval_steps", 0) or 0)
-        if eval_steps <= 0 or step <= 0 or step % eval_steps != 0:
-            return
-
-        checkpoint_path = pathlib.Path(checkpoint_dir).resolve()
-        if not checkpoint_path.is_dir():
-            rank0_print(f"Skipping SLURM eval submission: checkpoint not found at {checkpoint_path}")
-            return
-
-        marker_dir = pathlib.Path(self.args.output_dir).resolve() / "slurm_eval_jobs"
-        marker_dir.mkdir(parents=True, exist_ok=True)
-        marker_path = marker_dir / f"checkpoint-{step}.json"
-        if marker_path.exists():
-            rank0_print(f"Skipping SLURM eval submission for checkpoint-{step}: marker already exists.")
-            return
-
-        repo_root = pathlib.Path(__file__).resolve().parents[2]
-        script_path = pathlib.Path(getattr(self.args, "slurm_eval_script", ""))
-        if not script_path.is_absolute():
-            script_path = repo_root / script_path
-        if not script_path.is_file():
-            rank0_print(f"Skipping SLURM eval submission: script not found at {script_path}")
-            return
-
-        output_root = str(getattr(self.args, "slurm_eval_output_root", "") or "./evaluation_results")
-        run_name = pathlib.Path(self.args.output_dir).resolve().name
-        run_tag_base = getattr(self.args, "slurm_eval_run_tag", None) or run_name
-        export_values = {
-            "ADAPTER_PATH": str(checkpoint_path),
-            "OUTPUT_ROOT": output_root,
-            "RUN_TAG": f"{run_tag_base}_ckpt{step}",
-            "WANDB_TRAINING_STEP": str(step),
-            "TRAINING_SLURM_JOB_ID": os.getenv("SLURM_JOB_ID", ""),
-        }
-
-        optional_exports = {
-            "MODEL_PATH": getattr(self.args, "slurm_eval_model_path", None),
-            "MODEL_BASE": getattr(self.args, "slurm_eval_model_base", None),
-            "DATASET_JSON": getattr(self.args, "slurm_eval_dataset_json", None),
-            "IMAGES_DIR": getattr(self.args, "slurm_eval_images_dir", None),
-            "WANDB_RUN_ID": self._wandb_env_or_run_attr("WANDB_RUN_ID", "id"),
-            "WANDB_RUN_NAME": self._wandb_env_or_run_attr("WANDB_RUN_NAME", "name"),
-            "WANDB_PROJECT": self._wandb_env_or_run_attr("WANDB_PROJECT", "project"),
-            "WANDB_ENTITY": self._wandb_env_or_run_attr("WANDB_ENTITY", "entity"),
-        }
-        for key, value in optional_exports.items():
-            if value:
-                export_values[key] = str(value)
-
-        export_arg = "ALL," + ",".join(f"{key}={value}" for key, value in export_values.items())
-        extra_export = str(getattr(self.args, "slurm_eval_extra_export", "") or "").strip()
-        if extra_export:
-            export_arg = f"{export_arg},{extra_export}"
-
-        sbatch_args = shlex.split(str(getattr(self.args, "slurm_eval_sbatch_args", "") or ""))
-        command = ["sbatch", "--parsable", f"--export={export_arg}", *sbatch_args, str(script_path)]
-
-        rank0_print(f"Submitting SLURM eval for checkpoint-{step}: {' '.join(shlex.quote(part) for part in command)}")
-        try:
-            result = subprocess.run(command, cwd=str(repo_root), capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            rank0_print("SLURM eval submission failed: sbatch was not found.")
-            return
-
-        if result.returncode != 0:
-            rank0_print(
-                "SLURM eval submission failed "
-                f"(exit={result.returncode}): {(result.stderr or result.stdout).strip()}"
-            )
-            return
-
-        job_id = result.stdout.strip()
-        marker_payload = {
-            "checkpoint_step": step,
-            "checkpoint_dir": str(checkpoint_path),
-            "slurm_job_id": job_id,
-            "submitted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "script": str(script_path),
-        }
-        with marker_path.open("w", encoding="utf-8") as handle:
-            json.dump(marker_payload, handle, indent=2)
-        rank0_print(f"Submitted SLURM eval job {job_id} for checkpoint-{step}.")
-
-    @staticmethod
-    def _wandb_env_or_run_attr(env_name: str, attr_name: str) -> str:
-        env_value = os.getenv(env_name, "")
-        if env_value:
-            return env_value
-        if wandb.run is None:
-            return ""
-        value = getattr(wandb.run, attr_name, "")
-        if callable(value):
-            value = value()
-        return str(value) if value else ""
+        self.slurm_eval_manager = SlurmEvalManager(self.args, self.is_world_process_zero)
 
     def evaluate(
         self,
@@ -1641,7 +1539,8 @@ class LLaVATrainer(Trainer):
                         torch.save(projector_weights, os.path.join(output_dir, "mm_projector.bin"))
 
         should_stop = self._run_checkpoint_sanity_check()
-        self._submit_slurm_eval_for_checkpoint(checkpoint_output_dir)
+        self.slurm_eval_manager.submit_for_checkpoint(checkpoint_output_dir, int(self.state.global_step))
+        self.slurm_eval_manager.log_completed_results()
         if should_stop:
             rank0_print("Stopping training: sanity check output too short.")
             self.control.should_training_stop = True

@@ -169,8 +169,10 @@ SLURM_EVAL_DATASET_JSON="report_finals/datasets/validation/20251217/20251205_174
 SLURM_EVAL_IMAGES_DIR="${IMAGE_FOLDER}"
 SLURM_EVAL_OUTPUT_ROOT="${OUTPUT_BASE_DIR}/${MID_RUN_NAME}/periodic_qwen3vl_eval"
 SLURM_EVAL_RUN_TAG="${MID_RUN_NAME}"
-SLURM_EVAL_EXTRA_EXPORT="LIMIT=1000,BATCH_SIZE=1,TABLE_LOG_INTERVAL=0,ROI_OVERLAY_LOG_INTERVAL=0,WANDB_METRIC_PREFIX=qwen3vl_eval"
+SLURM_EVAL_EXTRA_EXPORT="LIMIT=1000,BATCH_SIZE=1,TABLE_LOG_INTERVAL=0,ROI_OVERLAY_LOG_INTERVAL=0,WANDB=false"
 SLURM_EVAL_SBATCH_ARGS=""
+SLURM_EVAL_FINAL_WAIT_SECONDS="3600"
+SLURM_EVAL_POLL_INTERVAL_SECONDS="60"
 
 # Precision and performance
 BF16="True"
@@ -255,6 +257,8 @@ echo "SLURM Eval Output Root: ${SLURM_EVAL_OUTPUT_ROOT}"
 echo "SLURM Eval Run Tag: ${SLURM_EVAL_RUN_TAG}"
 echo "SLURM Eval Extra Export: ${SLURM_EVAL_EXTRA_EXPORT:-<none>}"
 echo "SLURM Eval sbatch args: ${SLURM_EVAL_SBATCH_ARGS:-<none>}"
+echo "SLURM Eval Final Wait Seconds: ${SLURM_EVAL_FINAL_WAIT_SECONDS}"
+echo "SLURM Eval Poll Interval Seconds: ${SLURM_EVAL_POLL_INTERVAL_SECONDS}"
 echo "ROI Contrastive Enable: ${ROI_CONTRASTIVE_ENABLE}"
 echo "ROI Contrastive Weight: ${ROI_CONTRASTIVE_WEIGHT}"
 echo "ROI Contrastive Temperature: ${ROI_CONTRASTIVE_TEMPERATURE}"
@@ -349,6 +353,8 @@ ACCELERATE_DISABLE_NUMA=1 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node
     --slurm_eval_run_tag "${SLURM_EVAL_RUN_TAG}" \
     --slurm_eval_extra_export "${SLURM_EVAL_EXTRA_EXPORT}" \
     --slurm_eval_sbatch_args "${SLURM_EVAL_SBATCH_ARGS}" \
+    --slurm_eval_final_wait_seconds ${SLURM_EVAL_FINAL_WAIT_SECONDS} \
+    --slurm_eval_poll_interval_seconds ${SLURM_EVAL_POLL_INTERVAL_SECONDS} \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay ${WEIGHT_DECAY} \
     --warmup_ratio ${WARMUP_RATIO} \
