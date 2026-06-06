@@ -17,6 +17,7 @@ class SlurmEvalManager:
         self.args = args
         self.is_world_process_zero = is_world_process_zero
         self.repo_root = pathlib.Path(__file__).resolve().parents[2]
+        self._wandb_metrics_defined = False
 
     def marker_dir(self) -> pathlib.Path:
         return pathlib.Path(self.args.output_dir).resolve() / "slurm_eval_jobs"
@@ -32,6 +33,7 @@ class SlurmEvalManager:
             return 0
         if not (self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None):
             return 0
+        self._define_wandb_metrics()
 
         output_root = self.output_root()
         if not output_root.is_dir():
@@ -57,7 +59,7 @@ class SlurmEvalManager:
             }
             if checkpoint_step is not None:
                 wandb_payload["eval/checkpoint_step"] = checkpoint_step
-                wandb_payload["step"] = checkpoint_step
+                wandb_payload["eval/step"] = checkpoint_step
             wandb_payload["eval/metrics_path"] = resolved_path
             wandb_payload["eval/output_dir"] = str(metrics_path.parent.resolve())
 
@@ -74,6 +76,16 @@ class SlurmEvalManager:
         if logged_count:
             self._save_logged_metrics(logged)
         return logged_count
+
+    def _define_wandb_metrics(self) -> None:
+        if self._wandb_metrics_defined or wandb.run is None:
+            return
+        try:
+            wandb.define_metric("eval/checkpoint_step")
+            wandb.define_metric("eval/*", step_metric="eval/checkpoint_step")
+            self._wandb_metrics_defined = True
+        except Exception as exc:  # noqa: BLE001
+            rank0_print(f"Warning: failed to define SLURM eval wandb metrics: {exc}")
 
     def submit_for_checkpoint(self, checkpoint_dir: str, step: int) -> None:
         if not self._enabled_on_rank0():
