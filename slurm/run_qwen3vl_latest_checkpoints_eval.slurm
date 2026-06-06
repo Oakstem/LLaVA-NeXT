@@ -29,9 +29,10 @@ LOAD_4BIT="${LOAD_4BIT:-false}"
 LOAD_8BIT="${LOAD_8BIT:-false}"
 
 # Dataset configuration
-DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val.json}"
+#DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val.json}"
+DATASET_JSON="${DATASET_JSON:-training_datasets/20251205_174741_sgl_conversation_data_20251214_204738/val_filtered.json}"
 IMAGES_DIR="${IMAGES_DIR:-/galitylab/students/alonmardi/gazefollow}"
-LIMIT="${LIMIT:-100}"
+LIMIT="${LIMIT:-}"
 
 # Generation controls
 CONV_TEMPLATE="${CONV_TEMPLATE:-}"
@@ -68,8 +69,8 @@ ROI_OVERLAY_LOG_INTERVAL="${ROI_OVERLAY_LOG_INTERVAL:-5}"
 
 # Run selection
 RUN_SELECTION_LIMIT="${RUN_SELECTION_LIMIT:-10}"
-CHECKPOINT_STEP="${CHECKPOINT_STEP:-9000}"
-RUN_NAME_PATTERN="${RUN_NAME_PATTERN:-llava-*}"
+CHECKPOINT_STEP="${CHECKPOINT_STEP:-6000}"
+RUN_NAME_PATTERN="${RUN_NAME_PATTERN:-llava-202604*}"
 
 mapfile -t RUN_DIRS < <(
     find training_outputs -maxdepth 1 -mindepth 1 -type d -name "$RUN_NAME_PATTERN" -printf '%T@ %f\n' |

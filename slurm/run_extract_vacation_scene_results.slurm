@@ -25,14 +25,14 @@ fi
 
 MODEL_PATH="${MODEL_PATH:-lmms-lab/llava-onevision-qwen2-7b-ov-chat}"
 MODEL_BASE="${MODEL_BASE:-}"
-ADAPTER_PATH="${ADAPTER_PATH:-training_outputs/llava-20260420_030228/checkpoint-6000}"
+ADAPTER_PATH="${ADAPTER_PATH:-}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 QUANTIZATION="${QUANTIZATION:-}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-qwen_1_5}"
 
 ANNOTATIONS_CSV="${ANNOTATIONS_CSV:-datasets/Vacation/test_annotations_with_scene_id.csv}"
 VIDEOS_DIR="${VIDEOS_DIR:-datasets/Vacation/Videos}"
-OUTPUT_CSV="${OUTPUT_CSV:-vacation_results/videos/test_annotations_with_scene_results.csv}"
+OUTPUT_CSV="${OUTPUT_CSV:-vacation_results/videos/test_annotations_with_scene_results_baseline.csv}"
 PROMPT="${PROMPT:-}"
 if [ -z "${PROMPT_FILE+x}" ]; then
     if [ -n "$PROMPT" ]; then
