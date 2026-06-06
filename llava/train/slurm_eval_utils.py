@@ -13,6 +13,14 @@ from llava.utils import rank0_print
 
 
 class SlurmEvalManager:
+    WANDB_EVAL_METRIC_KEYS = (
+        "gaze_l2_normalized_mean",
+        "inout_accuracy",
+        "inout_recall",
+        "inout_precision",
+        "inout_total_samples",
+    )
+
     def __init__(self, args: Any, is_world_process_zero: Callable[[], bool]):
         self.args = args
         self.is_world_process_zero = is_world_process_zero
@@ -52,16 +60,13 @@ class SlurmEvalManager:
                 continue
 
             checkpoint_step = self._checkpoint_step_from_metrics(metrics, metrics_path)
-            wandb_payload = {
-                f"eval/{key}": value
-                for key, value in metrics.items()
-                if self._is_scalar(value)
-            }
+            wandb_payload = {}
             if checkpoint_step is not None:
                 wandb_payload["eval/checkpoint_step"] = checkpoint_step
-                wandb_payload["eval/step"] = checkpoint_step
-            wandb_payload["eval/metrics_path"] = resolved_path
-            wandb_payload["eval/output_dir"] = str(metrics_path.parent.resolve())
+            for key in self.WANDB_EVAL_METRIC_KEYS:
+                value = metrics.get(key)
+                if self._is_scalar(value):
+                    wandb_payload[f"eval/{key}"] = value
 
             try:
                 wandb.log(wandb_payload)
