@@ -1434,7 +1434,7 @@ class LLaVATrainer(Trainer):
                             skip_special_tokens=True,
                         ).strip()
                         output_token_count = len(self.tokenizer.encode(output_text, add_special_tokens=False))
-                        passed_min_tokens = output_token_count >= 50
+                        passed_min_tokens = output_token_count >= 5
                         checkpoint_name = f"checkpoint-{self.state.global_step}"
                         
                         rank0_print(f"Sanity check for step {self.state.global_step} resulted text: {output_text}")

@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:H100:1
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #SBATCH --partition=gpu
@@ -66,6 +66,7 @@ PROMPT_VERSION="qwen_1_5"
 # Set to a previous run's output directory name to resume training, e.g., "llava-20241007_123456"
 # The trainer will automatically resume from the latest checkpoint in that directory
 # Leave empty to start a fresh training run with a new output directory
+# DO NOT use the full dir path like training_outputs/llava-20241007_123456, just use the run name like llava-20241007_123456
 RESUME_FROM_CHECKPOINT=""
 
 # Set run name based on whether we're resuming or starting fresh
@@ -102,7 +103,8 @@ DEEPSPEED_CONFIG="scripts/zero1.json"
 # MM_TUNABLE_PARTS="mm_projector,model.layers[-8:].self_attn.{q_proj,v_proj,o_proj},model.layers[-8:].mlp,"
 # MM_TUNABLE_PARTS="mm_projector,model.layers[-20:].self_attn.{q_proj,v_proj},model.layers[-20:].mlp"
 # MM_TUNABLE_PARTS="mm_projector,lm_head"
-MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[-16:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-16:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj}"
+# MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[-16:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-16:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj}"
+MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj}"
 # MM_TUNABLE_PARTS="mm_projector,model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].mlp"
 #"mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},vision_tower.vision_model.encoder.layers[-4:].mlp"
 MM_VISION_TOWER_LR="1e-5"
@@ -125,7 +127,7 @@ LORA_DROPOUT="0.3"
 MM_PROJECTOR_FULL_FINETUNE="True"
 
 # Training hyperparameters
-MAX_STEPS="20000"
+MAX_STEPS="30000"
 PER_DEVICE_TRAIN_BATCH_SIZE="1"  # Reduced from 2 to 1
 PER_DEVICE_EVAL_BATCH_SIZE="2"  # Reduced from 4 to 2
 GRADIENT_ACCUMULATION_STEPS="8"  # Increased to maintain effective batch size
