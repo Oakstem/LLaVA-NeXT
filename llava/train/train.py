@@ -2445,9 +2445,8 @@ def train(attn_implementation=None):
         tunable_parts = _split_tunable_specs(model_args.mm_tunable_parts)
         sanitized_parts = ','.join(tunable_parts)
         model.config.mm_tunable_parts = training_args.mm_tunable_parts = sanitized_parts or model_args.mm_tunable_parts
-        # custom_module_targets = resolve_custom_tunable_modules(model, tunable_parts)
-        # model.config.resolved_custom_tunable_modules = custom_module_targets
-        custom_module_targets = True
+        custom_module_targets = resolve_custom_tunable_modules(model, tunable_parts)
+        model.config.resolved_custom_tunable_modules = custom_module_targets
         # Set the entire model to not require gradients by default
         model.requires_grad_(False)
         vision_tower.requires_grad_(False)
@@ -2536,11 +2535,11 @@ def train(attn_implementation=None):
                     if "lora_" in name:
                         param.requires_grad_(True)
                         custom_params.add(name)
-            # else:
-            #     for name, param in model.named_parameters():
-            #         if any(name.startswith(target) for target in custom_module_targets):
-            #             param.requires_grad_(True)
-            #             custom_params.add(name)
+            else:
+                for name, param in model.named_parameters():
+                    if any(name.startswith(f"{target}.") for target in custom_module_targets):
+                        param.requires_grad_(True)
+                        custom_params.add(name)
             rank0_print(f"Custom module parameters set to require gradients ({len(custom_params)} parameters):")
             for param_name in sorted(custom_params):
                 rank0_print(f"  {param_name}")
