@@ -104,7 +104,15 @@ DEEPSPEED_CONFIG="scripts/zero1.json"
 # MM_TUNABLE_PARTS="mm_projector,model.layers[-20:].self_attn.{q_proj,v_proj},model.layers[-20:].mlp"
 # MM_TUNABLE_PARTS="mm_projector,lm_head"
 # MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[-16:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-16:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj}"
-DEFAULT_MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj}"
+# DEFAULT_MM_TUNABLE_PARTS q,v only:
+# DEFAULT_MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj}"
+# DEFAULT_MM_TUNABLE_PARTS q,k,v,o:
+# DEFAULT_MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[:].self_attn.{q_proj,k_proj,v_proj,o_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[:].mlp,model.layers[-4:].self_attn.{q_proj,k_proj,v_proj,o_proj}"
+# DEFAULT_MM_TUNABLE_PARTS q,v,o:
+# DEFAULT_MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[:].self_attn.{q_proj,v_proj,o_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj,o_proj}"
+# DEFAULT_MM_TUNABLE_PARTS all attention + MLP:
+# DEFAULT_MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[:].self_attn.{q_proj,k_proj,v_proj,o_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[:].mlp,model.layers[-4:].self_attn.{q_proj,k_proj,v_proj,o_proj},model.layers[-4:].mlp"
+# DEFAULT_MM_TUNABLE_PARTS="mm_projector,lm_head,model.vision_tower.vision_tower.vision_model.encoder.layers[:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[:].mlp,model.layers[-4:].self_attn.{q_proj,v_proj}"
 MM_TUNABLE_PARTS="${MM_TUNABLE_PARTS:-$DEFAULT_MM_TUNABLE_PARTS}"
 # MM_TUNABLE_PARTS="mm_projector,model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].self_attn.{q_proj,v_proj},model.vision_tower.vision_tower.vision_model.encoder.layers[-20:].mlp"
 #"mm_projector,model.layers[-4:].self_attn.{q_proj,v_proj},model.layers[-4:].mlp,vision_tower.vision_model.encoder.layers[-4:].self_attn.{q_proj,v_proj},vision_tower.vision_model.encoder.layers[-4:].mlp"
