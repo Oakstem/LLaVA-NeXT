@@ -3,8 +3,8 @@
 Param(
     [string]$RepoRoot = "D:\Projects\LLaVA-NeXT",
     [int]$Port = 7861,
-    #[string]$AdapterPath = "training_outputs/llava-20260304_225738/checkpoint-10000",
-    [string]$AdapterPath = "training_outputs/llava-20260420_030228/checkpoint-6000",
+    [string]$DefaultAdapterPath = "training_outputs/llava-20260304_225738/checkpoint-10000",
+    [string]$AdapterPath = "",
     [string]$ModelPath = "lmms-lab/llava-onevision-qwen2-7b-ov-chat",
     [switch]$Load4bit,
     [switch]$Load8bit
@@ -21,10 +21,14 @@ $wslArgs = @(
     "$pythonBin",
     "$serverScript",
     "--port", "$Port",
-    "--adapter-path", "`"$AdapterPath`"",
+    "--adapter-path", "`"$DefaultAdapterPath`"",
     "--model-path", "`"$ModelPath`""
 )
 
+if (-not [string]::IsNullOrWhiteSpace($AdapterPath) -and $AdapterPath -ne $DefaultAdapterPath) {
+    $wslArgs += "--extra-adapter-path"
+    $wslArgs += "`"$AdapterPath`""
+}
 if ($Load4bit) { $wslArgs += "--load-4bit" }
 if ($Load8bit) { $wslArgs += "--load-8bit" }
 
@@ -34,7 +38,12 @@ Write-Host "=========================================="
 Write-Host " Vanilla Inference Demo Server"
 Write-Host "=========================================="
 Write-Host "Repo:     $repoRootWsl"
-Write-Host "Adapter:  $AdapterPath"
+Write-Host "Default:  $DefaultAdapterPath"
+if (-not [string]::IsNullOrWhiteSpace($AdapterPath) -and $AdapterPath -ne $DefaultAdapterPath) {
+    Write-Host "Extra:    $AdapterPath"
+} else {
+    Write-Host "Extra:    (none)"
+}
 Write-Host "Port:     $Port"
 Write-Host "URL:      http://localhost:$Port/vanilla/"
 Write-Host "=========================================="
