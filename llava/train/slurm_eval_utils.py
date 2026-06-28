@@ -183,6 +183,9 @@ class SlurmEvalManager:
             "OUTPUT_ROOT": str(getattr(self.args, "slurm_eval_output_root", "") or "./evaluation_results"),
             "RUN_TAG": f"{run_tag_base}_ckpt{step}",
             "WANDB_TRAINING_STEP": str(step),
+            "WANDB_PROJECT": "llava-model-eval",
+            "WANDB_RUN_ID": "",
+            "WANDB_RUN_NAME": "",
             "TRAINING_SLURM_JOB_ID": os.getenv("SLURM_JOB_ID", ""),
         }
 
@@ -191,9 +194,6 @@ class SlurmEvalManager:
             "MODEL_BASE": getattr(self.args, "slurm_eval_model_base", None),
             "DATASET_JSON": getattr(self.args, "slurm_eval_dataset_json", None),
             "IMAGES_DIR": getattr(self.args, "slurm_eval_images_dir", None),
-            "WANDB_RUN_ID": self._wandb_env_or_run_attr("WANDB_RUN_ID", "id"),
-            "WANDB_RUN_NAME": self._wandb_env_or_run_attr("WANDB_RUN_NAME", "name"),
-            "WANDB_PROJECT": self._wandb_env_or_run_attr("WANDB_PROJECT", "project"),
             "WANDB_ENTITY": self._wandb_env_or_run_attr("WANDB_ENTITY", "entity"),
         }
         for key, value in optional_exports.items():
