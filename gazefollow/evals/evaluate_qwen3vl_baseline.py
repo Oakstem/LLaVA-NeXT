@@ -90,6 +90,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus sampling value.")
     parser.add_argument("--num-beams", type=int, default=1, help="Number of beams for beam search.")
     parser.add_argument("--do-sample", action="store_true", help="Enable sampling instead of greedy decoding.")
+    parser.add_argument(
+        "--extract-concise-gaze-target",
+        action="store_true",
+        help=(
+            "After image-conditioned prediction, run a second text-only Qwen generation that rewrites "
+            "the answer to a concise gaze-target phrase used for grounding."
+        ),
+    )
+    parser.add_argument(
+        "--gaze-target-extraction-max-new-tokens",
+        type=int,
+        default=64,
+        help="Maximum tokens for the second-step concise gaze target extraction.",
+    )
     parser.add_argument("--output-dir", default="./evaluation_results", help="Directory for evaluation artifacts.")
     parser.add_argument("--save-predictions", action="store_true", help="Save predictions.json.")
     parser.add_argument(
@@ -227,6 +241,59 @@ def generate_qwen3vl_response(
     )[0].strip()
 
 
+def generate_text_only_qwen3vl_response(
+    *,
+    processor: Any,
+    model: Any,
+    prompt_text: str,
+    system_prompt: str,
+    max_new_tokens: int,
+) -> str:
+    messages: List[Dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt_text})
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], return_tensors="pt", padding=True).to(model.device)
+
+    with torch.inference_mode():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+
+    input_length = inputs.input_ids.shape[-1]
+    generated_ids = generated[:, input_length:]
+    return processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0].strip()
+
+
+def clean_extracted_gaze_target(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+    if "\n" in cleaned:
+        cleaned = cleaned.splitlines()[0].strip()
+    cleaned = cleaned.strip("` \t\r\n")
+    if ":" in cleaned and cleaned.lower().split(":", 1)[0].strip() in {"answer", "gaze target", "target"}:
+        cleaned = cleaned.split(":", 1)[1].strip()
+    return cleaned.strip("\"' .,;")
+
+
+def build_gaze_target_extraction_prompt(prediction: str) -> str:
+    return (
+        "Extract only the gaze target from the answer below.\n"
+        "Return a short noun phrase, not a sentence. Do not mention the person. "
+        "If the target is outside the image, return: someone or something outside the frame.\n\n"
+        f"Answer:\n{prediction}"
+    )
+
+
 def generate_sample_outputs(args: argparse.Namespace, dataset_samples: List[Dict[str, Any]]) -> Tuple[List[EvaluationSampleOutput], List[Dict[str, Any]], Dict[str, Any]]:
     images_dir = Path(args.images_dir)
     dataset_json = Path(args.dataset_json)
@@ -271,7 +338,7 @@ def generate_sample_outputs(args: argparse.Namespace, dataset_samples: List[Dict
 
         image = Image.open(image_path).convert("RGB")
         try:
-            prediction = generate_qwen3vl_response(
+            raw_prediction = generate_qwen3vl_response(
                 processor=processor,
                 model=model,
                 image=image,
@@ -286,6 +353,23 @@ def generate_sample_outputs(args: argparse.Namespace, dataset_samples: List[Dict
         finally:
             image_size = image.size
             image.close()
+
+        prediction = raw_prediction
+        if args.extract_concise_gaze_target:
+            extraction_prompt = build_gaze_target_extraction_prompt(raw_prediction)
+            extracted_prediction = generate_text_only_qwen3vl_response(
+                processor=processor,
+                model=model,
+                prompt_text=extraction_prompt,
+                system_prompt="You extract concise gaze targets from text.",
+                max_new_tokens=args.gaze_target_extraction_max_new_tokens,
+            )
+            prediction = clean_extracted_gaze_target(extracted_prediction) or raw_prediction
+            sample["_qwen3vl_raw_prediction"] = raw_prediction
+            sample["_qwen3vl_gaze_target_extraction"] = {
+                "raw_extraction": extracted_prediction,
+                "cleaned_extraction": prediction,
+            }
 
         predictions.append(prediction)
         ground_truths.append(ground_truth)
@@ -437,8 +521,31 @@ def main() -> None:
             "average_time_per_sample": evaluation_time / processed_samples if processed_samples else 0.0,
             "model_generation_samples": len(model_generation_records),
             "skipped_in_out_minus_one": len(evaluation_state.skipped_in_out_minus_one_samples),
+            "concise_gaze_target_extraction_enabled": bool(args.extract_concise_gaze_target),
         }
     )
+
+    if args.extract_concise_gaze_target:
+        for entry in predictions_output:
+            sample_ref = next((output.sample for output in sample_outputs if output.sample_id == str(entry.get("id"))), None)
+            if not sample_ref:
+                continue
+            raw_prediction = sample_ref.get("_qwen3vl_raw_prediction")
+            extraction = sample_ref.get("_qwen3vl_gaze_target_extraction")
+            if raw_prediction is not None:
+                entry["raw_prediction"] = raw_prediction
+            if isinstance(extraction, dict):
+                entry["gaze_target_extraction"] = extraction
+        for record in model_generation_records:
+            sample_ref = next((output.sample for output in sample_outputs if output.sample_id == str(record.get("id"))), None)
+            if not sample_ref:
+                continue
+            raw_prediction = sample_ref.get("_qwen3vl_raw_prediction")
+            extraction = sample_ref.get("_qwen3vl_gaze_target_extraction")
+            if raw_prediction is not None:
+                record["raw_model_prediction"] = raw_prediction
+            if isinstance(extraction, dict):
+                record["gaze_target_extraction"] = extraction
 
     in_out_predictions: List[int] = []
     in_out_labels: List[int] = []
@@ -523,6 +630,8 @@ def main() -> None:
         "prompt_override": args.prompt_override,
         "system_prompt": args.system_prompt,
         "generation_kwargs": generation_kwargs,
+        "extract_concise_gaze_target": args.extract_concise_gaze_target,
+        "gaze_target_extraction_max_new_tokens": args.gaze_target_extraction_max_new_tokens,
         "gaze_max_new_tokens": args.gaze_max_new_tokens,
         "gaze_box_threshold": args.gaze_box_threshold,
         "gaze_iou_radius_ratio": args.gaze_iou_radius_ratio,

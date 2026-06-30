@@ -22,7 +22,11 @@ fi
 echo "Job started at: $(date)"
 
 PROJECT_DIR="${PROJECT_DIR:-/galitylab/students/alonmardi/projects/LLaVA-NeXT}"
-PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/llava/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/galitylab/students/alonmardi/.ground-uv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "Python environment not found; set PYTHON_BIN." >&2
+    exit 1
+fi
 
 # Dataset configuration
 DATASET_JSON="${DATASET_JSON:-report_finals/datasets/validation/20251217/20251205_174741_sgl_conversation_data_20251214_204738/val_filtered.json}"
@@ -34,6 +38,8 @@ PREDICTION_MODEL_ID="${PREDICTION_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct}"
 PREDICTION_DEVICE="${PREDICTION_DEVICE:-}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful vision-language assistant.}"
 PROMPT_OVERRIDE="${PROMPT_OVERRIDE:-}"
+EXTRACT_CONCISE_GAZE_TARGET="${EXTRACT_CONCISE_GAZE_TARGET:-false}"
+GAZE_TARGET_EXTRACTION_MAX_NEW_TOKENS="${GAZE_TARGET_EXTRACTION_MAX_NEW_TOKENS:-64}"
 
 # Generation controls
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
@@ -87,6 +93,7 @@ ARGS+=("--temperature" "$TEMPERATURE")
 ARGS+=("--top-p" "$TOP_P")
 ARGS+=("--num-beams" "$NUM_BEAMS")
 ARGS+=("--system-prompt" "$SYSTEM_PROMPT")
+ARGS+=("--gaze-target-extraction-max-new-tokens" "$GAZE_TARGET_EXTRACTION_MAX_NEW_TOKENS")
 ARGS+=("--output-dir" "$OUTPUT_DIR")
 ARGS+=("--table-log-interval" "$TABLE_LOG_INTERVAL")
 ARGS+=("--gaze-model-id" "$GAZE_MODEL_ID")
@@ -102,6 +109,10 @@ fi
 
 if [ "$DO_SAMPLE" = "true" ]; then
     ARGS+=("--do-sample")
+fi
+
+if [ "$EXTRACT_CONCISE_GAZE_TARGET" = "true" ]; then
+    ARGS+=("--extract-concise-gaze-target")
 fi
 
 if [ "$SAVE_PREDICTIONS" = "true" ]; then
@@ -171,6 +182,7 @@ else
 fi
 echo "Prediction model: $PREDICTION_MODEL_ID"
 echo "Grounding model: $GAZE_MODEL_ID"
+echo "Concise gaze target extraction: $EXTRACT_CONCISE_GAZE_TARGET"
 echo "Output dir: $OUTPUT_DIR"
 echo "Table log interval: $TABLE_LOG_INTERVAL"
 echo "wandb run id: ${WANDB_RUN_ID:-N/A}"
