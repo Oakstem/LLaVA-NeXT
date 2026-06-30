@@ -74,9 +74,9 @@ WANDB_METRIC_PREFIX="${WANDB_METRIC_PREFIX:-}"
 timestamp="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/eval_${RUN_TAG}_${timestamp}}"
 
+cd "$PROJECT_DIR"
 mkdir -p logs
 mkdir -p "$OUTPUT_DIR"
-cd "$PROJECT_DIR"
 
 ARGS=()
 ARGS+=("--prediction-model-id" "$PREDICTION_MODEL_ID")
